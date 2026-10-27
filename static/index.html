@@ -107,7 +107,11 @@
         </div>
         <div class="panel">
           <h3>Возможности устройства</h3>
-          <div class="chips" id="features">—</div>
+          <div style="display:flex; gap:14px; align-items:flex-start">
+            <img src="/static/img/station-mini2.svg" alt="Колонка" width="88" height="88"
+                 style="flex:none; border-radius:14px; background:#000; border:1px solid var(--line)">
+            <div class="chips" id="features" style="flex:1">—</div>
+          </div>
           <h3 style="margin-top:18px">Быстрые действия</h3>
           <div class="row wrap">
             <button class="btn sm" data-quick="uptime">uptime</button>

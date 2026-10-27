@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <!-- Яндекс Станция Мини 2: вид сверху-сбоку -->
+  <defs>
+    <radialGradient id="body" cx="50%" cy="42%" r="60%">
+      <stop offset="0%" stop-color="#3a3a44"/>
+      <stop offset="70%" stop-color="#232329"/>
+      <stop offset="100%" stop-color="#141418"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#8b7cff" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#8b7cff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="60" cy="60" r="56" fill="url(#glow)"/>
+  <!-- корпус -->
+  <circle cx="60" cy="62" r="42" fill="url(#body)" stroke="#34343d" stroke-width="1.5"/>
+  <!-- сетка динамика -->
+  <g fill="#0d0d11">
+    <circle cx="60" cy="62" r="30" fill="#111116" stroke="#26262c" stroke-width="1"/>
+    <g opacity="0.9">
+      <circle cx="52" cy="52" r="1.4"/><circle cx="60" cy="50" r="1.4"/><circle cx="68" cy="52" r="1.4"/>
+      <circle cx="48" cy="60" r="1.4"/><circle cx="72" cy="60" r="1.4"/>
+      <circle cx="50" cy="69" r="1.4"/><circle cx="60" cy="73" r="1.4"/><circle cx="70" cy="69" r="1.4"/>
+      <circle cx="57" cy="61" r="1.4"/><circle cx="64" cy="59" r="1.4"/>
+    </g>
+  </g>
+  <!-- LED-кольцо -->
+  <circle cx="60" cy="62" r="38" fill="none" stroke="#8b7cff" stroke-width="3" stroke-linecap="round"
+          stroke-dasharray="150 89" transform="rotate(-90 60 62)"/>
+  <circle cx="60" cy="62" r="38" fill="none" stroke="#3a2f6b" stroke-width="3" stroke-dasharray="89 150"
+          stroke-dashoffset="-150" transform="rotate(-90 60 62)" opacity="0.7"/>
+  <!-- дисплей-часы -->
+  <rect x="48" y="96" width="24" height="10" rx="3" fill="#111116" stroke="#26262c"/>
+  <text x="60" y="104" text-anchor="middle" font-family="ui-monospace, monospace" font-size="7" fill="#efe9d9">12:07</text>
+</svg>
