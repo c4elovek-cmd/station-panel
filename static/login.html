@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Вход — Панель Станции</title>
+<style>
+  :root{
+    --bg:#000; --panel:#0a0a0c; --panel-2:#121216; --line:#232329;
+    --text:#f2f3f8; --muted:#9a9db0; --accent:#8b7cff; --ok:#34d399;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; min-height:100vh; display:grid; place-items:center;
+    background:var(--bg);
+    font:15px/1.5 "Segoe UI", system-ui, sans-serif; color:var(--text);
+  }
+  .card{
+    width:min(380px, 92vw); padding:32px 28px; border-radius:18px;
+    background:var(--panel);
+    border:1px solid var(--line); box-shadow:0 24px 60px rgba(0,0,0,.8);
+    text-align:center;
+  }
+  .logo{font-size:34px; line-height:1; letter-spacing:-2px; margin-bottom:6px}
+  h1{font-size:19px; margin:0 0 4px; font-weight:600}
+  p.hint{color:var(--muted); font-size:13px; margin:0 0 22px}
+  input{
+    width:100%; padding:12px 14px; border-radius:11px; border:1px solid var(--line);
+    background:#000; color:var(--text); font-size:15px; outline:none; transition:.15s;
+  }
+  input:focus{border-color:var(--accent); box-shadow:0 0 0 3px rgba(139,124,255,.18)}
+  button{
+    width:100%; margin-top:14px; padding:12px; border:0; border-radius:11px; cursor:pointer;
+    background:linear-gradient(180deg,#9484ff,#6f5cf5); color:#fff; font-size:15px; font-weight:600;
+    transition:.15s;
+  }
+  button:hover{filter:brightness(1.08)}
+  button:disabled{opacity:.6; cursor:default}
+  .error{margin-top:12px; color:#ff8098; font-size:13px; min-height:18px}
+  small{display:block; margin-top:18px; color:var(--muted); font-size:12px; line-height:1.5}
+</style>
+</head>
+<body>
+  <form class="card" id="form">
+    <div class="logo">⟨⌒⌒⟩</div>
+    <h1>Панель Станции</h1>
+    <p class="hint">Введите пароль администратора</p>
+    <input id="password" type="password" placeholder="пароль" autocomplete="current-password" autofocus>
+    <button id="submit" type="submit">Войти</button>
+    <div class="error" id="error"></div>
+    <small>Пароль создаётся при первом запуске и лежит рядом с панелью в файле <b>password.txt</b>. Сменить — в разделе «Система».</small>
+  </form>
+<script>
+const form = document.getElementById('form');
+const input = document.getElementById('password');
+const errorBox = document.getElementById('error');
+const submit = document.getElementById('submit');
+form.onsubmit = async event => {
+  event.preventDefault();
+  errorBox.textContent = '';
+  submit.disabled = true;
+  try {
+    const response = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({password: input.value})
+    });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || 'ошибка входа');
+    location.href = '/';
+  } catch (err) {
+    errorBox.textContent = err.message;
+    submit.disabled = false;
+    input.select();
+  }
+};
+</script>
+</body>
+</html>

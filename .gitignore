@@ -1,0 +1,17 @@
+# секреты и локальный конфиг
+config.json
+password.txt
+
+# runtime
+run/
+plugin-configs/
+__pycache__/
+*.pyc
+
+# виртуальное окружение и зависимости
+.venv/
+venv/
+
+# ОС
+Thumbs.db
+.DS_Store
