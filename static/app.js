@@ -901,11 +901,220 @@ if ($('panelUpdAuto').checked) {
   setInterval(() => panelUpdateCheck(true), 24 * 3600 * 1000);
 }
 
+/* ------------------------- голосовые команды ------------------------- */
+async function loadVoiceConfig() {
+  try {
+    const voice = await api('/api/voice/config');
+    $('voicePhrases').value = (voice.phrases || []).join('\n');
+    $('voiceBridge').value = voice.bridge_url || '';
+    $('voiceBridgeToken').dataset.hasToken = voice.has_token ? '1' : '0';
+    const status = await api('/api/voice/status');
+    if (status.installed) {
+      const state = [status.enabled ? 'включён' : 'выключен', status.running ? 'работает' : 'не запущен'].join(', ');
+      notify($('voiceStatus'), `плагин на колонке: ${state}. Фразы: ${(status.phrases || []).join(', ')}`, 'ok');
+    } else {
+      notify($('voiceStatus'), 'плагин на колонке не установлен');
+    }
+  } catch (error) {
+    notify($('voiceStatus'), 'конфиг голоса: ' + error.message, 'error');
+  }
+}
+
+$('voiceDeploy').onclick = async () => {
+  const phrases = $('voicePhrases').value.split('\n').map(x => x.trim()).filter(Boolean);
+  const payload = { phrases, bridge_url: $('voiceBridge').value.trim() };
+  const token = $('voiceBridgeToken').value.trim();
+  if (token) payload.bridge_token = token;
+  if (!phrases.length) {
+    notify($('voiceStatus'), 'нужна хотя бы одна фраза', 'error');
+    return;
+  }
+  notify($('voiceStatus'), 'устанавливаю плагин на колонку…');
+  try {
+    await api('/api/voice/config', { method: 'PUT', body: JSON.stringify(payload) });
+    const result = await api('/api/voice/deploy', { method: 'POST', body: '{}' });
+    notify($('voiceStatus'), 'плагин установлен и запущен. Скажи: «Алиса, ' + phrases[0] + '»', 'ok');
+  } catch (error) {
+    notify($('voiceStatus'), 'ошибка: ' + error.message, 'error');
+  }
+};
+
+/* ------------------------- сказать на колонке ------------------------- */
+$('sayBtn').onclick = async () => {
+  const text = $('sayText').value.trim();
+  if (!text) {
+    notify($('sayStatus'), 'введи текст', 'error');
+    return;
+  }
+  notify($('sayStatus'), 'синтезирую речь…');
+  $('sayBtn').disabled = true;
+  try {
+    await api('/api/speaker/say', {
+      method: 'POST',
+      body: JSON.stringify({ text, voice: $('sayVoice').value, mood: $('sayMood').value })
+    });
+    notify($('sayStatus'), 'колонка произнесла текст', 'ok');
+  } catch (error) {
+    notify($('sayStatus'), 'ошибка: ' + error.message, 'error');
+  } finally {
+    $('sayBtn').disabled = false;
+  }
+};
+
+/* ------------------------- файловый менеджер ------------------------- */
+let filesCurrent = '/data';
+
+function formatSize(bytes) {
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' МБ';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' КБ';
+  return bytes + ' Б';
+}
+
+async function loadFiles(path) {
+  path = path.replace(/\/+$/, '') || '/';
+  filesCurrent = path;
+  $('filesPath').value = path;
+  $('filesEditor').style.display = 'none';
+  notify($('filesStatus'), 'читаю ' + path + '…');
+  try {
+    const data = await api('/api/files/list?path=' + encodeURIComponent(path));
+    const rows = [['📁', '..', '', '', '']];
+    for (const entry of data.entries) {
+      rows.push([
+        entry.is_dir ? '📁' : '📄',
+        entry.name,
+        entry.is_dir ? '' : formatSize(entry.size),
+        new Date(entry.mtime * 1000).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' }),
+        entry.perms
+      ]);
+    }
+    const table = document.createElement('table');
+    table.style.width = '100%';
+    table.style.borderCollapse = 'collapse';
+    for (const [i, row] of rows.entries()) {
+      const tr = document.createElement('tr');
+      const name = row[1];
+      if (i === 0) {
+        tr.onclick = () => loadFiles(path.replace(/\/[^/]*$/, '') || '/');
+        tr.style.cursor = path === '/' ? 'default' : 'pointer';
+      } else {
+        const entry = data.entries[i - 1];
+        tr.style.cursor = 'pointer';
+        tr.onclick = () => entry.is_dir ? loadFiles(path + '/' + entry.name) : openFileEditor(path + '/' + entry.name);
+      }
+      for (const [col, cell] of row.entries()) {
+        const td = document.createElement('td');
+        if (col === 1 && i > 0) {
+          td.textContent = cell;
+          td.style.flex = '1';
+          // кнопки действий в той же строке
+          const entry = data.entries[i - 1];
+          const actions = document.createElement('span');
+          actions.style.cssText = 'float:right; opacity:.75';
+          const dl = document.createElement('a');
+          dl.textContent = '⬇ ';
+          dl.href = '/api/files/download?path=' + encodeURIComponent(path + '/' + entry.name);
+          actions.appendChild(dl);
+          if (!entry.is_dir) {
+            const edit = document.createElement('span');
+            edit.textContent = '✏ ';
+            edit.onclick = event => { event.stopPropagation(); openFileEditor(path + '/' + entry.name); };
+            actions.appendChild(edit);
+          }
+          const del = document.createElement('span');
+          del.textContent = '✕';
+          del.onclick = async event => {
+            event.stopPropagation();
+            if (!confirm('Удалить ' + (entry.is_dir ? 'папку со всем содержимым' : 'файл') + ' ' + name + '?')) return;
+            try {
+              await api('/api/files/delete', { method: 'POST', body: JSON.stringify({ path: path + '/' + entry.name, recursive: entry.is_dir }) });
+              loadFiles(path);
+            } catch (error) { notify($('filesStatus'), 'ошибка: ' + error.message, 'error'); }
+          };
+          actions.appendChild(del);
+          td.appendChild(actions);
+        } else {
+          td.textContent = cell;
+        }
+        td.style.padding = '2px 8px 2px 0';
+        td.style.whiteSpace = 'nowrap';
+        tr.appendChild(td);
+      }
+      table.appendChild(tr);
+    }
+    const container = $('filesTable');
+    container.textContent = '';
+    container.appendChild(table);
+    notify($('filesStatus'), data.entries.length + ' объектов в ' + path, 'ok');
+  } catch (error) {
+    notify($('filesStatus'), 'ошибка: ' + error.message, 'error');
+  }
+}
+
+async function openFileEditor(filePath) {
+  try {
+    const data = await api('/api/files/read?path=' + encodeURIComponent(filePath));
+    if (data.binary) {
+      notify($('filesStatus'), 'бинарный файл — смотрим через скачивание', 'error');
+      return;
+    }
+    $('filesEditor').style.display = 'block';
+    $('filesEditPath').textContent = filePath + ' · ' + formatSize(data.size);
+    $('filesEditArea').value = data.content;
+    $('filesEditArea').dataset.path = filePath;
+    $('filesEditArea').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (error) {
+    notify($('filesStatus'), 'ошибка: ' + error.message, 'error');
+  }
+}
+
+$('filesGo').onclick = () => loadFiles($('filesPath').value.trim() || '/');
+$('filesPath').onkeydown = event => { if (event.key === 'Enter') loadFiles($('filesPath').value.trim() || '/'); };
+$('filesUp').onclick = () => loadFiles(filesCurrent.replace(/\/[^/]*$/, '') || '/');
+$('filesRefresh').onclick = () => loadFiles(filesCurrent);
+$('filesMkdir').onclick = async () => {
+  const name = prompt('Имя новой папки в ' + filesCurrent);
+  if (!name) return;
+  try {
+    await api('/api/files/mkdir', { method: 'POST', body: JSON.stringify({ path: filesCurrent + '/' + name }) });
+    loadFiles(filesCurrent);
+  } catch (error) { notify($('filesStatus'), 'ошибка: ' + error.message, 'error'); }
+};
+$('filesUpload').onchange = async event => {
+  const file = event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    await api('/api/files/upload?path=' + encodeURIComponent(filesCurrent), { method: 'POST', body: form });
+    loadFiles(filesCurrent);
+  } catch (error) { notify($('filesStatus'), 'ошибка: ' + error.message, 'error'); }
+};
+$('filesSave').onclick = async () => {
+  try {
+    await api('/api/files/write', { method: 'PUT', body: JSON.stringify({ path: $('filesEditArea').dataset.path, content: $('filesEditArea').value }) });
+    notify($('filesStatus'), 'сохранено', 'ok');
+  } catch (error) { notify($('filesStatus'), 'ошибка: ' + error.message, 'error'); }
+};
+$('filesEditClose').onclick = () => { $('filesEditor').style.display = 'none'; };
+
+// файлы грузим при первом открытии вкладки
+let filesLoaded = false;
+const filesObserver = new MutationObserver(() => {
+  if ($('tab-files').classList.contains('active') && !filesLoaded) {
+    filesLoaded = true;
+    loadFiles('/data');
+  }
+});
+filesObserver.observe($('tab-files'), { attributes: true, attributeFilter: ['class'] });
+
 /* -------------------------------- запуск -------------------------------- */
 (async function start() {
   showTab(localStorage.getItem('sp_tab') || 'overview');
   connectTerminal();
   await refreshStatus();
+  loadVoiceConfig();
   // если колонка недоступна по сохранённому IP — пробуем найти автоматически
   if (state.status && !state.status.reachable) {
     const detect = await detectStation(true);

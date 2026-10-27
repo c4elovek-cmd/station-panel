@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30
 aiohttp>=3.9
 asyncssh>=2.14
 python-multipart>=0.0.9
+edge-tts>=7.0

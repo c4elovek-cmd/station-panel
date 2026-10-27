@@ -30,7 +30,7 @@ import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import aiohttp
@@ -55,6 +55,9 @@ DEFAULTS: dict[str, Any] = {
     "password_salt": "",
     "password_hash": "",
     "session_hours": 72,
+    "voice_phrases": ["дипсик"],
+    "voice_bridge_url": "",
+    "voice_bridge_token": "",
 }
 
 SESSIONS: dict[str, float] = {}  # token -> expires_at
@@ -792,6 +795,495 @@ async def api_panel_update(request: Request) -> JSONResponse:
     if not ok:
         return JSONResponse({"detail": log}, status_code=500)
     return JSONResponse({"ok": True, "log": log, "note": "панель сейчас перезапустится"})
+
+
+# --------------------------------------------------------------------------- #
+# Голосовые команды: плагин на колонке с кастомными фразами
+# --------------------------------------------------------------------------- #
+VOICE_PLUGIN_ID = "station-voice"
+VOICE_LUA_TEMPLATE = """\
+-- Плагин панели Станции: слушает распознанную речь и шлёт запросы на мост.
+-- Триггеры и адрес моста задаются в панели, файл генерируется автоматически.
+local TRIGGERS = {__PHRASES__}
+local BRIDGE_URL = __BRIDGE_URL__
+local BRIDGE_TOKEN = __TOKEN__
+
+local function normalize(text)
+  -- как в yamd: буквы/цифры остаются, остальное — пробел; пробелы схлопываем
+  local out = tostring(text):lower():gsub("[^%wа-яё ]", " ")
+  local parts = {}
+  for word in out:gmatch("%S+") do parts[#parts + 1] = word end
+  return table.concat(parts, " ")
+end
+
+local function match_trigger(transcript)
+  local spoken = normalize(transcript)
+  if spoken == "" then return nil end
+  for _, trigger in ipairs(TRIGGERS) do
+    local t = normalize(trigger)
+    if t ~= "" then
+      for _, prefix in ipairs({t, "алиса " .. t}) do
+        if spoken == prefix then
+          return ""
+        elseif spoken:sub(1, #prefix + 1) == prefix .. " " then
+          return spoken:sub(#prefix + 2)
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function json_escape(s)
+  return tostring(s):gsub('[\\"%c]', { ['\\\\'] = '\\\\\\\\', ['\"'] = '\\\\\"' })
+end
+
+local function handle(transcript, query)
+  if BRIDGE_URL == "" then
+    print("[station-voice] мост не настроен в панели")
+    return
+  end
+  print("[station-voice] запрос: " .. query)
+  local body = '{"transcript":"' .. json_escape(query) .. '"}'
+  local url = BRIDGE_URL .. (BRIDGE_URL:find("?", 1, true) and "&" or "?") .. "token=" .. BRIDGE_TOKEN
+  local ok, response = pcall(alice.http.post, url, body)
+  if not ok or type(response) ~= "table" then
+    print("[station-voice] мост недоступен")
+    return
+  end
+  print("[station-voice] ответ " .. tostring(response.status) .. ": " .. tostring(response.body):sub(1, 300))
+  -- звуковые ответы появятся позже (нужен TTS-файл в пакете)
+end
+
+print("[station-voice] слушаю: " .. table.concat(TRIGGERS, ", "))
+while true do
+  local ok, event = pcall(alice.ipc.next_speech, 60000)
+  if ok and type(event) == "table" and type(event.transcript) == "string" then
+    local query = match_trigger(event.transcript)
+    if query then
+      pcall(alice.command.cancel)
+      pcall(handle, event.transcript, query == "" and "привет" or query)
+    end
+  end
+  alice.sleep(50)
+end
+"""
+
+
+def build_voice_plugin_yap(phrases: list[str], bridge_url: str, bridge_token: str) -> bytes:
+    """Собрать .yap (ZIP) с plugin.toml и main.lua."""
+    import io
+    import zipfile
+
+    host = ""
+    if bridge_url:
+        match = re.match(r"^https://([^/]+)", bridge_url)
+        if not match:
+            raise HTTPException(status_code=400, detail="адрес моста должен начинаться с https://")
+        host = match.group(1)
+
+    phrase_list = ", ".join('"%s"' % p.replace('"', "") for p in phrases)
+    toml = (
+        f'id = "{VOICE_PLUGIN_ID}"\n'
+        'name = "Station Voice"\n'
+        'version = "1.1.0"\n'
+        'entry = "main.lua"\n'
+        'description = "Голосовые команды панели Станции"\n'
+        "\n"
+        'permissions = ["ipc.speech", "commands", "audio", "network"]\n'
+        "\n"
+        "[launch]\n"
+        'kind = "lua"\n'
+        'path = "main.lua"\n'
+        "\n"
+        "[commands]\n"
+        f"phrases = [{phrase_list}]\n"
+        "\n"
+    )
+    if host:
+        toml += "[network]\n" f'allow = ["{host}"]\n' "\n"
+    toml += '[compatibility]\nfeatures = ["runtime.lua.v1", "plugin.yap.v1"]\n'
+
+    lua = VOICE_LUA_TEMPLATE
+    lua = lua.replace("__PHRASES__", phrase_list)
+    lua = lua.replace("__BRIDGE_URL__", json.dumps(bridge_url))
+    lua = lua.replace("__TOKEN__", json.dumps(bridge_token))
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("plugin.toml", toml)
+        archive.writestr("main.lua", lua)
+    return buffer.getvalue()
+
+
+async def yam_api(method: str, path: str, data: Any = None, content_type: str | None = None) -> tuple[int, Any]:
+    url = f"http://{cfg['station_ip']}:{cfg['yam_port']}{path}"
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(method, url, data=data, headers={"content-type": content_type} if content_type else None) as response:
+            raw = await response.read()
+            try:
+                return response.status, json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                return response.status, raw.decode("utf-8", "replace")[:400]
+
+
+@app.get("/api/voice/config")
+async def api_voice_config(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse({
+        "phrases": cfg["voice_phrases"],
+        "bridge_url": cfg["voice_bridge_url"],
+        "has_token": bool(cfg["voice_bridge_token"]),
+    })
+
+
+@app.put("/api/voice/config")
+async def api_voice_config_put(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    phrases = data.get("phrases")
+    if not isinstance(phrases, list) or not phrases:
+        raise HTTPException(status_code=400, detail="нужна хотя бы одна фраза")
+    clean = []
+    for phrase in phrases:
+        phrase = str(phrase).strip()
+        if not phrase:
+            continue
+        if len(phrase.encode("utf-8")) > 128 or len(clean) >= 32:
+            raise HTTPException(status_code=400, detail="фразы: до 32 штук, каждая до 128 байт")
+        clean.append(phrase)
+    if not clean:
+        raise HTTPException(status_code=400, detail="нужна хотя бы одна непустая фраза")
+    cfg["voice_phrases"] = clean
+    if "bridge_url" in data:
+        url = str(data["bridge_url"]).strip()
+        if url and not re.match(r"^https://", url):
+            raise HTTPException(status_code=400, detail="адрес моста должен начинаться с https://")
+        cfg["voice_bridge_url"] = url
+    if "bridge_token" in data:
+        cfg["voice_bridge_token"] = str(data["bridge_token"]).strip()
+    save_config(cfg)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/voice/deploy")
+async def api_voice_deploy(request: Request) -> JSONResponse:
+    """Собрать .yap с текущими фразами и установить на колонку."""
+    require_auth(request)
+    yap = build_voice_plugin_yap(cfg["voice_phrases"], cfg["voice_bridge_url"], cfg["voice_bridge_token"])
+    try:
+        # multipart с полем package, как ждёт POST /api/plugins в yamd
+        import io as _io
+
+        boundary = "----stationpanel" + secrets.token_hex(8)
+        part = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="package"; filename="station-voice.yap"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8") + yap + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        status, body = await yam_api(
+            "POST", "/api/plugins", data=part,
+            content_type=f"multipart/form-data; boundary={boundary}",
+        )
+        if status not in (200, 201):
+            return JSONResponse({"detail": f"YAM вернул {status}: {body}"}, status_code=502)
+
+        # включить пакет и поставить на автозапуск
+        await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/toggle")
+        await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/stop")
+        status, body = await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/service/enable")
+        if status != 200:
+            return JSONResponse({"detail": f"автозапуск: YAM вернул {status}: {body}"}, status_code=502)
+        return JSONResponse({"ok": True, "manifest": body})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"не удалось установить плагин: {exc}")
+
+
+@app.get("/api/voice/status")
+async def api_voice_status(request: Request) -> JSONResponse:
+    require_auth(request)
+    status, plugins = await yam_api("GET", "/api/plugins")
+    if status != 200 or not isinstance(plugins, list):
+        return JSONResponse({"installed": False, "detail": "демон недоступен"})
+    for plugin in plugins:
+        if (plugin.get("manifest") or {}).get("id") == VOICE_PLUGIN_ID:
+            return JSONResponse({
+                "installed": True,
+                "enabled": bool(plugin.get("enabled")),
+                "service": bool(plugin.get("service_enabled")),
+                "running": bool(plugin.get("running")),
+                "phrases": (plugin.get("manifest") or {}).get("commands", {}).get("phrases", []),
+            })
+    return JSONResponse({"installed": False})
+
+
+# --------------------------------------------------------------------------- #
+# «Сказать на колонке»: синтез речи и воспроизведение через aplay
+# --------------------------------------------------------------------------- #
+SAY_MOODS: dict[str, str | None] = {
+    # ffmpeg-фильтры поверх обычного синтеза; имена — как у TTS Алисы (TTtsGenerate.Emotion)
+    "normal": None,
+    "joy": "asetrate=16000*1.07,aresample=16000,atempo=1.05",       # EmotionalJoy
+    "smile": "asetrate=16000*1.03,aresample=16000,atempo=1.02",     # EmotionalSmile
+    "sadness": "asetrate=16000*0.92,aresample=16000,atempo=0.92",   # EmotionalSadness
+    "angry": "asetrate=16000*0.97,aresample=16000,atempo=1.06,volume=3dB",  # EmotionalAngry
+    "wow": "asetrate=16000*1.12,aresample=16000,atempo=1.08",       # EmotionalWow
+    "whisper": "volume=-26dB,highpass=f=180,lowpass=f=3400",        # is_whisper
+}
+SAY_VOICES = {"svetlana": "ru-RU-SvetlanaNeural", "dmitry": "ru-RU-DmitryNeural"}
+SAY_REMOTE = "/tmp/station-panel-say.wav"
+
+
+@app.post("/api/speaker/say")
+async def api_speaker_say(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    text = str(data.get("text", "")).strip()
+    if not text or len(text) > 500:
+        raise HTTPException(status_code=400, detail="текст от 1 до 500 символов")
+    voice = SAY_VOICES.get(str(data.get("voice", "svetlana")))
+    mood = str(data.get("mood", "normal"))
+    if not voice or mood not in SAY_MOODS:
+        raise HTTPException(status_code=400, detail="неизвестный голос или интонация")
+
+    import tempfile
+
+    import edge_tts
+
+    tmp_dir = Path(tempfile.gettempdir())
+    mp3_path = tmp_dir / f"station-say-{secrets.token_hex(4)}.mp3"
+    wav_path = tmp_dir / f"station-say-{secrets.token_hex(4)}.wav"
+    try:
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(str(mp3_path))
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"синтез речи не удался: {exc}")
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise HTTPException(status_code=500, detail="ffmpeg не найден в PATH")
+        command = [ffmpeg, "-y", "-loglevel", "error", "-i", str(mp3_path)]
+        if SAY_MOODS[mood]:
+            command += ["-af", SAY_MOODS[mood]]
+        command += ["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav_path)]
+        proc = await asyncio.create_subprocess_exec(
+            *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await asyncio.wait_for(proc.communicate(), 30)
+        if proc.returncode != 0 or not wav_path.exists():
+            raise HTTPException(status_code=500, detail="ffmpeg: " + err.decode("utf-8", "replace")[:200])
+
+        content = wav_path.read_bytes()
+        async with await ssh_connect() as conn:
+            async with conn.start_sftp_client() as sftp:
+                async with sftp.open(SAY_REMOTE, "wb") as remote_file:
+                    await remote_file.write(content)
+            # aplay блокируется до конца воспроизведения — ждём с запасом
+            await asyncio.wait_for(conn.run(f"aplay -q {SAY_REMOTE}", check=False), 120)
+        return JSONResponse({"ok": True, "voice": voice, "mood": mood, "bytes": len(content)})
+    finally:
+        mp3_path.unlink(missing_ok=True)
+        wav_path.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# Файловый менеджер: SFTP к колонке
+# --------------------------------------------------------------------------- #
+def safe_remote_path(value: Any) -> str:
+    path = str(value or "").strip()
+    if not path.startswith("/") or "\\" in path or ".." in PurePosixPath(path).parts:
+        raise HTTPException(status_code=400, detail="нужен абсолютный путь без «..»")
+    return path.rstrip("/") or "/"
+
+
+def safe_remote_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if not name or "/" in name or "\\" in name or name in (".", "..") or len(name) > 255:
+        raise HTTPException(status_code=400, detail="недопустимое имя файла")
+    return name
+
+
+@app.get("/api/files/list")
+async def api_files_list(request: Request, path: str = "/") -> JSONResponse:
+    require_auth(request)
+    path = safe_remote_path(path)
+    import stat as stat_module
+
+    try:
+        async with await ssh_connect() as conn:
+            async with conn.start_sftp_client() as sftp:
+                attrs = await sftp.stat(path)
+                if not stat_module.S_ISDIR(attrs.permissions or 0):
+                    raise HTTPException(status_code=400, detail="это не папка")
+                entries = []
+                for item in await sftp.listdir(path):
+                    try:
+                        a = await sftp.stat(f"{path}/{item}".replace("//", "/"))
+                    except Exception:
+                        continue
+                    entries.append({
+                        "name": item,
+                        "is_dir": bool(stat_module.S_ISDIR(a.permissions or 0)),
+                        "size": a.size or 0,
+                        "mtime": int(a.mtime or 0),
+                        "perms": format(a.permissions & 0o777 or 0, "03o"),
+                    })
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"не удалось прочитать папку: {exc}")
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+    return JSONResponse({"path": path, "entries": entries})
+
+
+@app.get("/api/files/read")
+async def api_files_read(request: Request, path: str) -> JSONResponse:
+    require_auth(request)
+    path = safe_remote_path(path)
+    try:
+        async with await ssh_connect() as conn:
+            async with conn.start_sftp_client() as sftp:
+                attrs = await sftp.stat(path)
+                if (attrs.size or 0) > 256 * 1024:
+                    raise HTTPException(status_code=400, detail="файл больше 256 КиБ — открой через скачивание")
+                async with sftp.open(path, "rb") as remote_file:
+                    content = await remote_file.read()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"не удалось прочитать файл: {exc}")
+    try:
+        text = content.decode("utf-8")
+        binary = False
+    except UnicodeDecodeError:
+        text = content.decode("utf-8", "replace")
+        binary = True
+    return JSONResponse({"path": path, "size": len(content), "binary": binary, "content": text})
+
+
+@app.put("/api/files/write")
+async def api_files_write(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    path = safe_remote_path(data.get("path"))
+    content = str(data.get("content", "")).encode("utf-8")
+    if len(content) > 256 * 1024:
+        raise HTTPException(status_code=400, detail="больше 256 КиБ — заливай файлом через загрузку")
+    try:
+        async with await ssh_connect() as conn:
+            async with conn.start_sftp_client() as sftp:
+                await write_remote_atomic(sftp, path, content)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"не удалось записать файл: {exc}")
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/files/download")
+async def api_files_download(request: Request, path: str) -> Response:
+    require_auth(request)
+    path = safe_remote_path(path)
+    try:
+        max_size = int(request.query_params.get("max_size", "67108864"))
+    except ValueError:
+        max_size = 67108864
+    max_size = min(max_size, 256 * 1024 * 1024)
+    try:
+        async with await ssh_connect() as conn:
+            async with conn.start_sftp_client() as sftp:
+                attrs = await sftp.stat(path)
+                if (attrs.size or 0) > max_size:
+                    raise HTTPException(status_code=400, detail=f"файл больше {max_size // 1048576} МиБ")
+                async with sftp.open(path, "rb") as remote_file:
+                    content = await remote_file.read()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"не удалось скачать: {exc}")
+    from urllib.parse import quote
+
+    name = PurePosixPath(path).name
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={"content-disposition": f"attachment; filename*=UTF-8''{quote(name)}"},
+    )
+
+
+@app.post("/api/files/upload")
+async def api_files_upload(request: Request, file: UploadFile = File(...), path: str = "/") -> JSONResponse:
+    require_auth(request)
+    directory = safe_remote_path(path)
+    name = safe_remote_name(file.filename)
+    content = await file.read()
+    if len(content) > 256 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="файл больше 256 МиБ")
+    target = f"{directory}/{name}"
+    try:
+        async with await ssh_connect() as conn:
+            async with conn.start_sftp_client() as sftp:
+                async with sftp.open(target, "wb") as remote_file:
+                    await remote_file.write(content)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"не удалось загрузить: {exc}")
+    return JSONResponse({"ok": True, "path": target, "size": len(content)})
+
+
+@app.post("/api/files/mkdir")
+async def api_files_mkdir(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    path = safe_remote_path(data.get("path"))
+    try:
+        async with await ssh_connect() as conn:
+            async with conn.start_sftp_client() as sftp:
+                await sftp.mkdir(path)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"не удалось создать папку: {exc}")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/files/delete")
+async def api_files_delete(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    path = safe_remote_path(data.get("path"))
+    if path == "/":
+        raise HTTPException(status_code=400, detail="корень удалить нельзя")
+    recursive = bool(data.get("recursive"))
+    try:
+        async with await ssh_connect() as conn:
+            if recursive:
+                # rm -rf только по проверенному абсолютному пути
+                await asyncio.wait_for(conn.run(f"rm -rf -- {shlex.quote(path)}", check=True), 60)
+            else:
+                async with conn.start_sftp_client() as sftp:
+                    await sftp.remove(path)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"не удалось удалить: {exc}")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/files/rename")
+async def api_files_rename(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    source = safe_remote_path(data.get("from"))
+    target = safe_remote_path(data.get("to"))
+    try:
+        async with await ssh_connect() as conn:
+            async with conn.start_sftp_client() as sftp:
+                await sftp.rename(source, target)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"не удалось переименовать: {exc}")
+    return JSONResponse({"ok": True})
 
 
 # --------------------------------------------------------------------------- #
