@@ -984,7 +984,7 @@ async function loadFiles(path) {
         entry.is_dir ? '📁' : '📄',
         entry.name,
         entry.is_dir ? '' : formatSize(entry.size),
-        new Date(entry.mtime * 1000).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' }),
+        entry.mtime,
         entry.perms
       ]);
     }
@@ -1105,9 +1105,141 @@ const filesObserver = new MutationObserver(() => {
   if ($('tab-files').classList.contains('active') && !filesLoaded) {
     filesLoaded = true;
     loadFiles('/data');
+    loadBackups();
   }
 });
 filesObserver.observe($('tab-files'), { attributes: true, attributeFilter: ['class'] });
+
+/* ------------------------- бэкапы /data ------------------------- */
+async function loadBackups() {
+  try {
+    const data = await api('/api/files/backups');
+    const container = $('backupsList');
+    container.textContent = '';
+    if (!data.backups.length) {
+      container.textContent = 'бэкапов пока нет';
+      return;
+    }
+    const table = document.createElement('table');
+    table.style.width = '100%';
+    for (const backup of data.backups) {
+      const tr = document.createElement('tr');
+      const name = document.createElement('td');
+      name.textContent = backup.name + ' · ' + formatSize(backup.size) + ' · ' + new Date(backup.mtime * 1000).toLocaleString('ru-RU');
+      name.style.padding = '2px 8px 2px 0';
+      const actions = document.createElement('td');
+      actions.style.textAlign = 'right';
+      actions.style.whiteSpace = 'nowrap';
+      const dl = document.createElement('a');
+      dl.textContent = 'скачать';
+      dl.href = '/api/files/backups/download?name=' + encodeURIComponent(backup.name);
+      actions.appendChild(dl);
+      const restore = document.createElement('span');
+      restore.textContent = ' · восстановить';
+      restore.style.cursor = 'pointer';
+      restore.onclick = async () => {
+        if (!confirm('Восстановить ' + backup.name + ' на колонку?\nФайлы из архива перезапишут текущие в /data.')) return;
+        notify($('filesStatus'), 'восстанавливаю…');
+        try {
+          const result = await api('/api/files/restore', { method: 'POST', body: JSON.stringify({ name: backup.name }) });
+          notify($('filesStatus'), 'восстановлено объектов: ' + result.restored, 'ok');
+          loadFiles(filesCurrent);
+        } catch (error) { notify($('filesStatus'), 'ошибка: ' + error.message, 'error'); }
+      };
+      actions.appendChild(restore);
+      tr.appendChild(name);
+      tr.appendChild(actions);
+      table.appendChild(tr);
+    }
+    container.appendChild(table);
+  } catch (error) {
+    $('backupsList').textContent = 'ошибка: ' + error.message;
+  }
+}
+
+$('backupBtn').onclick = async () => {
+  notify($('filesStatus'), 'архивирую /data на колонке и качаю на ПК…');
+  $('backupBtn').disabled = true;
+  try {
+    const result = await api('/api/files/backup', { method: 'POST', body: '{}' });
+    notify($('filesStatus'), 'бэкап готов: ' + result.name + ' (' + formatSize(result.size) + ')', 'ok');
+    loadBackups();
+  } catch (error) {
+    notify($('filesStatus'), 'ошибка: ' + error.message, 'error');
+  } finally {
+    $('backupBtn').disabled = false;
+  }
+};
+$('backupsRefresh').onclick = loadBackups;
+
+/* ------------------------- музыка: soundya + spotiya ------------------------- */
+let musicObserverBound = false;
+let spotiyaPaused = false;
+let spotiyaVolume = 60;
+
+async function musicStatus() {
+  try {
+    const data = await api('/api/music/status');
+    const s = data.soundya || {};
+    $('soundyaChip').textContent = s.running ? 'работает' : 'остановлен';
+    $('soundyaStatus').textContent = s.raw || '';
+    const p = data.spotiya || {};
+    spotiyaPaused = !!p.paused;
+    if (typeof p.volume === 'number') spotiyaVolume = p.volume;
+    $('spotiyaChip').textContent = p.installed ? (p.active ? (p.paused ? 'на паузе' : 'играет') : 'готов') : 'не установлен';
+    $('spotiyaStatus').textContent = p.installed
+      ? `${p.artist ? p.artist + ' — ' : ''}${p.title || 'ничего не играет'} · громкость ${p.volume ?? '?'} · голос ${p.voice ? 'ВКЛ(!)' : 'выкл'} · AirPlay ${p.airplay ? 'работает' : 'выкл'}${p.error ? ' · ' + p.error : ''}`
+      : (p.raw || '');
+  } catch (error) {
+    $('soundyaChip').textContent = 'ошибка';
+  }
+}
+
+async function musicCmd(kind, cmd, arg) {
+  try {
+    const result = await api('/api/music/' + kind, { method: 'POST', body: JSON.stringify({ cmd, arg }) });
+    if (!result.ok) notify($('soundyaStatus'), result.output || 'ошибка', 'error');
+  } catch (error) {
+    notify($('soundyaStatus'), 'ошибка: ' + error.message, 'error');
+  }
+  setTimeout(musicStatus, 1500);
+}
+
+document.querySelectorAll('[data-soundya]').forEach(button => {
+  button.onclick = () => musicCmd('soundya', button.dataset.soundya);
+});
+document.querySelectorAll('[data-spotiya]').forEach(button => {
+  button.onclick = () => {
+    const cmd = button.dataset.spotiya;
+    if (cmd === 'toggle') musicCmd('spotiya', spotiyaPaused ? 'resume' : 'pause');
+    else musicCmd('spotiya', cmd);
+  };
+});
+$('soundyaPlay').onclick = () => {
+  const q = $('soundyaQuery').value.trim();
+  if (q) musicCmd('soundya', 'play', q);
+};
+$('soundyaQuery').onkeydown = event => {
+  if (event.key === 'Enter') $('soundyaPlay').click();
+};
+$('spotiyaVolUp').onclick = async () => {
+  try { await api('/api/music/spotiya/volume', { method: 'POST', body: JSON.stringify({ volume: Math.min(100, spotiyaVolume + 10) }) }); } catch (error) { notify($('spotiyaStatus'), 'ошибка: ' + error.message, 'error'); }
+  setTimeout(musicStatus, 1200);
+};
+$('spotiyaVolDown').onclick = async () => {
+  try { await api('/api/music/spotiya/volume', { method: 'POST', body: JSON.stringify({ volume: Math.max(0, spotiyaVolume - 10) }) }); } catch (error) { notify($('spotiyaStatus'), 'ошибка: ' + error.message, 'error'); }
+  setTimeout(musicStatus, 1200);
+};
+
+// статус музыки — при открытии вкладки и далее по таймеру
+const musicObserver = new MutationObserver(() => {
+  if ($('tab-music').classList.contains('active') && !musicObserverBound) {
+    musicObserverBound = true;
+    musicStatus();
+    setInterval(musicStatus, 10000);
+  }
+});
+musicObserver.observe($('tab-music'), { attributes: true, attributeFilter: ['class'] });
 
 /* -------------------------------- запуск -------------------------------- */
 (async function start() {

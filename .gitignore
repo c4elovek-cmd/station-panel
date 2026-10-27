@@ -1,6 +1,7 @@
 # секреты и локальный конфиг
 config.json
 password.txt
+backups/
 
 # runtime
 run/

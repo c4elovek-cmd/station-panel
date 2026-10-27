@@ -58,6 +58,7 @@ DEFAULTS: dict[str, Any] = {
     "voice_phrases": ["дипсик"],
     "voice_bridge_url": "",
     "voice_bridge_token": "",
+    "voice_music_source": "youtube",
 }
 
 SESSIONS: dict[str, float] = {}  # token -> expires_at
@@ -935,6 +936,7 @@ async def api_voice_config(request: Request) -> JSONResponse:
         "phrases": cfg["voice_phrases"],
         "bridge_url": cfg["voice_bridge_url"],
         "has_token": bool(cfg["voice_bridge_token"]),
+        "music_source": cfg.get("voice_music_source", "youtube"),
     })
 
 
@@ -963,7 +965,32 @@ async def api_voice_config_put(request: Request) -> JSONResponse:
         cfg["voice_bridge_url"] = url
     if "bridge_token" in data:
         cfg["voice_bridge_token"] = str(data["bridge_token"]).strip()
+    if "music_source" in data:
+        source = str(data["music_source"]).lower()
+        if source not in ("youtube", "soundcloud", "spotify"):
+            raise HTTPException(status_code=400, detail="источник: youtube | soundcloud | spotify")
+        cfg["voice_music_source"] = source
     save_config(cfg)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/voice/bridge-config")
+async def api_voice_bridge_config(request: Request) -> JSONResponse:
+    """Отправить выбранный источник музыки в мост (его ручка /api/bridge/config)."""
+    require_auth(request)
+    url, token = cfg["voice_bridge_url"].strip(), cfg["voice_bridge_token"].strip()
+    if not url or not token:
+        raise HTTPException(status_code=400, detail="сначала задай адрес и токен моста")
+    base = url.split("/api/voice")[0].rstrip("/")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        async with session.put(
+            f"{base}/api/bridge/config",
+            json={"source": cfg.get("voice_music_source", "youtube")},
+            headers={"authorization": f"Bearer {token}"},
+        ) as response:
+            body = await response.text()
+    if response.status != 200:
+        return JSONResponse({"detail": f"мост вернул {response.status}: {body[:200]}"}, status_code=502)
     return JSONResponse({"ok": True})
 
 
@@ -1091,7 +1118,7 @@ async def api_speaker_say(request: Request) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
-# Файловый менеджер: SFTP к колонке
+# Файловый менеджер: exec-команды по SSH (dropbear без SFTP-подсистемы)
 # --------------------------------------------------------------------------- #
 def safe_remote_path(value: Any) -> str:
     path = str(value or "").strip()
@@ -1107,35 +1134,75 @@ def safe_remote_name(value: Any) -> str:
     return name
 
 
+# /data на прошивке — симлинк на /bkupgrade/data: rm по этим корням = factory reset.
+WRITABLE_PREFIXES = ("/data/", "/tmp/", "/bkupgrade/data/")
+TOUCHY_ROOTS = {"/", "/data", "/bkupgrade", "/bkupgrade/data", "/opt", "/system", "/etc", "/usr", "/lib", "/bin", "/sbin"}
+
+
+def safe_writable_path(value: Any) -> str:
+    """Путь для изменения/удаления: только пользовательские области."""
+    path = safe_remote_path(value)
+    if not path.startswith(WRITABLE_PREFIXES):
+        raise HTTPException(
+            status_code=403,
+            detail="изменение разрешено только внутри /data и /tmp (защита от сброса колонки)",
+        )
+    return path
+
+
+async def assert_realpath_deletable(path: str) -> None:
+    """Второй рубеж: проверяем фактический путь (с раскрытием симлинков)."""
+    code, out, _ = await ssh_run_bytes(f"readlink -f {shlex.quote(path)}")
+    real = out.decode("utf-8", "replace").strip() if code == 0 else path
+    if real in TOUCHY_ROOTS:
+        raise HTTPException(status_code=403, detail=f"«{path}» указывает на системный путь — удаление запрещено")
+    if not real.startswith(WRITABLE_PREFIXES):
+        raise HTTPException(status_code=403, detail=f"«{path}» вне /data и /tmp — удаление запрещено")
+
+
+LS_LINE = re.compile(
+    r"^([\-dlcbps][rwxsStT-]{9})\s+\d+\s+\S+\s+\S+\s+(\d+)\s+"
+    r"(\w{3}\s+\d{1,2}\s+(?:\d{4}|\d{2}:\d{2}))\s(.*)$"
+)
+
+
+async def ssh_run_bytes(command: str, input_data: bytes | None = None, timeout: float = 60) -> tuple[int, bytes, bytes]:
+    """Выполнить команду на колонке, вернуть (код, stdout, stderr) в байтах."""
+    try:
+        async with await ssh_connect() as conn:
+            process = await conn.run(command, input=input_data, check=False, encoding=None)
+            return process.exit_status, process.stdout or b"", process.stderr or b""
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"команда на колонке не выполнена: {exc}")
+
+
 @app.get("/api/files/list")
 async def api_files_list(request: Request, path: str = "/") -> JSONResponse:
     require_auth(request)
     path = safe_remote_path(path)
-    import stat as stat_module
-
-    try:
-        async with await ssh_connect() as conn:
-            async with conn.start_sftp_client() as sftp:
-                attrs = await sftp.stat(path)
-                if not stat_module.S_ISDIR(attrs.permissions or 0):
-                    raise HTTPException(status_code=400, detail="это не папка")
-                entries = []
-                for item in await sftp.listdir(path):
-                    try:
-                        a = await sftp.stat(f"{path}/{item}".replace("//", "/"))
-                    except Exception:
-                        continue
-                    entries.append({
-                        "name": item,
-                        "is_dir": bool(stat_module.S_ISDIR(a.permissions or 0)),
-                        "size": a.size or 0,
-                        "mtime": int(a.mtime or 0),
-                        "perms": format(a.permissions & 0o777 or 0, "03o"),
-                    })
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"не удалось прочитать папку: {exc}")
+    code, out, err = await ssh_run_bytes(f"ls -l {shlex.quote(path)} 2>&1; echo EXIT:$?")
+    text = out.decode("utf-8", "replace")
+    if "EXIT:0" not in text:
+        detail = [l for l in text.splitlines() if l and not l.startswith(("total ", "EXIT:"))]
+        raise HTTPException(status_code=502, detail=" ; ".join(detail)[:300] or f"ls вернул {code}")
+    entries = []
+    for line in text.splitlines():
+        match = LS_LINE.match(line)
+        if not match:
+            continue
+        perms, size, date, name = match.groups()
+        if name in (".", ".."):
+            continue
+        entries.append({
+            "name": name,
+            "is_dir": perms.startswith("d"),
+            "is_link": perms.startswith("l"),
+            "size": int(size),
+            "mtime": date,
+            "perms": perms,
+        })
     entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
     return JSONResponse({"path": path, "entries": entries})
 
@@ -1144,43 +1211,35 @@ async def api_files_list(request: Request, path: str = "/") -> JSONResponse:
 async def api_files_read(request: Request, path: str) -> JSONResponse:
     require_auth(request)
     path = safe_remote_path(path)
-    try:
-        async with await ssh_connect() as conn:
-            async with conn.start_sftp_client() as sftp:
-                attrs = await sftp.stat(path)
-                if (attrs.size or 0) > 256 * 1024:
-                    raise HTTPException(status_code=400, detail="файл больше 256 КиБ — открой через скачивание")
-                async with sftp.open(path, "rb") as remote_file:
-                    content = await remote_file.read()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"не удалось прочитать файл: {exc}")
+    code, out, _ = await ssh_run_bytes(f"wc -c < {shlex.quote(path)}")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="файл недоступен")
+    size = int(out.split()[0])
+    if size > 256 * 1024:
+        raise HTTPException(status_code=400, detail=f"файл больше 256 КиБ ({size} байт) — открой через скачивание")
+    code, content, _ = await ssh_run_bytes(f"cat {shlex.quote(path)}")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="не удалось прочитать файл")
     try:
         text = content.decode("utf-8")
         binary = False
     except UnicodeDecodeError:
         text = content.decode("utf-8", "replace")
         binary = True
-    return JSONResponse({"path": path, "size": len(content), "binary": binary, "content": text})
+    return JSONResponse({"path": path, "size": size, "binary": binary, "content": text})
 
 
 @app.put("/api/files/write")
 async def api_files_write(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
-    path = safe_remote_path(data.get("path"))
+    path = safe_writable_path(data.get("path"))
     content = str(data.get("content", "")).encode("utf-8")
     if len(content) > 256 * 1024:
         raise HTTPException(status_code=400, detail="больше 256 КиБ — заливай файлом через загрузку")
-    try:
-        async with await ssh_connect() as conn:
-            async with conn.start_sftp_client() as sftp:
-                await write_remote_atomic(sftp, path, content)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"не удалось записать файл: {exc}")
+    code, _, err = await ssh_run_bytes(f"cat > {shlex.quote(path)}", input_data=content)
+    if code != 0:
+        raise HTTPException(status_code=502, detail="не удалось записать: " + err.decode("utf-8", "replace")[:200])
     return JSONResponse({"ok": True})
 
 
@@ -1188,23 +1247,15 @@ async def api_files_write(request: Request) -> JSONResponse:
 async def api_files_download(request: Request, path: str) -> Response:
     require_auth(request)
     path = safe_remote_path(path)
-    try:
-        max_size = int(request.query_params.get("max_size", "67108864"))
-    except ValueError:
-        max_size = 67108864
-    max_size = min(max_size, 256 * 1024 * 1024)
-    try:
-        async with await ssh_connect() as conn:
-            async with conn.start_sftp_client() as sftp:
-                attrs = await sftp.stat(path)
-                if (attrs.size or 0) > max_size:
-                    raise HTTPException(status_code=400, detail=f"файл больше {max_size // 1048576} МиБ")
-                async with sftp.open(path, "rb") as remote_file:
-                    content = await remote_file.read()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"не удалось скачать: {exc}")
+    code, out, _ = await ssh_run_bytes(f"wc -c < {shlex.quote(path)}")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="файл недоступен")
+    size = int(out.split()[0])
+    if size > 256 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="файл больше 256 МиБ")
+    code, content, err = await ssh_run_bytes(f"cat {shlex.quote(path)}", timeout=120)
+    if code != 0:
+        raise HTTPException(status_code=502, detail="не удалось скачать: " + err.decode("utf-8", "replace")[:200])
     from urllib.parse import quote
 
     name = PurePosixPath(path).name
@@ -1218,19 +1269,15 @@ async def api_files_download(request: Request, path: str) -> Response:
 @app.post("/api/files/upload")
 async def api_files_upload(request: Request, file: UploadFile = File(...), path: str = "/") -> JSONResponse:
     require_auth(request)
-    directory = safe_remote_path(path)
+    directory = safe_writable_path(path)
     name = safe_remote_name(file.filename)
     content = await file.read()
     if len(content) > 256 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="файл больше 256 МиБ")
     target = f"{directory}/{name}"
-    try:
-        async with await ssh_connect() as conn:
-            async with conn.start_sftp_client() as sftp:
-                async with sftp.open(target, "wb") as remote_file:
-                    await remote_file.write(content)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"не удалось загрузить: {exc}")
+    code, _, err = await ssh_run_bytes(f"cat > {shlex.quote(target)}", input_data=content, timeout=180)
+    if code != 0:
+        raise HTTPException(status_code=502, detail="не удалось загрузить: " + err.decode("utf-8", "replace")[:200])
     return JSONResponse({"ok": True, "path": target, "size": len(content)})
 
 
@@ -1238,13 +1285,10 @@ async def api_files_upload(request: Request, file: UploadFile = File(...), path:
 async def api_files_mkdir(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
-    path = safe_remote_path(data.get("path"))
-    try:
-        async with await ssh_connect() as conn:
-            async with conn.start_sftp_client() as sftp:
-                await sftp.mkdir(path)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"не удалось создать папку: {exc}")
+    path = safe_writable_path(data.get("path"))
+    code, _, err = await ssh_run_bytes(f"mkdir {shlex.quote(path)}")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="не удалось создать папку: " + err.decode("utf-8", "replace")[:200])
     return JSONResponse({"ok": True})
 
 
@@ -1252,22 +1296,13 @@ async def api_files_mkdir(request: Request) -> JSONResponse:
 async def api_files_delete(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
-    path = safe_remote_path(data.get("path"))
+    path = safe_writable_path(data.get("path"))
     if path == "/":
         raise HTTPException(status_code=400, detail="корень удалить нельзя")
-    recursive = bool(data.get("recursive"))
-    try:
-        async with await ssh_connect() as conn:
-            if recursive:
-                # rm -rf только по проверенному абсолютному пути
-                await asyncio.wait_for(conn.run(f"rm -rf -- {shlex.quote(path)}", check=True), 60)
-            else:
-                async with conn.start_sftp_client() as sftp:
-                    await sftp.remove(path)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"не удалось удалить: {exc}")
+    await assert_realpath_deletable(path)
+    code, _, err = await ssh_run_bytes(f"rm -rf {shlex.quote(path)}", timeout=120)
+    if code != 0:
+        raise HTTPException(status_code=502, detail="не удалось удалить: " + err.decode("utf-8", "replace")[:200])
     return JSONResponse({"ok": True})
 
 
@@ -1275,15 +1310,181 @@ async def api_files_delete(request: Request) -> JSONResponse:
 async def api_files_rename(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
-    source = safe_remote_path(data.get("from"))
-    target = safe_remote_path(data.get("to"))
-    try:
-        async with await ssh_connect() as conn:
-            async with conn.start_sftp_client() as sftp:
-                await sftp.rename(source, target)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"не удалось переименовать: {exc}")
+    source = safe_writable_path(data.get("from"))
+    target = safe_writable_path(data.get("to"))
+    code, _, err = await ssh_run_bytes(f"mv {shlex.quote(source)} {shlex.quote(target)}")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="не удалось переименовать: " + err.decode("utf-8", "replace")[:200])
     return JSONResponse({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# Бэкапы /data колонки на ПК (busybox tar без -z → pipeline с gzip)
+# --------------------------------------------------------------------------- #
+BACKUPS_DIR = BASE / "backups"
+BACKUP_EXCLUDES = ["data/opt/entware", "data/MediaCache", "data/opt/backup"]
+
+
+@app.post("/api/files/backup")
+async def api_files_backup(request: Request) -> JSONResponse:
+    """Архивировать /data колонки (без entware и кешей) и сохранить на ПК."""
+    require_auth(request)
+    BACKUPS_DIR.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    remote = f"/tmp/station-backup-{stamp}.tar.gz"
+    excludes = " ".join(f"--exclude={shlex.quote(e)}" for e in BACKUP_EXCLUDES)
+    code, _, err = await ssh_run_bytes(
+        # /data — симлинк: упаковываем из /bkupgrade, где data — реальный каталог
+        f"cd /bkupgrade && busybox tar -cf - {excludes} data | busybox gzip -6 > {shlex.quote(remote)}",
+        timeout=600,
+    )
+    if code != 0:
+        raise HTTPException(status_code=502, detail="tar не удался: " + err.decode("utf-8", "replace")[:200])
+    code, content, _ = await ssh_run_bytes(f"cat {shlex.quote(remote)}", timeout=600)
+    await ssh_run_bytes(f"rm -f {shlex.quote(remote)}")
+    if code != 0 or not content or len(content) < 1024:
+        raise HTTPException(status_code=502, detail="архив подозрительно мал — бэкап не сохранён")
+    name = f"station-data-{stamp}.tar.gz"
+    (BACKUPS_DIR / name).write_bytes(content)
+    return JSONResponse({"ok": True, "name": name, "size": len(content)})
+
+
+@app.get("/api/files/backups")
+async def api_files_backups(request: Request) -> JSONResponse:
+    require_auth(request)
+    items = []
+    if BACKUPS_DIR.exists():
+        for path in sorted(BACKUPS_DIR.glob("*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True):
+            items.append({"name": path.name, "size": path.stat().st_size, "mtime": int(path.stat().st_mtime)})
+    return JSONResponse({"backups": items})
+
+
+@app.get("/api/files/backups/download")
+async def api_files_backup_download(request: Request, name: str) -> Response:
+    require_auth(request)
+    safe_remote_name(name)
+    local = BACKUPS_DIR / name
+    if not local.exists():
+        raise HTTPException(status_code=404, detail="бэкап не найден")
+    return Response(
+        content=local.read_bytes(),
+        media_type="application/gzip",
+        headers={"content-disposition": f"attachment; filename={name}"},
+    )
+
+
+@app.post("/api/files/restore")
+async def api_files_restore(request: Request) -> JSONResponse:
+    """Залить бэкап обратно на колонку. Пути внутри архива проверяются."""
+    require_auth(request)
+    data = await request.json()
+    name = safe_remote_name(data.get("name"))
+    local = BACKUPS_DIR / name
+    if not local.exists():
+        raise HTTPException(status_code=404, detail="бэкап не найден")
+    content = local.read_bytes()
+    remote = "/tmp/station-restore.tar.gz"
+    try:
+        code, _, err = await ssh_run_bytes(f"cat > {shlex.quote(remote)}", input_data=content, timeout=300)
+        if code != 0:
+            raise HTTPException(status_code=502, detail="не удалось загрузить архив на колонку")
+        code, out, _ = await ssh_run_bytes(
+            f"busybox gzip -dc {shlex.quote(remote)} | busybox tar -tf -", timeout=300,
+        )
+        if code != 0:
+            raise HTTPException(status_code=400, detail="архив повреждён или это не tar.gz")
+        entries = [line for line in out.decode("utf-8", "replace").splitlines() if line.strip()]
+        bad = [e for e in entries if not (e.startswith("data/") or e.startswith("tmp/"))]
+        if bad:
+            raise HTTPException(
+                status_code=403,
+                detail=f"в архиве запрещённые пути ({bad[:3]}...) — восстановление отменено",
+            )
+        code, _, err = await ssh_run_bytes(
+            f"busybox gzip -dc {shlex.quote(remote)} | busybox tar -xf - -C /", timeout=600,
+        )
+        if code != 0:
+            raise HTTPException(status_code=502, detail="распаковка не удалась: " + err.decode("utf-8", "replace")[:200])
+        return JSONResponse({"ok": True, "restored": len(entries)})
+    finally:
+        await ssh_run_bytes(f"rm -f {shlex.quote(remote)}")
+
+
+# --------------------------------------------------------------------------- #
+# Музыка: управление soundya (SoundCloud) и spotiya (Spotify Connect)
+# --------------------------------------------------------------------------- #
+@app.get("/api/music/status")
+async def api_music_status(request: Request) -> JSONResponse:
+    require_auth(request)
+    result: dict[str, Any] = {}
+    code, out, _ = await ssh_run_bytes("soundya status 2>&1", timeout=20)
+    text = out.decode("utf-8", "replace").strip()
+    result["soundya"] = {
+        "installed": "running" in text or "stopped" in text,
+        "running": "running" in text,
+        "playing": text.lower().startswith("playing") or "playing" in text.lower().split(";")[0] if text else False,
+        "raw": text[:300],
+    }
+    code, out, _ = await ssh_run_bytes("spotiya status 2>&1", timeout=20)
+    try:
+        spotiya = json.loads(out.decode("utf-8", "replace"))
+        result["spotiya"] = {
+            "installed": True,
+            "active": bool(spotiya.get("active")),
+            "connected": bool(spotiya.get("connected")),
+            "paused": bool(spotiya.get("paused")),
+            "voice": bool(spotiya.get("voice")),
+            "airplay": bool(spotiya.get("airplay_running")),
+            "title": spotiya.get("title") or "",
+            "artist": spotiya.get("artist") or "",
+            "volume": spotiya.get("volume"),
+            "error": spotiya.get("error") or "",
+        }
+    except json.JSONDecodeError:
+        result["spotiya"] = {"installed": False, "raw": out.decode("utf-8", "replace")[:200]}
+    return JSONResponse(result)
+
+
+@app.post("/api/music/soundya")
+async def api_music_soundya(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    cmd = str(data.get("cmd", "")).strip()
+    arg = str(data.get("arg", "")).strip()
+    allowed = {"play", "pause", "resume", "toggle", "next", "prev", "stop", "shuffle", "repeat", "similar", "likes", "recs", "playlist", "status"}
+    if cmd not in allowed:
+        raise HTTPException(status_code=400, detail="неизвестная команда soundya")
+    if cmd in ("play", "playlist") and not arg:
+        raise HTTPException(status_code=400, detail="нужен запрос")
+    command = f"soundya {cmd}" + (f" {shlex.quote(arg)}" if arg else "")
+    code, out, err = await ssh_run_bytes(command + " 2>&1", timeout=90)
+    return JSONResponse({"ok": code == 0, "output": out.decode("utf-8", "replace")[:400] + err.decode("utf-8", "replace")[:200]})
+
+
+@app.post("/api/music/spotiya")
+async def api_music_spotiya(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    cmd = str(data.get("cmd", "")).strip()
+    arg = str(data.get("arg", "")).strip()
+    allowed = {"play", "pause", "resume", "next", "previous", "stop", "release", "retry", "start", "stop"}
+    if cmd not in allowed:
+        raise HTTPException(status_code=400, detail="неизвестная команда spotiya")
+    command = f"spotiya {cmd}" + (f" {shlex.quote(arg)}" if arg else "")
+    code, out, err = await ssh_run_bytes(command + " 2>&1", timeout=60)
+    return JSONResponse({"ok": code == 0, "output": out.decode("utf-8", "replace")[:400] + err.decode("utf-8", "replace")[:200]})
+
+
+@app.post("/api/music/spotiya/volume")
+async def api_music_spotiya_volume(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    try:
+        value = max(0, min(100, int(data.get("volume"))))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="громкость: 0..100")
+    code, out, _ = await ssh_run_bytes(f"spotiya volume {value} 2>&1", timeout=30)
+    return JSONResponse({"ok": code == 0})
 
 
 # --------------------------------------------------------------------------- #
