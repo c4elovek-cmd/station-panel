@@ -884,14 +884,17 @@ def build_voice_plugin_yap(phrases: list[str], bridge_url: str, bridge_token: st
         host = match.group(1)
 
     phrase_list = ", ".join('"%s"' % p.replace('"', "") for p in phrases)
+    permissions = ["ipc.speech", "commands", "audio"]
+    if host:
+        permissions.append("network")
     toml = (
         f'id = "{VOICE_PLUGIN_ID}"\n'
         'name = "Station Voice"\n'
-        'version = "1.1.0"\n'
+        'version = "1.1.1"\n'
         'entry = "main.lua"\n'
         'description = "Голосовые команды панели Станции"\n'
         "\n"
-        'permissions = ["ipc.speech", "commands", "audio", "network"]\n'
+        f'permissions = [{", ".join(chr(34) + p + chr(34) for p in permissions)}]\n'
         "\n"
         "[launch]\n"
         'kind = "lua"\n'
@@ -1020,7 +1023,7 @@ async def api_voice_deploy(request: Request) -> JSONResponse:
         await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/toggle")
         await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/stop")
         status, body = await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/service/enable")
-        if status != 200:
+        if status not in (200, 202, 204):
             return JSONResponse({"detail": f"автозапуск: YAM вернул {status}: {body}"}, status_code=502)
         return JSONResponse({"ok": True, "manifest": body})
     except HTTPException:
@@ -1105,12 +1108,13 @@ async def api_speaker_say(request: Request) -> JSONResponse:
             raise HTTPException(status_code=500, detail="ffmpeg: " + err.decode("utf-8", "replace")[:200])
 
         content = wav_path.read_bytes()
-        async with await ssh_connect() as conn:
-            async with conn.start_sftp_client() as sftp:
-                async with sftp.open(SAY_REMOTE, "wb") as remote_file:
-                    await remote_file.write(content)
-            # aplay блокируется до конца воспроизведения — ждём с запасом
-            await asyncio.wait_for(conn.run(f"aplay -q {SAY_REMOTE}", check=False), 120)
+        code, _, err = await ssh_run_bytes(f"cat > {shlex.quote(SAY_REMOTE)}", input_data=content, timeout=120)
+        if code != 0:
+            raise HTTPException(status_code=502, detail="не удалось залить аудио на колонку")
+        # aplay блокируется до конца воспроизведения — ждём с запасом
+        code, _, aplay_err = await ssh_run_bytes(f"aplay -q {shlex.quote(SAY_REMOTE)}", timeout=180)
+        if code != 0:
+            raise HTTPException(status_code=502, detail="aplay: " + aplay_err.decode("utf-8", "replace")[:200])
         return JSONResponse({"ok": True, "voice": voice, "mood": mood, "bytes": len(content)})
     finally:
         mp3_path.unlink(missing_ok=True)
