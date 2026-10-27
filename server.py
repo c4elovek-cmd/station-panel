@@ -1492,6 +1492,205 @@ async def api_music_spotiya_volume(request: Request) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
+# Spotify Soloist (официальный Connect, midi-kit): управление по SSH
+# --------------------------------------------------------------------------- #
+SOLOIST_DIR = "/data/local/spotify"
+SOLOIST_CTL = (
+    f"LD_LIBRARY_PATH={SOLOIST_DIR}/runtime/lib "
+    f"{SOLOIST_DIR}/runtime/bin/soloist ctl -w 127.0.0.1:24879"
+)
+
+
+@app.get("/api/music/soloist/status")
+async def api_music_soloist_status(request: Request) -> JSONResponse:
+    require_auth(request)
+    code, out, _ = await ssh_run_bytes(f"{SOLOIST_DIR}/service.sh status 2>&1", timeout=20)
+    service = out.decode("utf-8", "replace").strip()[:200]
+    code, out, _ = await ssh_run_bytes(f"{SOLOIST_CTL} now --json 2>&1", timeout=20)
+    player: Any = None
+    text = out.decode("utf-8", "replace").strip()
+    for line in text.splitlines():
+        if line.startswith("{"):
+            try:
+                player = json.loads(line)
+            except json.JSONDecodeError:
+                player = None
+            break
+    code, key_out, _ = await ssh_run_bytes(f"test -s {SOLOIST_DIR}/api-key && echo yes || echo no", timeout=10)
+    return JSONResponse({
+        "service": service,
+        "player": player,
+        "has_key": key_out.decode("utf-8", "replace").strip() == "yes",
+    })
+
+
+@app.post("/api/music/soloist/cmd")
+async def api_music_soloist_cmd(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    cmd = str(data.get("cmd", "")).strip()
+    arg = str(data.get("arg", "")).strip()
+    if cmd not in {"play", "pause", "resume", "next", "previous", "volume"}:
+        raise HTTPException(status_code=400, detail="неизвестная команда soloist")
+    command = f"{SOLOIST_CTL} {cmd}" + (f" {shlex.quote(arg)}" if arg else "")
+    code, out, _ = await ssh_run_bytes(command + " 2>&1", timeout=30)
+    return JSONResponse({"ok": code == 0, "output": out.decode("utf-8", "replace")[:300]})
+
+
+@app.post("/api/music/soloist/service")
+async def api_music_soloist_service(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    action = str(data.get("action", "")).strip()
+    if action not in {"start", "stop", "restart"}:
+        raise HTTPException(status_code=400, detail="action: start | stop | restart")
+    code, out, _ = await ssh_run_bytes(f"{SOLOIST_DIR}/service.sh {action} 2>&1", timeout=60)
+    return JSONResponse({"ok": code == 0, "output": out.decode("utf-8", "replace")[:300]})
+
+
+@app.post("/api/music/soloist/apikey")
+async def api_music_soloist_apikey(request: Request) -> JSONResponse:
+    """Сохранить spak_-ключ Soloist (создаётся на developer.spotify.com/dashboard/soloist)."""
+    require_auth(request)
+    data = await request.json()
+    key = str(data.get("key", "")).strip()
+    if not key.startswith("spak_"):
+        raise HTTPException(status_code=400, detail="ключ должен начинаться с spak_")
+    key_path = f"{SOLOIST_DIR}/api-key"
+    code, _, err = await ssh_run_bytes(f"umask 077; cat > {shlex.quote(key_path)}", input_data=key.encode(), timeout=30)
+    if code != 0:
+        raise HTTPException(status_code=502, detail="не удалось записать ключ: " + err.decode("utf-8", "replace")[:150])
+    code, out, _ = await ssh_run_bytes(f"{SOLOIST_DIR}/service.sh restart 2>&1", timeout=90)
+    return JSONResponse({"ok": code == 0, "output": out.decode("utf-8", "replace")[:300]})
+
+
+@app.post("/api/music/soundya/token")
+async def api_music_soundya_token(request: Request) -> JSONResponse:
+    """Обновить oauth_token SoundCloud в /data/opt/soundya/config.json."""
+    require_auth(request)
+    data = await request.json()
+    token = str(data.get("token", "")).strip()
+    if len(token) < 40:
+        raise HTTPException(status_code=400, detail="похоже, это не oauth_token")
+    code, current, _ = await ssh_run_bytes("cat /data/opt/soundya/config.json 2>/dev/null", timeout=15)
+    try:
+        config = json.loads(current.decode("utf-8", "replace") or "{}")
+    except json.JSONDecodeError:
+        config = {}
+    config.setdefault("proxy", "socks5://192.168.0.179:1081")
+    config.setdefault("keyword_only", False)
+    config.setdefault("ring", False)
+    config["token"] = token
+    code, _, err = await ssh_run_bytes(
+        "cat > /data/opt/soundya/config.json",
+        input_data=json.dumps(config, ensure_ascii=False).encode(), timeout=15,
+    )
+    if code != 0:
+        raise HTTPException(status_code=502, detail="не удалось записать конфиг: " + err.decode("utf-8", "replace")[:150])
+    code, out, _ = await ssh_run_bytes("/etc/init.d/S99soundya restart 2>&1; sleep 2; soundya likes 2>&1 | head -2", timeout=60)
+    return JSONResponse({"ok": True, "output": out.decode("utf-8", "replace")[:300]})
+
+
+# --------------------------------------------------------------------------- #
+# Локальный плеер ПК: поиск yt-dlp + воспроизведение ffplay («колонка на ПК»)
+# --------------------------------------------------------------------------- #
+LOCAL_PLAYER: dict[str, Any] = {"proc": None, "title": "", "started": 0.0}
+# порядок прокси для поиска с ПК: сначала VPN-канал (xraycore), затем steelproxy
+LOCAL_PLAYER_PROXIES = [
+    "socks5://127.0.0.1:10811",
+    "http://4ys1MYfr:IAWl3Vmz@isp01.steelproxy.com:3071",
+]
+
+
+def _kill_local_player() -> None:
+    proc = LOCAL_PLAYER.get("proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    LOCAL_PLAYER["proc"] = None
+
+
+def _player_running() -> bool:
+    proc = LOCAL_PLAYER.get("proc")
+    return bool(proc and proc.poll() is None)
+
+
+@app.post("/api/player/local")
+async def api_player_local(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    query = str(data.get("query", "")).strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="пустой запрос")
+    source = str(data.get("source", "youtube")).lower()
+    ytdlp = shutil.which("yt-dlp")
+    if not ytdlp:
+        raise HTTPException(status_code=500, detail="yt-dlp не установлен на ПК")
+    search = {"soundcloud": "scsearch5:"}.get(source, "ytsearch1:")
+    _kill_local_player()
+    info = None
+    detail = ""
+    for proxy in LOCAL_PLAYER_PROXIES:
+        try:
+            proc = subprocess.run(
+                [ytdlp, "--dump-json", "--no-playlist", "--no-warnings", "--ignore-errors",
+                 "--default-search", search, "--proxy", proxy, query],
+                capture_output=True, text=True, timeout=180,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception as exc:
+            detail = str(exc)[:150]
+            continue
+        lines = [l for l in proc.stdout.splitlines() if l.strip().startswith("{")]
+        for line in lines:
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # DRM-треки SoundCloud отдаёт без рабочего потока — пропускаем
+            if candidate.get("formats") or candidate.get("url"):
+                info = candidate
+                break
+        if info:
+            break
+        detail = (proc.stderr or detail)[-200:]
+    if info is None:
+        raise HTTPException(status_code=404, detail="играбельного трека нет: " + detail)
+    url = info.get("url") or info.get("webpage_url")
+    title = info.get("title") or query
+
+    ffplay = shutil.which("ffplay")
+    if not ffplay:
+        raise HTTPException(status_code=500, detail="ffplay не найден (ставится вместе с ffmpeg)")
+    LOCAL_PLAYER["proc"] = subprocess.Popen(
+        [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", "80", url],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    LOCAL_PLAYER["title"] = title
+    LOCAL_PLAYER["started"] = time.time()
+    return JSONResponse({"ok": True, "title": title, "source": source})
+
+
+@app.post("/api/player/local/stop")
+async def api_player_local_stop(request: Request) -> JSONResponse:
+    require_auth(request)
+    _kill_local_player()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/player/local/status")
+async def api_player_local_status(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse({
+        "playing": _player_running(),
+        "title": LOCAL_PLAYER.get("title", ""),
+        "elapsed": round(time.time() - LOCAL_PLAYER.get("started", 0.0)),
+    })
+
+
+# --------------------------------------------------------------------------- #
 # SSH-терминал в браузере
 # --------------------------------------------------------------------------- #
 @app.websocket("/ws/console")

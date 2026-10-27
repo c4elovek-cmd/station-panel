@@ -180,6 +180,10 @@
             <button class="btn primary" id="soundyaPlay">Включить</button>
           </div>
           <div class="row wrap">
+            <input class="input" id="soundyaToken" placeholder="Свежий oauth_token (для лайков и плейлистов)" style="flex:1; min-width:200px">
+            <button class="btn sm" id="soundyaTokenSave">Сохранить токен</button>
+          </div>
+          <div class="row wrap" style="margin-top:6px">
             <button class="btn sm" data-soundya="toggle">▶/⏸</button>
             <button class="btn sm" data-soundya="next">⏭</button>
             <button class="btn sm" data-soundya="prev">⏮</button>
@@ -203,6 +207,16 @@
             <button class="btn sm" id="spotiyaVolUp">+</button>
           </div>
           <p class="muted small" id="spotiyaStatus" style="margin-top:8px">spotiya не проверен</p>
+        </div>
+        <div class="panel">
+          <h3>Плеер на ПК <span class="chip" id="localChip">—</span></h3>
+          <p class="muted small" style="margin-top:0">Колонка не нужна: поиск и воспроизведение прямо на компьютере (YouTube/SoundCloud через steelproxy).</p>
+          <div class="row wrap" style="margin-bottom:8px">
+            <input class="input" id="localQuery" placeholder="Что включить на ПК" style="flex:1; min-width:200px">
+            <button class="btn primary" id="localPlay">Включить</button>
+            <button class="btn" id="localStop">Стоп</button>
+          </div>
+          <p class="muted small" id="localStatus" style="margin-top:8px">ничего не играет</p>
         </div>
       </div>
       <p class="muted small" style="margin-top:10px">AirPlay 2: колонка видна в сети как приёмник — можно передавать системный звук ПК (TuneBlade и т.п.) или кастить YouTube через дополнение spotiya.</p>
@@ -440,6 +454,7 @@
           <div class="row">
             <button class="btn primary" id="voiceDeploy">Установить на колонку</button>
             <button class="btn" id="voiceSourceSave">Сохранить источник в мосте</button>
+            <a class="btn" id="wakewordLink" href="#" target="_blank" rel="noreferrer">Слова активации ↗</a>
           </div>
           <p class="muted small" id="voiceStatus" style="margin-top:8px"></p>
         </div>

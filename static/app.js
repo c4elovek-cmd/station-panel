@@ -1231,12 +1231,59 @@ $('spotiyaVolDown').onclick = async () => {
   setTimeout(musicStatus, 1200);
 };
 
+/* ------------------------- плеер на ПК ------------------------- */
+let localTimer = null;
+
+async function localStatus() {
+  try {
+    const data = await api('/api/player/local/status');
+    $('localChip').textContent = data.playing ? 'играет' : 'тишина';
+    $('localStatus').textContent = data.playing
+      ? `играет: ${data.title} · ${data.elapsed} с`
+      : 'ничего не играет';
+  } catch (error) {
+    $('localChip').textContent = 'ошибка';
+  }
+}
+
+$('localPlay').onclick = async () => {
+  const query = $('localQuery').value.trim();
+  if (!query) { notify($('localStatus'), 'введи запрос', 'error'); return; }
+  notify($('localStatus'), 'ищу и запускаю на ПК…');
+  try {
+    const result = await api('/api/player/local', { method: 'POST', body: JSON.stringify({ query }) });
+    notify($('localStatus'), 'играет: ' + result.title, 'ok');
+  } catch (error) {
+    notify($('localStatus'), 'ошибка: ' + error.message, 'error');
+  }
+};
+$('localQuery').onkeydown = event => { if (event.key === 'Enter') $('localPlay').click(); };
+$('localStop').onclick = async () => {
+  try { await api('/api/player/local/stop', { method: 'POST', body: '{}' }); } catch (error) { notify($('localStatus'), 'ошибка: ' + error.message, 'error'); }
+  localStatus();
+};
+
+$('soundyaTokenSave').onclick = async () => {
+  const token = $('soundyaToken').value.trim();
+  if (!token) { notify($('soundyaStatus'), 'вставь oauth_token из браузера', 'error'); return; }
+  notify($('soundyaStatus'), 'сохраняю токен…');
+  try {
+    const result = await api('/api/music/soundya/token', { method: 'POST', body: JSON.stringify({ token }) });
+    $('soundyaToken').value = '';
+    notify($('soundyaStatus'), result.output || 'токен сохранён', result.output && result.output.includes('error') ? 'error' : 'ok');
+  } catch (error) {
+    notify($('soundyaStatus'), 'ошибка: ' + error.message, 'error');
+  }
+};
+
 // статус музыки — при открытии вкладки и далее по таймеру
 const musicObserver = new MutationObserver(() => {
   if ($('tab-music').classList.contains('active') && !musicObserverBound) {
     musicObserverBound = true;
     musicStatus();
+    localStatus();
     setInterval(musicStatus, 10000);
+    setInterval(localStatus, 5000);
   }
 });
 musicObserver.observe($('tab-music'), { attributes: true, attributeFilter: ['class'] });
@@ -1247,6 +1294,9 @@ musicObserver.observe($('tab-music'), { attributes: true, attributeFilter: ['cla
   connectTerminal();
   await refreshStatus();
   loadVoiceConfig();
+  api('/api/config').then(config => {
+    $('wakewordLink').href = 'http://' + config.station_ip + ':8780/';
+  }).catch(() => {});
   // если колонка недоступна по сохранённому IP — пробуем найти автоматически
   if (state.status && !state.status.reachable) {
     const detect = await detectStation(true);
