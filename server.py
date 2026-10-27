@@ -742,8 +742,9 @@ async def api_panel_update_check(request: Request) -> JSONResponse:
 
         local_commit = await run("rev-parse HEAD")
         remote_url = await run("remote get-url origin")
-        # git@github.com:owner/repo(.git) → owner/repo
-        slug = re.sub(r"^[^:/]+[:/]|\.git$", "", remote_url.strip())
+        # https://github.com/owner/repo(.git) или git@github.com:owner/repo(.git) → owner/repo
+        slug = re.sub(r"^(?:https?://|git@)?[^:/]*[:/]+github\.com[:/]?", "", remote_url.strip())
+        slug = re.sub(r"\.git$", "", slug)
         await run("fetch origin --quiet")
     except Exception as exc:
         return JSONResponse({"ok": False, "detail": str(exc)[:400]}, status_code=500)
