@@ -774,6 +774,49 @@ function drawCharts() {
   });
 });
 
+/* ------------------------- автонастройка ------------------------- */
+function setupRenderStep(step) {
+  const mark = step.ok ? '✓' : '✗';
+  const cls = step.ok ? 'ok' : 'err';
+  return `<div class="setup-step ${cls}"><b>${mark} ${step.step}:</b> ${step.detail}</div>`;
+}
+
+$('setupFull').onclick = async () => {
+  const btn = $('setupFull');
+  btn.disabled = true;
+  $('setupSteps').innerHTML = '';
+  notify($('setupStatus'), 'идёт автонастройка, это до минуты…');
+  try {
+    const res = await api('/api/setup/full', { method: 'POST', body: '{}' });
+    $('setupSteps').innerHTML = (res.steps || []).map(setupRenderStep).join('');
+    if (res.ok) {
+      notify($('setupStatus'), 'автонастройка завершена — колонка настроена', 'ok');
+      state.socket && state.socket.close();
+      setTimeout(() => { connectTerminal(); refreshStatus(); }, 400);
+      loadSettings();
+    } else {
+      notify($('setupStatus'), 'не готово: ' + (res.error || 'смотрите шаги выше'), 'error');
+    }
+  } catch (error) {
+    notify($('setupStatus'), 'ошибка: ' + error.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+$('setupKeyShow').onclick = async () => {
+  try {
+    const res = await api('/api/setup/ssh-key');
+    if (res.exists) {
+      $('setupSteps').innerHTML = setupRenderStep({ step: 'Публичный ключ панели', ok: true, detail: '<code style="word-break:break-all">' + res.public_key + '</code>' });
+    } else {
+      notify($('setupStatus'), 'ключ ещё не создан — запустите автонастройку', 'error');
+    }
+  } catch (error) {
+    notify($('setupStatus'), 'ошибка: ' + error.message, 'error');
+  }
+};
+
 /* ------------------------------- система ------------------------------- */
 async function loadSettings() {
   try {

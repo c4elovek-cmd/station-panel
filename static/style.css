@@ -413,3 +413,14 @@ canvas { width: 100%; display: block; border-radius: 10px; cursor: crosshair; }
   .term-wrap { height: 60vh; }
   .content { padding: 18px; }
 }
+
+/* ── автонастройка ─────────────────────────────────────────────── */
+.setup-steps { display: flex; flex-direction: column; gap: 6px; }
+.setup-step {
+  font-size: 13px; line-height: 1.45; padding: 7px 10px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.setup-step.ok { border-color: rgba(52, 211, 153, 0.35); }
+.setup-step.err { border-color: rgba(251, 113, 133, 0.35); }
+.setup-step b { font-weight: 600; }

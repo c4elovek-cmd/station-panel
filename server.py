@@ -176,18 +176,28 @@ async def index(request: Request) -> Response:
 
 
 # --------------------------------------------------------------------------- #
-# SSH к колонке
+# SSH к колонке (по ключу, с откатом на пустой пароль dropbear -B)
 # --------------------------------------------------------------------------- #
+KEY_DIR = BASE / "keys"
+KEY_PRIV = KEY_DIR / "id_ed25519"
+KEY_PUB = KEY_DIR / "id_ed25519.pub"
+
+
 async def ssh_connect():
-    return await asyncssh.connect(
-        cfg["station_ip"],
+    """Подключиться к колонке: сначала пробуем свой SSH-ключ, затем пустой пароль."""
+    options = dict(
+        host=cfg["station_ip"],
         port=cfg["ssh_port"],
         username=cfg["ssh_user"],
-        password="",
         known_hosts=None,
-        client_keys=None,
         login_timeout=10,
     )
+    if KEY_PRIV.exists():
+        try:
+            return await asyncssh.connect(**options, client_keys=[str(KEY_PRIV)], password="")
+        except (asyncssh.PermissionDenied, asyncssh.DisconnectError):
+            pass  # ключ ещё не установлен или отвергнут — пробуем пустой пароль
+    return await asyncssh.connect(**options, client_keys=None, password="")
 
 
 async def ssh_run(command: str, timeout: float = 20.0) -> tuple[int, str, str]:
@@ -708,6 +718,222 @@ async def api_reboot(request: Request) -> JSONResponse:
     except Exception:
         pass  # связь рвётся штатно — колонка уходит в перезагрузку
     return JSONResponse({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# Автонастройка: SSH-ключ, SFTP, автодетект параметров
+# --------------------------------------------------------------------------- #
+def ssh_key_public_line() -> str | None:
+    if KEY_PUB.exists():
+        return KEY_PUB.read_text(encoding="utf-8").strip()
+    return None
+
+
+async def setup_ssh_key() -> dict[str, Any]:
+    """Сгенерировать ключ панели и установить его в authorized_keys колонки.
+
+    Идемпотентно: перед добавлением убираем свою старую строку, поэтому
+    повторный запуск не плодит дубли в ~/.ssh/authorized_keys.
+    """
+    KEY_DIR.mkdir(exist_ok=True)
+    if not KEY_PRIV.exists():
+        key = asyncssh.generate_private_key("ssh-ed25519")
+        key.write_private_key(str(KEY_PRIV))
+        pub = key.export_public_key("openssh")
+        KEY_PUB.write_text(f"{pub} station-panel\n", encoding="utf-8")
+        KEY_PRIV.chmod(0o600)
+        print("[+] создан SSH-ключ панели: keys/id_ed25519")
+    pub_line = KEY_PUB.read_text(encoding="utf-8").strip()
+
+    script = (
+        'umask 077; mkdir -p ~/.ssh; '
+        'touch ~/.ssh/authorized_keys; '
+        'grep -v "station-panel" ~/.ssh/authorized_keys > ~/.ssh/ak_new; '
+        f'echo "{pub_line}" >> ~/.ssh/ak_new; '
+        'mv ~/.ssh/ak_new ~/.ssh/authorized_keys; '
+        'chmod 600 ~/.ssh/authorized_keys; echo OK'
+    )
+    code, out, err = await ssh_run(script, timeout=20)
+    ok = code == 0 and "OK" in out
+    return {"installed": ok, "public_key": pub_line, "error": err.strip() if not ok else ""}
+
+
+async def sftp_probe() -> dict[str, Any]:
+    """Проверка SFTP-подсистемы.
+
+    dropbear обычно собран без sftp-server — файловый менеджер панели
+    в этом случае работает через exec-каналы SSH, это не ошибка.
+    """
+    try:
+        async with await ssh_connect() as conn:
+            try:
+                sftp = await conn.start_sftp()
+                await sftp.listdir(".")
+                return {"sftp": "subsystem", "detail": "SFTP-подсистема доступна"}
+            except (asyncssh.SFTPError, OSError, NotImplementedError) as exc:
+                return {"sftp": "no", "detail": f"подсистема недоступна: {exc}"[:200]}
+    except Exception as exc:
+        return {"sftp": "no", "detail": f"SSH недоступен: {exc}"[:200]}
+
+
+def _probe_ip_sync(ip: str) -> str | None:
+    """Синхронная проверка одного IP: отвечает ли YAM (для asyncio.to_thread)."""
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(  # noqa: S310
+            f"http://{ip}:{cfg['yam_port']}/api/device", timeout=1.5
+        ) as resp:
+            if resp.status == 200:
+                device = json.loads(resp.read(4096))
+                if isinstance(device, dict) and device.get("model"):
+                    return ip
+    except Exception:
+        pass
+    return None
+
+
+@app.post("/api/setup/ssh-key")
+async def api_setup_ssh_key(request: Request) -> JSONResponse:
+    """Установить (или обновить) SSH-ключ панели на колонке."""
+    require_auth(request)
+    try:
+        result = await setup_ssh_key()
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse(
+            {"installed": False, "public_key": None, "error": f"{type(exc).__name__}: {exc}"},
+            status_code=502,
+        )
+
+
+@app.get("/api/setup/ssh-key")
+async def api_setup_ssh_key_get(request: Request) -> JSONResponse:
+    """Показать публичный ключ панели без установки."""
+    require_auth(request)
+    line = ssh_key_public_line()
+    return JSONResponse({"exists": bool(line), "public_key": line})
+
+
+@app.get("/api/setup/sftp-probe")
+async def api_setup_sftp_probe(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse(await sftp_probe())
+
+
+@app.post("/api/setup/full")
+async def api_setup_full(request: Request) -> JSONResponse:
+    """Полная автонастройка: детект IP → порт YAM → SSH → ключ → SFTP.
+
+    Каждый шаг не роняет следующий: то, что не нашлось, помечается в steps.
+    """
+    require_auth(request)
+    steps: list[dict[str, Any]] = []
+
+    # 1. детект IP — дублируем логику /api/detect через прямой вызов probe
+    found_ip: str | None = None
+    scanned = 0
+    if cfg.get("station_ip"):
+        try:
+            timeout = aiohttp.ClientTimeout(total=1.2)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"http://{cfg['station_ip']}:{cfg['yam_port']}/api/device") as resp:
+                    if resp.status == 200:
+                        device = await resp.json(content_type=None)
+                        if isinstance(device, dict) and device.get("model"):
+                            found_ip = cfg["station_ip"]
+        except Exception:
+            pass
+    if not found_ip:
+        network_prefix = ".".join(str(cfg.get("station_ip", "")).split(".")[:3])
+        if not all(p.isdigit() for p in network_prefix.split(".")):
+            return JSONResponse({"ok": False, "steps": steps,
+                                 "error": "не знаю, какую подсеть сканировать — задайте IP станции"})
+        current = cfg["station_ip"]
+        local_octet = current.split(".")[3] if current.startswith(network_prefix + ".") else None
+        candidates = [f"{network_prefix}.{o}" for o in range(1, 255) if str(o) != local_octet]
+        for i in range(0, len(candidates), 40):
+            batch = candidates[i:i + 40]
+            scanned += len(batch)
+            results = await asyncio.gather(*(asyncio.to_thread(_probe_ip_sync, ip) for ip in batch))
+            hit = next((ip for ip in results if ip), None)
+            if hit:
+                found_ip = hit
+                break
+    steps.append({"step": "IP станции", "ok": bool(found_ip),
+                  "detail": found_ip or "не найдена — проверьте, что колонка в той же сети"})
+    if not found_ip:
+        return JSONResponse({"ok": False, "steps": steps, "error": "колонка не найдена в сети"})
+    if found_ip != cfg["station_ip"]:
+        cfg["station_ip"] = found_ip
+        _status_cache["ts"] = 0.0
+
+    # 2. порт YAM
+    yam_port = None
+    for port in (cfg["yam_port"], 8099, 8080, 80):
+        try:
+            timeout = aiohttp.ClientTimeout(total=1.5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"http://{found_ip}:{port}/api/device") as resp:
+                    if resp.status == 200:
+                        yam_port = port
+                        break
+        except Exception:
+            continue
+    if yam_port:
+        cfg["yam_port"] = yam_port
+    steps.append({"step": "Порт YAM", "ok": bool(yam_port), "detail": str(yam_port or "не найден")})
+
+    # 3. SSH-порт
+    ssh_ok = False
+    ssh_ports = [cfg["ssh_port"], 2222, 22] if cfg["ssh_port"] not in (2222, 22) else [cfg["ssh_port"], 22]
+    for port in ssh_ports:
+        cfg["ssh_port"] = port
+        try:
+            async with await ssh_connect() as conn:
+                result = await asyncio.wait_for(conn.run("echo alive", check=False, encoding="utf-8"), 8)
+                if (result.exit_status or 0) == 0 and "alive" in (result.stdout or ""):
+                    ssh_ok = True
+                    break
+        except Exception:
+            continue
+    steps.append({"step": "SSH", "ok": ssh_ok, "detail": f"порт {cfg['ssh_port']}" if ssh_ok else "не отвечает на портах 2222/22"})
+    save_config(cfg)
+    if not ssh_ok:
+        return JSONResponse({"ok": False, "steps": steps, "error": "SSH недоступен"})
+
+    # 4. SSH-ключ
+    key_res = await setup_ssh_key()
+    steps.append({"step": "SSH-ключ", "ok": key_res["installed"],
+                  "detail": "установлен" if key_res["installed"] else (key_res["error"] or "не установился")})
+
+    # 5. проверка входа по ключу (отключаем fallback на пустой пароль)
+    if key_res["installed"]:
+        try:
+            async with await asyncssh.connect(
+                cfg["station_ip"], port=cfg["ssh_port"], username=cfg["ssh_user"],
+                client_keys=[str(KEY_PRIV)], password="", known_hosts=None, login_timeout=10,
+            ) as conn:
+                result = await conn.run("echo key-login", check=False, encoding="utf-8")
+                key_login = "key-login" in (result.stdout or "")
+        except Exception:
+            key_login = False
+        steps.append({"step": "Вход по ключу", "ok": key_login,
+                      "detail": "работает" if key_login else "пока вход по пустому паролю"})
+        if key_login and not cfg.get("ssh_key_only"):
+            cfg["ssh_key_only"] = True
+            save_config(cfg)
+
+    # 6. SFTP
+    sftp_res = await sftp_probe()
+    if sftp_res["sftp"] == "subsystem":
+        steps.append({"step": "SFTP", "ok": True, "detail": "SFTP-подсистема доступна — файлы идут через неё"})
+    else:
+        steps.append({"step": "SFTP", "ok": True,
+                      "detail": "SFTP-подсистемы нет (обычно у dropbear) — файловый менеджер работает через SSH-каналы"})
+
+    steps.append({"step": "Готово", "ok": True, "detail": "автонастройка завершена"})
+    return JSONResponse({"ok": True, "steps": steps})
 
 
 @app.get("/api/config")

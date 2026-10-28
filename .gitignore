@@ -3,6 +3,7 @@ config.json
 password.txt
 backups/
 soundproxy-secrets.json
+keys/
 
 # runtime
 run/

@@ -469,6 +469,20 @@
 
       <div class="grid2">
         <div class="panel">
+          <h3>Автонастройка</h3>
+          <p class="muted small" style="margin-top:0">
+            Найдёт колонку в сети, подберёт порты, создаст SSH-ключ панели и установит
+            его на колонку — руками ничего вводить не надо. Повторный запуск безопасен.
+          </p>
+          <div class="row">
+            <button class="btn primary" id="setupFull">Запустить автонастройку</button>
+            <button class="btn" id="setupKeyShow">Показать ключ</button>
+          </div>
+          <div id="setupSteps" class="setup-steps" style="margin-top:10px"></div>
+          <p class="muted small" id="setupStatus" style="margin-top:8px"></p>
+        </div>
+
+        <div class="panel">
           <h3>Подключение к колонке</h3>
           <label class="field"><span>IP станции</span><input class="input" id="cfgIp"></label>
           <label class="field"><span>Порт SSH</span><input class="input" id="cfgSsh" type="number"></label>
