@@ -73,10 +73,12 @@ function showTab(name) {
   document.querySelectorAll('.tab').forEach(tab => tab.classList.toggle('active', tab.id === 'tab-' + name));
   if (name === 'console') setTimeout(() => { state.fit && state.fit.fit(); state.term && state.term.focus(); }, 60);
   if (name === 'sensors') drawCharts();
+  if (name === 'wakeword') { wwRefresh(); if (!wwTimer) wwTimer = setInterval(wwRefresh, 700); }
   localStorage.setItem('sp_tab', name);
 }
 
 document.querySelectorAll('.nav-item').forEach(item => item.onclick = () => showTab(item.dataset.tab));
+$('voiceGoWords').onclick = () => showTab('wakeword');
 
 $('logout').onclick = async () => {
   await api('/api/logout', { method: 'POST', body: '{}' }).catch(() => {});
@@ -1288,15 +1290,241 @@ const musicObserver = new MutationObserver(() => {
 });
 musicObserver.observe($('tab-music'), { attributes: true, attributeFilter: ['class'] });
 
+/* ------------------------- слова активации ------------------------- */
+const ww = (path, options) => api('/wakeword/' + path, options);
+let wwState = null;
+let wwTimer = null;
+let wwBusy = false;
+let wwDragging = false;
+
+const wwSleep = ms => new Promise(r => setTimeout(r, ms));
+
+function wwPct(x) { return Math.round(Math.max(0, Math.min(1, x)) * 100) + '%'; }
+
+function wwEsc(value) { return esc(value); }
+
+/* аудио и прогресс */
+function wwRenderAudio() {
+  const audio = wwState?.audio || {};
+  const chip = $('wwAudioChip');
+  chip.textContent = audio.ok ? 'слышно' : 'нет звука';
+  chip.style.color = audio.ok ? 'var(--ok)' : 'var(--danger)';
+  const level = typeof audio.level === 'number' ? audio.level : -90;
+  const norm = Math.max(0, Math.min(1, (level + 80) / 70));
+  $('wwLevelBar').style.width = wwPct(norm);
+  $('wwLevelText').textContent = `${level.toFixed(1)} дБ${audio.channel ? ' · ' + audio.channel : ''}`;
+}
+
+/* обучение */
+function wwRenderTrain() {
+  const t = wwState?.train || {};
+  const panel = $('wwTrainPanel');
+  panel.hidden = !t.active && !t.error;
+  if (panel.hidden) return;
+  $('wwTrainWord').textContent = t.name || t.word || '';
+  const stages = { load: [0, 0.02], embed: [0.02, 0.45], train: [0.45, 0.95], calibrate: [0.95, 1] };
+  const names = { load: 'загрузка', embed: 'обработка записей', train: 'обучение', calibrate: 'проверка' };
+  const [a, b] = stages[t.stage] || [0, 1];
+  const frac = Math.max(0, Math.min(1, a + (b - a) * (t.frac || 0)));
+  $('wwTrainBar').style.width = wwPct(frac);
+  $('wwTrainPct').textContent = wwPct(frac);
+  $('wwTrainStage').textContent = t.error ? 'Ошибка: ' + t.error : (names[t.stage] || t.stage || '') + '…';
+}
+
+/* список слов */
+function wwRenderWords() {
+  const words = wwState?.words || [];
+  $('wwEmpty').hidden = words.length > 0;
+  const box = $('wwWords');
+  if (wwDragging) {  // не перерисовываем под активным ползунком
+    words.forEach(w => {
+      const meter = box.querySelector(`[data-meter="${w.id}"]`);
+      if (meter) meter.style.width = wwPct(w.score);
+    });
+    return;
+  }
+  box.innerHTML = words.map(w => {
+    const thr = Math.min(0.99, Math.max(0.05, w.threshold - w.sensitivity));
+    const notes = (w.notes || []).map(n => `<div class="muted small">${wwEsc(n)}</div>`).join('');
+    return `<div class="ww-word">
+      <div class="ww-word-head">
+        <h3>«${wwEsc(w.name)}»</h3>
+        <label class="check" style="margin:0"><input type="checkbox" data-ww-enable="${wwEsc(w.id)}" ${w.enabled ? 'checked' : ''}> включено</label>
+        <span class="grow" style="flex:1"></span>
+        <span class="muted small">${w.takes} записей · узнаёт ${wwPct(w.recall)} · ложных ≈ ${(w.false_per_h ?? 0).toFixed(1)}/час</span>
+      </div>
+      <div class="ww-meter" title="Уверенность сейчас; отметка — порог срабатывания">
+        <i data-meter="${wwEsc(w.id)}" style="width:${wwPct(w.score)}"></i><b style="left:${wwPct(thr)}"></b>
+      </div>
+      <div class="row wrap">
+        <span class="muted small">реже</span>
+        <input type="range" min="-0.3" max="0.3" step="0.05" value="${w.sensitivity}" data-ww-sens="${wwEsc(w.id)}" style="flex:1; min-width:120px">
+        <span class="muted small">чаще</span>
+      </div>
+      ${notes}
+      <div class="row wrap" style="margin-top:10px">
+        <button class="btn sm" data-ww-more="${wwEsc(w.name)}">Дозаписать</button>
+        <button class="btn sm" data-ww-retrain="${wwEsc(w.id)}">Переобучить</button>
+        <span style="flex:1"></span>
+        <button class="btn sm danger" data-ww-del="${wwEsc(w.id)}" data-ww-name="${wwEsc(w.name)}">Удалить</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* мастер записи слова */
+function wwRenderEnroll() {
+  const e = wwState?.enroll;
+  $('wwWizard').hidden = !e;
+  if (!e) return;
+  $('wwName').textContent = e.name;
+  $('wwMinTakes').textContent = e.min_takes;
+  const enough = e.takes.length >= e.min_takes;
+  $('wwStepAmbient').className = 'ww-step ' + (e.has_ambient ? 'done' : 'cur');
+  $('wwStepTakes').className = 'ww-step ' + (enough ? 'done' : (e.has_ambient ? 'cur' : ''));
+  $('wwStepSpeech').className = 'ww-step ' + (e.speech_secs > 0 ? 'done' : '');
+  $('wwStepTrain').className = 'ww-step ' + (enough && e.has_ambient ? 'cur' : '');
+  $('wwTrainBtn').disabled = wwBusy || !enough || !e.has_ambient;
+  $('wwAmbientMsg').textContent = e.has_ambient ? 'записано' : '';
+  $('wwSpeechMsg').textContent = e.speech_secs > 0 ? 'записано' : '';
+  $('wwTakes').innerHTML = (e.takes || []).map((d, i) => `<span class="ww-take">#${i + 1} ${Number(d).toFixed(2)} с
+      <button class="btn sm ghost" data-ww-play-take="${i}" title="Послушать">▶</button>
+      <button class="btn sm ghost" data-ww-del-take="${i}" title="Удалить">✕</button></span>`).join('');
+}
+
+/* срабатывания */
+function wwRenderHits() {
+  const hits = wwState?.hits || [];
+  $('wwNoHits').hidden = hits.length > 0;
+  $('wwHits').innerHTML = hits.map(h => `<div class="ww-hit">
+      <time>${new Date(h.at).toLocaleTimeString()}</time>
+      <span>«${wwEsc(h.name)}» · ${Number(h.score).toFixed(2)} ${h.error ? '· ' + wwEsc(h.error) : (h.fired ? '· слушала' : '')}</span>
+      <span></span>
+      <span class="row">
+        <button class="btn sm" data-ww-play-hit="${wwEsc(h.id)}">▶</button>
+        <button class="btn sm" data-ww-false="${wwEsc(h.id)}">Ложное</button>
+      </span>
+    </div>`).join('');
+}
+
+async function wwRefresh() {
+  try {
+    wwState = await ww('api/state');
+    wwRenderAudio();
+    wwRenderTrain();
+    wwRenderWords();
+    wwRenderEnroll();
+    wwRenderHits();
+  } catch (error) {
+    $('wwAudioChip').textContent = 'нет связи';
+    $('wwAudioChip').style.color = 'var(--danger)';
+  }
+}
+
+async function wwRun(btn, fn) {
+  if (wwBusy) return;
+  wwBusy = true;
+  if (btn) btn.disabled = true;
+  try { await fn(); } catch (error) { alert(error.message); }
+  finally { wwBusy = false; if (btn) btn.disabled = false; await wwRefresh(); }
+}
+
+$('wwNewBtn').onclick = () => {
+  const name = prompt('Какое слово будет звать станцию? Например: Джарвис, Компьютер, Станция');
+  if (!name) return;
+  wwRun(null, async () => {
+    $('wwTakeMsg').textContent = '';
+    $('wwSpeechMsg').textContent = '';
+    $('wwSay').textContent = '';
+    await ww('api/enroll/start', { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
+  });
+};
+
+$('wwCancel').onclick = () => {
+  if (confirm('Бросить запись этого слова?')) wwRun(null, () => ww('api/enroll/cancel', { method: 'POST', body: '{}' }));
+};
+
+$('wwAmbientBtn').onclick = () => wwRun($('wwAmbientBtn'), async () => {
+  notify($('wwAmbientMsg'), 'тихо… 8 секунд');
+  const r = await ww('api/enroll/ambient', { method: 'POST', body: '{}' });
+  notify($('wwAmbientMsg'), `записано (фон ${Number(r.level).toFixed(0)} дБ)`, 'ok');
+});
+
+$('wwTakeBtn').onclick = () => wwRun($('wwTakeBtn'), async () => {
+  notify($('wwTakeMsg'), '');
+  $('wwPlayLast').hidden = true;
+  for (const n of ['3', '2', '1']) { $('wwSay').textContent = n + '…'; await wwSleep(500); }
+  $('wwSay').textContent = 'Говорите!';
+  try {
+    const r = await ww('api/enroll/take', { method: 'POST', body: '{}' });
+    notify($('wwTakeMsg'), r.ok ? `отлично: ${Number(r.duration).toFixed(2)} с · всего ${r.takes}` : (r.message || 'не получилось'), r.ok ? 'ok' : 'error');
+  } finally {
+    $('wwSay').textContent = '';
+    $('wwPlayLast').hidden = false;
+  }
+});
+
+$('wwSpeechBtn').onclick = () => wwRun($('wwSpeechBtn'), async () => {
+  notify($('wwSpeechMsg'), 'читайте вслух… 20 секунд');
+  await ww('api/enroll/speech?secs=20', { method: 'POST', body: '{}' });
+  notify($('wwSpeechMsg'), 'записано', 'ok');
+});
+
+$('wwTrainBtn').onclick = () => wwRun($('wwTrainBtn'), async () => {
+  await ww('api/enroll/train', { method: 'POST', body: '{}' });
+  notify($('wwTrainMsg'), 'обучение началось', 'ok');
+});
+
+$('wwListenBtn').onclick = () => wwRun($('wwListenBtn'), async () => {
+  await ww('api/listen', { method: 'POST', body: '{}' });
+});
+
+$('wwPlayLast').onclick = () => new Audio('/wakeword/api/enroll/take/last?t=' + Date.now()).play();
+
+/* прослушивание: записи слова и срабатываний */
+document.addEventListener('click', event => {
+  const btn = event.target.closest('button');
+  if (!btn) return;
+  const playTake = btn.dataset.wwPlayTake;
+  if (playTake !== undefined) { new Audio('/wakeword/api/enroll/take/' + playTake + '?t=' + Date.now()).play(); return; }
+  const delTake = btn.dataset.wwDelTake;
+  if (delTake !== undefined) { wwRun(null, () => ww('api/enroll/take/' + delTake, { method: 'DELETE' })); return; }
+  const playHit = btn.dataset.wwPlayHit;
+  if (playHit !== undefined) { new Audio('/wakeword/api/hits/' + playHit + '?t=' + Date.now()).play(); return; }
+  const falseHit = btn.dataset.wwFalse;
+  if (falseHit !== undefined) { wwRun(null, () => ww('api/hits/' + falseHit + '/false', { method: 'POST', body: '{}' })); return; }
+  const more = btn.dataset.wwMore;
+  if (more !== undefined) { wwRun(null, () => ww('api/enroll/start', { method: 'POST', body: JSON.stringify({ name: more }) })); return; }
+  const retrain = btn.dataset.wwRetrain;
+  if (retrain !== undefined) { wwRun(null, () => ww('api/words/' + retrain + '/retrain', { method: 'POST', body: '{}' })); return; }
+  const del = btn.dataset.wwDel;
+  if (del !== undefined && confirm(`Удалить слово «${btn.dataset.wwName}» со всеми записями?`)) {
+    wwRun(null, () => ww('api/words/' + del, { method: 'DELETE' }));
+  }
+});
+
+/* включение/чувствительность */
+document.addEventListener('change', event => {
+  const target = event.target;
+  if (target.dataset.wwEnable !== undefined) {
+    wwRun(null, () => ww('api/words/' + target.dataset.wwEnable, { method: 'POST', body: JSON.stringify({ enabled: target.checked }) }));
+  }
+  if (target.dataset.wwSens !== undefined) {
+    wwDragging = true;
+    const value = parseFloat(target.value);
+    wwRun(null, async () => {
+      await ww('api/words/' + target.dataset.wwSens, { method: 'POST', body: JSON.stringify({ sensitivity: value }) });
+      target.blur();
+    }).finally(() => { wwDragging = false; });
+  }
+});
+
 /* -------------------------------- запуск -------------------------------- */
 (async function start() {
   showTab(localStorage.getItem('sp_tab') || 'overview');
   connectTerminal();
   await refreshStatus();
   loadVoiceConfig();
-  api('/api/config').then(config => {
-    $('wakewordLink').href = 'http://' + config.station_ip + ':8780/';
-  }).catch(() => {});
   // если колонка недоступна по сохранённому IP — пробуем найти автоматически
   if (state.status && !state.status.reachable) {
     const detect = await detectStation(true);

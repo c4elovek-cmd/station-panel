@@ -30,6 +30,7 @@
         <button class="nav-item" data-tab="led"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Подсветка</button>
         <button class="nav-item" data-tab="sensors"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>Датчики</button>
         <button class="nav-item" data-tab="music"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>Музыка</button>
+        <button class="nav-item" data-tab="wakeword"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M19 11a7 7 0 0 1-14 0"/><line x1="12" y1="18" x2="12" y2="21"/></svg>Слова</button>
         <button class="nav-item" data-tab="files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>Файлы</button>
         <button class="nav-item" data-tab="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Система</button>
       </nav>
@@ -220,6 +221,83 @@
         </div>
       </div>
       <p class="muted small" style="margin-top:10px">AirPlay 2: колонка видна в сети как приёмник — можно передавать системный звук ПК (TuneBlade и т.п.) или кастить YouTube через дополнение spotiya.</p>
+    </section>
+
+    <!-- СЛОВА АКТИВАЦИИ -->
+    <section class="tab" id="tab-wakeword">
+      <header class="head">
+        <h2>Слова активации</h2>
+        <div class="row">
+          <span class="chip" id="wwAudioChip">аудио ?</span>
+          <button class="btn" id="wwListenBtn" title="Станция начнёт слушать, как по слову">Проверить: «слушаю»</button>
+          <button class="btn primary" id="wwNewBtn">Новое слово</button>
+        </div>
+      </header>
+
+      <div class="panel">
+        <div class="row between">
+          <h3 style="margin:0">Микрофон</h3>
+          <span class="muted small" id="wwLevelText">—</span>
+        </div>
+        <div class="bar" style="margin-top:10px"><span id="wwLevelBar" style="width:0%"></span></div>
+        <p class="muted small" style="margin:8px 0 0">Уровень в реальном времени. Если полоса не двигается — станция не слышит (проверь микрофон в «Системе»).</p>
+      </div>
+
+      <div class="panel" id="wwTrainPanel" hidden>
+        <div class="row between">
+          <h3 style="margin:0">Обучение «<span id="wwTrainWord"></span>»</h3>
+          <span class="chip" id="wwTrainPct">0%</span>
+        </div>
+        <div class="bar" style="margin-top:10px"><span id="wwTrainBar" style="width:0%"></span></div>
+        <p class="muted small" id="wwTrainStage" style="margin:8px 0 0">…</p>
+      </div>
+
+      <div class="panel" id="wwWizard" hidden>
+        <div class="row between">
+          <h3 style="margin:0">Новое слово: «<span id="wwName"></span>»</h3>
+          <button class="btn sm danger" id="wwCancel">Отменить</button>
+        </div>
+
+        <div class="ww-step" id="wwStepAmbient">
+          <div class="row between"><b>1. Тишина в комнате</b><span class="muted small">8 секунд</span></div>
+          <p class="muted small">Станция слушает обычный фон. Не говорите; телевизор и музыку оставьте, если они обычно играют.</p>
+          <div class="row"><button class="btn" id="wwAmbientBtn">Записать фон</button><span class="muted small" id="wwAmbientMsg"></span></div>
+        </div>
+
+        <div class="ww-step" id="wwStepTakes">
+          <div class="row between"><b>2. Произнесите слово</b><span class="muted small">минимум <span id="wwMinTakes">6</span>, лучше 10–15</span></div>
+          <p class="muted small">После «Говорите!» скажите слово один раз. С разных мест комнаты, громче и тише, разными людьми.</p>
+          <div class="row">
+            <button class="btn primary" id="wwTakeBtn">Записать</button>
+            <span class="ww-say" id="wwSay"></span>
+            <button class="btn sm" id="wwPlayLast" hidden>▶ последняя</button>
+          </div>
+          <p class="muted small" id="wwTakeMsg" style="margin-top:8px"></p>
+          <div class="row wrap" id="wwTakes" style="margin-top:4px"></div>
+        </div>
+
+        <div class="ww-step" id="wwStepSpeech">
+          <div class="row between"><b>3. Обычная речь</b><span class="muted small">20 секунд, по желанию</span></div>
+          <p class="muted small">Прочитайте вслух текст — станция научится не путать слово с обычной речью:</p>
+          <p class="ww-reading">Сегодня обещали тёплую погоду, поэтому мы решили погулять в парке. Вечером нужно купить хлеб, молоко и что-нибудь к чаю. Позвоню маме и спрошу, как у неё дела. Завтра рано вставать, так что лягу пораньше и почитаю книгу.</p>
+          <div class="row"><button class="btn" id="wwSpeechBtn">Читать 20 секунд</button><span class="muted small" id="wwSpeechMsg"></span></div>
+        </div>
+
+        <div class="ww-step" id="wwStepTrain">
+          <div class="row between"><b>4. Обучение</b><span class="muted small">2–3 минуты, страницу можно закрыть</span></div>
+          <div class="row"><button class="btn primary" id="wwTrainBtn">Обучить</button><span class="muted small" id="wwTrainMsg"></span></div>
+        </div>
+      </div>
+
+      <div id="wwWords" class="list"></div>
+      <p class="muted small" id="wwEmpty">Своих слов пока нет — нажми «Новое слово» и запиши голосом.</p>
+
+      <div class="panel" style="margin-top:14px">
+        <h3>Последние срабатывания</h3>
+        <p class="muted small" id="wwNoHits">Пока не было. Скажи слово — здесь появится запись.</p>
+        <div class="pre" id="wwHits" style="max-height:280px; user-select:none"></div>
+        <p class="muted small" style="margin:10px 0 0">Если станция откликнулась зря — «Ложное» у записи, потом «Переобучить» у слова.</p>
+      </div>
     </section>
 
     <!-- ФАЙЛЫ -->
@@ -454,7 +532,7 @@
           <div class="row">
             <button class="btn primary" id="voiceDeploy">Установить на колонку</button>
             <button class="btn" id="voiceSourceSave">Сохранить источник в мосте</button>
-            <a class="btn" id="wakewordLink" href="#" target="_blank" rel="noreferrer">Слова активации ↗</a>
+            <button class="btn" id="voiceGoWords">Слова активации</button>
           </div>
           <p class="muted small" id="voiceStatus" style="margin-top:8px"></p>
         </div>

@@ -50,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "ssh_port": 2222,
     "ssh_user": "root",
     "yam_port": 8099,
+    "wakeword_port": 8780,
     "panel_port": 8787,
     "panel_host": "0.0.0.0",
     "password_salt": "",
@@ -222,6 +223,39 @@ async def yam_proxy(path: str, request: Request) -> Response:
                 )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"демон YAM недоступен: {exc}")
+
+
+# --------------------------------------------------------------------------- #
+# прокси к демону своих слов активации (wakeword, порт 8780)
+# --------------------------------------------------------------------------- #
+@app.api_route("/wakeword/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def wakeword_proxy(path: str, request: Request) -> Response:
+    """Проксирует API wakeword-демона, чтобы панель была единственным интерфейсом.
+
+    Демон отдаёт и JSON, и WAV-записи (прослушивание), поэтому тело пробрасывается
+    как есть, вместе с content-type. Запись фона (8 с) и речи (20 с) — блокирующие,
+    отсюда увеличенный таймаут.
+    """
+    require_auth(request)
+    url = f"http://{cfg['station_ip']}:{cfg.get('wakeword_port', 8780)}/{path}"
+    if request.url.query:
+        url += "?" + request.url.query
+    body = await request.body()
+    headers = {}
+    if body:
+        headers["content-type"] = request.headers.get("content-type", "application/json")
+    try:
+        timeout = aiohttp.ClientTimeout(total=180)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(request.method, url, data=body or None, headers=headers) as resp:
+                payload = await resp.read()
+                return Response(
+                    content=payload,
+                    status_code=resp.status,
+                    media_type=resp.headers.get("content-type", "application/json"),
+                )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"демон слов активации недоступен: {exc}")
 
 
 # --------------------------------------------------------------------------- #

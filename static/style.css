@@ -316,6 +316,23 @@ code { background: var(--panel-3); padding: 1px 6px; border-radius: 6px; font-si
 .config-field input[type="checkbox"] { justify-self: start; width: 18px; height: 18px; }
 .config-json { min-height: 180px; margin-top: 10px; font-family: var(--mono); font-size: 12px; resize: vertical; }
 
+/* слова активации (wakeword) */
+.ww-step { border-top: 1px solid var(--line); padding-top: 13px; margin-top: 13px; }
+.ww-step b { font-size: 13px; font-weight: 600; }
+.ww-step p { margin: 5px 0 8px; }
+.ww-say { font-size: 15px; font-weight: 650; color: var(--accent); min-width: 92px; }
+.ww-reading { font-size: 12.5px; line-height: 1.65; color: var(--muted); border-left: 2px solid var(--line-strong); padding-left: 11px; margin: 7px 0 9px !important; }
+.ww-take { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-family: var(--mono); color: var(--muted); background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 3px 8px; }
+.ww-word { border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); padding: 13px 14px; }
+.ww-word-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ww-word-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+.ww-meter { position: relative; height: 6px; border-radius: 6px; background: var(--bg); overflow: hidden; margin: 12px 0 7px; }
+.ww-meter i { display: block; height: 100%; border-radius: 6px; background: linear-gradient(90deg, var(--accent-strong), var(--cyan)); transition: width .4s ease; }
+.ww-meter b { position: absolute; top: -2px; width: 2px; height: 10px; background: var(--danger); }
+.ww-hit { display: grid; grid-template-columns: 74px 1fr 58px auto; gap: 9px; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.ww-hit:last-child { border-bottom: none; }
+.ww-hit time { font-family: var(--mono); color: var(--muted); font-size: 12px; }
+
 /* слайдеры яркости */
 input[type="range"] {
   -webkit-appearance: none;
