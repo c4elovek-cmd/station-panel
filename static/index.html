@@ -4,6 +4,23 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Панель Станции</title>
+<script>
+/* Внешний вид (вкладка «Внешний вид»): восстановить выбор до первой отрисовки,
+   чтобы тема/шрифт не «мигнули». Хранилище — localStorage этого браузера. */
+(function () {
+  try {
+    var a = JSON.parse(localStorage.getItem('sp.appearance.v1') || '{}');
+    var h = document.documentElement;
+    h.dataset.theme = a.theme || 'wine';
+    h.dataset.cursor = a.cursor || 'default';
+    h.dataset.font = a.font || 'system';
+    h.dataset.glass = a.glass === false ? 'off' : 'on';
+  } catch (e) { /* localStorage недоступен — остаётся тема по умолчанию */ }
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Nunito:wght@400;600;700&family=JetBrains+Mono:wght@400;500&family=Playfair+Display:wght@500;600&display=swap">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -33,6 +50,7 @@
         <button class="nav-item" data-tab="wakeword"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M19 11a7 7 0 0 1-14 0"/><line x1="12" y1="18" x2="12" y2="21"/></svg>Слова</button>
         <button class="nav-item" data-tab="files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>Файлы</button>
         <button class="nav-item" data-tab="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Система</button>
+        <button class="nav-item" data-tab="appearance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="13.5" cy="6.5" r="1.2"/><circle cx="17.5" cy="10.5" r="1.2"/><circle cx="8.5" cy="7.5" r="1.2"/><circle cx="6.5" cy="12.5" r="1.2"/><path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.6-1.4-.4-.4-.6-.9-.6-1.4 0-1.1.9-2 2-2h2.4A4.8 4.8 0 0 0 22 10.4C21 5.6 16.9 2 12 2z"/></svg>Внешний вид</button>
       </nav>
     </div>
 
@@ -109,10 +127,11 @@
         <div class="panel">
           <h3>Возможности устройства</h3>
           <div style="display:flex; gap:14px; align-items:flex-start">
-            <img src="/static/img/station-mini2.svg" alt="Колонка" width="88" height="88"
+            <img src="/static/img/station-mini2.svg" alt="Колонка" width="88" height="88" id="devicePhoto"
                  style="flex:none; border-radius:14px; background:#000; border:1px solid var(--line)">
             <div class="chips" id="features" style="flex:1">—</div>
           </div>
+          <p class="muted small" id="deviceSpecs" style="margin:10px 0 0"></p>
           <h3 style="margin-top:18px">Быстрые действия</h3>
           <div class="row wrap">
             <button class="btn sm" data-quick="uptime">uptime</button>
@@ -124,6 +143,15 @@
           </div>
           <div class="pre" id="quickOut">выбери команду — вывод появится здесь</div>
         </div>
+      </div>
+
+      <div class="panel" style="margin-top:14px">
+        <h3>Громкость колонки</h3>
+        <div class="row" style="gap:14px">
+          <input type="range" id="volumeRange" min="0" max="100" value="50" style="flex:1" aria-label="Громкость колонки">
+          <b id="volumeValue" style="min-width:54px; text-align:right; font-variant-numeric:tabular-nums">—</b>
+        </div>
+        <p class="muted small" id="volumeStatus" style="margin:9px 0 0">Общий регулятор ALSA (Master) — та же шкала 0–100 %, что у голоса Алисы. Ползунок применяется, когда отпустил его.</p>
       </div>
     </section>
 
@@ -168,6 +196,24 @@
       </div>
       <div class="term-wrap"><div id="term"></div></div>
       <p class="muted small" style="margin-top:10px">Вход по SSH (порт <span id="termPort">2222</span>), пользователь root, пароль пустой. CLI <code>yam</code> в сборке демона нет — команды YAM дублируют HTTP API для удобства.</p>
+      <details style="margin-top:10px">
+        <summary class="muted small" style="cursor:pointer">Подключение из обычного терминала (PowerShell / CMD / Linux)</summary>
+        <div class="panel" style="margin-top:8px">
+          <p class="muted small" style="margin-top:0">Интернет-браузер не нужен — можно подключиться напрямую из консоли. IP колонки и порт берите в разделе «Система», ниже — примеры команд.</p>
+          <h4 style="margin:10px 0 4px">Windows — PowerShell или CMD</h4>
+          <pre class="code" style="white-space:pre-wrap">ssh -p 2222 root@192.168.0.172</pre>
+          <p class="muted small">Вход — без пароля (dropbear запущен с <code>-B</code>). Если попросит пароль — оставьте пустым и нажмите Enter. Выход из сессии: <code>exit</code>.</p>
+          <h4 style="margin:12px 0 4px">Linux / macOS / WSL</h4>
+          <pre class="code" style="white-space:pre-wrap">ssh -p 2222 root@192.168.0.172</pre>
+          <h4 style="margin:12px 0 4px">Команда одной строкой (без интерактивной сессии)</h4>
+          <pre class="code" style="white-space:pre-wrap">ssh -p 2222 -o StrictHostKeyChecking=no -o BatchMode=yes root@192.168.0.172 "cat /proc/loadavg"</pre>
+          <p class="muted small"><code>-o BatchMode=yes</code> отключает интерактивные запросы — удобно для скриптов. Если подключаетесь впервые, опция <code>-o StrictHostKeyChecking=no</code> пропустит предупреждение о неизвестном хосте.</p>
+          <h4 style="margin:12px 0 4px">Копирование файлов (scp)</h4>
+          <pre class="code" style="white-space:pre-wrap">scp -P 2222 root@192.168.0.172:/tmp/file.txt .
+scp -P 2222 file.txt root@192.168.0.172:/tmp/</pre>
+          <p class="muted small">Обратите внимание: у scp порт задаётся заглавным <code>-P</code>, а у ssh — строчным <code>-p</code>. Настоящий SFTP-подсистемы у dropbear обычно нет, поэтому <code>sftp</code> может не работать — используйте scp.</p>
+        </div>
+      </details>
     </section>
 
     <!-- МУЗЫКА -->
@@ -233,6 +279,16 @@
           <button class="btn primary" id="wwNewBtn">Новое слово</button>
         </div>
       </header>
+
+      <div class="panel">
+        <details>
+          <summary class="muted small" style="cursor:pointer">Зачем это и как связано с «Голосовыми командами»</summary>
+          <div class="muted small" style="margin-top:6px; line-height:1.5">
+            <p style="margin:0 0 6px">Этот раздел — <b>плагин <code>wakeword</code></b>. Он обучает станцию узнавать <b>ваше слово-активацию</b> (как «Алиса», но своё) и будить по нему. Это только «слушатель»: он ничего не делает и не произносит, лишь просыпается, когда услышит слово.</p>
+            <p style="margin:0 0 6px"><b>Связка целиком:</b> слово активации будит станцию → она начинает слушать команду → плагин <a href="#" data-goto-tab="system" style="color:var(--accent)">«Голосовые команды»</a> ищет в речи триггер («дипсик») и отправляет его на ваш мост. То есть <b>здесь — чем разбудить</b>, там — <b>что делать после</b>.</p>
+          </div>
+        </details>
+      </div>
 
       <div class="panel">
         <div class="row between">
@@ -418,7 +474,9 @@
           <button class="btn sm" data-clock="08:20">08:20</button>
           <button class="btn sm" data-clock="22:22">22:22</button>
         </div>
+        <label class="check" style="margin-top:12px"><input type="checkbox" id="clockPin"> Закрепить это время (панель переподтверждает каждые 5 с)</label>
         <p class="muted small" id="clockStatus" style="margin-top:10px">Разрешены любые цифры в формате 99:99. Яркость применяется на колонке сразу при движении ползунка.</p>
+        <p class="muted small">Без закрепления колонка через ~20–60 с сама возвращает настоящее время (это вендорный демон maind перерисовывает LED-часы по своему таймеру). Включите «Закрепить», чтобы часы оставались заданными — панель будет напоминать колонке о вашем значении.</p>
       </div>
 
       <div class="panel">
@@ -466,6 +524,37 @@
     <!-- СИСТЕМА -->
     <section class="tab" id="tab-system">
       <header class="head"><h2>Система и настройки</h2></header>
+
+      <div class="panel" style="margin-bottom:14px">
+        <h3>Мастер настройки</h3>
+        <p class="muted small" style="margin-top:0">
+          Одна кнопка проходит весь путь новой колонки: найти её в сети → проверить связь и часы →
+          громкость → голосовой мост → слово активации → телеметрия. Шаги появляются по мере
+          выполнения, ошибки не прерывают прогон. Обычно занимает до полутора минут.
+        </p>
+        <div class="row">
+          <button class="btn primary" id="masterStart">Запустить мастер настройки</button>
+        </div>
+        <div id="masterSteps" class="setup-steps" style="margin-top:10px"></div>
+        <p class="muted small" id="masterStatus" style="margin-top:8px"></p>
+        <details style="margin-top:8px">
+          <summary class="muted small" style="cursor:pointer">Инструкция: что делает каждый шаг и что делать после</summary>
+          <div class="muted small" style="margin-top:6px; line-height:1.5">
+            <p style="margin:0 0 6px"><b>Шаги мастера:</b></p>
+            <ul style="margin:0 0 6px 18px; padding:0">
+              <li><b>Связь</b> — сканирует сеть, находит колонку, подбирает порты YAM/SSH и ставит SSH-ключ панели (то же, что «Автонастройка»).</li>
+              <li><b>Станция на связи</b> — демон YAM отвечает, модель опознана.</li>
+              <li><b>LED-часы</b> — отправляет текущее время и яркость на кольцо. Закреплять не нужно: без закрепления колонка сама показывает реальное время.</li>
+              <li><b>громкость</b> — читает общий регулятор ALSA (в «Обзоре» есть ползунок).</li>
+              <li><b>Голосовой мост</b> — запускает локальный мост на ПК и проверяет LLM-токен: без него триггер сработает, но музыку подобрать нечем.</li>
+              <li><b>Слово активации</b> — проверяет, записано ли хотя бы одно своё слово (раздел «Слова активации»).</li>
+              <li><b>Телеметрия</b> — просто показывает состояние; отключается отдельной кнопкой ниже.</li>
+            </ul>
+            <p style="margin:0 0 6px"><b>Если шаг помечен ✗:</b> колонка и ПК должны быть в одной сети; SSH — порт 2222, пользователь root, пароль пустой; колонка должна быть залогинена в аккаунт Яндекса.</p>
+            <p style="margin:0"><b>После мастера:</b> «Подсветка» — часы и LED, «Слова активации» — запись своего слова, «Голосовые команды» — фразы-триггеры, «Обзор» — громкость и быстрые команды.</p>
+          </div>
+        </details>
+      </div>
 
       <div class="grid2">
         <div class="panel">
@@ -527,6 +616,23 @@
 
         <div class="panel">
           <h3>Голосовые команды</h3>
+          <details style="margin-bottom:10px">
+            <summary class="muted small" style="cursor:pointer">Как это работает и почему колонка может молчать</summary>
+            <div class="muted small" style="margin-top:6px; line-height:1.5">
+              <p style="margin:0 0 6px">Этот раздел — <b>плагин <code>station-voice</code></b>. Он делает одно: слушает распознанную речь, ищет в ней <b>слово-триггер</b> (например «дипсик») и, если нашёл, отправляет остаток фразы на ваш внешний <b>мост</b> (сервер по адресу выше). Сама колонка при этом <b>ничего не произносит</b> — обратная речь в плагине пока не реализована.</p>
+              <p style="margin:0 0 6px"><b>Порядок активации:</b></p>
+              <ol style="margin:0 0 6px 18px; padding:0">
+                <li>Разбудить колонку — словом «Алиса» или своим <a href="#" data-goto-tab="wakeword" style="color:var(--accent)">словом активации</a>.</li>
+                <li>Сказать команду, которая <b>начинается с триггера</b>: «дипсик, включи музыку».</li>
+              </ol>
+              <p style="margin:0 0 6px"><b>Если колонка молчит, проверьте:</b></p>
+              <ul style="margin:0 0 6px 18px; padding:0">
+                <li>Заполнен ли <b>адрес моста</b> и токен (без моста триггер срабатывает, но отправлять некуда).</li>
+                <li>Совпадает ли триггер со сказанным словом (по умолчанию — «дипсик»).</li>
+                <li>Что вы сначала активировали колонку, иначе речь не распознаётся.</li>
+              </ul>
+            </div>
+          </details>
           <label class="field"><span>Фразы-триггеры (по одной в строке, до 32)</span>
             <textarea class="input" id="voicePhrases" rows="3" placeholder="дипсик"></textarea>
           </label>
@@ -559,6 +665,22 @@
           <p class="muted small" id="pwStatus" style="margin-top:8px"></p>
         </div>
 
+        <div class="panel">
+          <h3>Телеметрия Яндекса</h3>
+          <p class="muted small" style="margin-top:0">
+            По умолчанию колонка отправляет Яндексу телеметрию: логи падений и диагностику.
+            Панель убирает две autostart-службы — <code>telemetry</code> и <code>fluent-bitd</code> —
+            из <code>servicesList</code> в <code>quasar.cfg</code>. Исходник конфига сохраняется
+            рядом бэкапом, повторное включение возвращает его байт-в-байт.
+          </p>
+          <label class="check"><input type="checkbox" id="telemetryOff"> Отключить отправку телеметрии</label>
+          <p class="muted small" id="telemetryStatus" style="margin:8px 0 0">состояние ещё не проверялось</p>
+          <p class="muted small" style="margin:8px 0 0; color:var(--warn)">
+            Честно: применяется после перезагрузки колонки; на работу Алисы и обновления не влияет,
+            но Яндекс при обновлении прошивки может перезаписать конфиг — тогда просто повторите отключение.
+          </p>
+        </div>
+
         <div class="panel danger">
           <h3>Питание колонки</h3>
           <p class="muted small">Перезагрузка выполняется по SSH, связь оборвётся примерно через 2 секунды.</p>
@@ -568,11 +690,84 @@
       </div>
 
       <div class="panel" style="margin-top:14px">
-        <h3>Ссылки</h3>
-        <div class="row wrap">
+        <h3>Источники и благодарности</h3>
+        <p class="muted small">Эта панель — обёртка над чужими проектами. Ниже — всё, чьи идеи или код здесь используются. Спасибо авторам.</p>
+        <div class="panel" style="margin-top:8px; background:var(--panel-2)">
+          <h4 style="margin:0 0 4px"><a href="https://github.com/nyakokitsu/yam" target="_blank" style="color:var(--accent)">YAM (nyakokitsu/yam)</a></h4>
+          <p class="muted small" style="margin:0">Демон на колонке (yamd), чей HTTP API делает почти всё: LED-часы, датчики, TTS, плагины. Панель — просто клиент его API.</p>
+        </div>
+        <div class="panel" style="margin-top:8px; background:var(--panel-2)">
+          <h4 style="margin:0 0 4px"><a href="https://hackalice.me/" target="_blank" style="color:var(--accent)">Вики HackAlice (hackalice.me)</a></h4>
+          <p class="muted small" style="margin:0">Разборы внутренностей Станций, модели и платформы (<a href="https://hackalice.me/devices/" target="_blank">устройства</a>), голос (<a href="https://hackalice.me/internals/voice/" target="_blank">voice</a>), телеметрия (<a href="https://hackalice.me/internals/telemetry/" target="_blank">telemetry</a>), рецепт установки YAM (<a href="https://hackalice.me/recipes/yam/" target="_blank">recipes/yam</a>). Отсюда — знания о том, как устроена колонка.</p>
+        </div>
+        <div class="panel" style="margin-top:8px; background:var(--panel-2)">
+          <h4 style="margin:0 0 4px"><a href="https://github.com/Marker284/yandex-station-extended" target="_blank" style="color:var(--accent)">yandex-station-extended (Marker284)</a></h4>
+          <p class="muted small" style="margin:0">Идеи и находки по расширению возможностей Станции — в частности, подход к работе с LED и системными службами.</p>
+        </div>
+        <div class="panel" style="margin-top:8px; background:var(--panel-2)">
+          <h4 style="margin:0 0 4px"><a href="https://github.com/xtermjs/xterm.js" target="_blank" style="color:var(--accent)">xterm.js</a></h4>
+          <p class="muted small" style="margin:0">Терминал в браузере: веб-SFTP-окно для SSH-сессии колонки. BSD-лицензия, авторы — авторы xterm.js.</p>
+        </div>
+        <div class="panel" style="margin-top:8px; background:var(--panel-2)">
+          <h4 style="margin:0 0 4px">Разрешения Яндекса</h4>
+          <p class="muted small" style="margin:0">Станция, колонка, Алиса и прошивки — интеллектуальная собственность Яндекса. Панель не содержит кода Яндекса и не предназначена для распространения — только личное использование.</p>
+        </div>
+        <div class="row wrap" style="margin-top:10px">
           <a class="btn" id="linkYam" href="#" target="_blank">Web UI YAM (:8099)</a>
-          <a class="btn" href="https://hackalice.me/recipes/yam/" target="_blank">Вики: YAM и BetterYAM</a>
           <a class="btn" href="https://hackalice.me/recipes/" target="_blank">Вики: рецепты</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ВНЕШНИЙ ВИД -->
+    <section class="tab" id="tab-appearance">
+      <div class="head">
+        <div>
+          <h2>Внешний вид</h2>
+          <p class="muted small" style="margin:4px 0 0">Настройка оформления панели. Настройки сохраняются в этом браузере.</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Тема</h3>
+        <div class="row wrap" id="themeGroup">
+          <button class="preset" data-theme="wine"><span class="swatch" style="background:linear-gradient(135deg,#2a1418,#ec7a8e)"></span>Винная (тёмная)</button>
+          <button class="preset" data-theme="day"><span class="swatch" style="background:linear-gradient(135deg,#f3d9dc,#ec7a8e)"></span>День (светлая)</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Курсор</h3>
+        <p class="muted small" style="margin:0 0 10px">Стиль курсора при наведении на элементы панели.</p>
+        <div class="row wrap" id="cursorGroup">
+          <button class="preset" data-cursor="default">Системный</button>
+          <button class="preset" data-cursor="pointer">Указатель</button>
+          <button class="preset" data-cursor="crosshair">Перекрестие</button>
+          <button class="preset" data-cursor="grab">Рука</button>
+          <button class="preset" data-cursor="text">Текст</button>
+          <button class="preset" data-cursor="wait">Колёсико</button>
+        </div>
+        <label class="check" style="margin-top:12px">
+          <input type="checkbox" id="glassCursor"> Жидкое стекло за курсором
+        </label>
+      </div>
+
+      <div class="panel">
+        <h3>Шрифт</h3>
+        <p class="muted small" style="margin:0 0 10px">Гарнитура интерфейса панели.</p>
+        <div class="row wrap" id="fontGroup">
+          <button class="preset" data-font="system">Системный</button>
+          <button class="preset" data-font="inter">Inter / Segoe</button>
+          <button class="preset" data-font="mono">Моноширинный</button>
+          <button class="preset" data-font="rounded">Скруглённый</button>
+          <button class="preset" data-font="serif">Антиква</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Пресеты</h3>
+        <div class="row wrap">
+          <button class="btn" id="appearanceReset">Сбросить всё</button>
         </div>
       </div>
     </section>
@@ -583,5 +778,30 @@
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/addon-fit.js"></script>
 <script src="/static/app.js"></script>
+<script>
+/* liquid-glass кружок за курсором — декоративный, pointer-events:none в CSS */
+(function () {
+  if (matchMedia('(hover: none)').matches || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var blob = document.createElement('div');
+  blob.className = 'cursor-glass';
+  blob.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(blob);
+  var tx = -300, ty = -300, x = -300, y = -300, shown = false;
+  addEventListener('pointermove', function (e) {
+    tx = e.clientX; ty = e.clientY;
+    if (!shown) { x = tx; y = ty; shown = true; blob.classList.add('on'); }
+    var t = e.target;
+    var hot = !!(t && t.closest && t.closest('a,button,input,select,textarea,.btn,.nav-item,canvas,[role=button]'));
+    blob.classList.toggle('hot', hot);
+  }, { passive: true });
+  addEventListener('pointerleave', function () { blob.classList.remove('on'); shown = false; });
+  (function loop() {
+    x += (tx - x) * 0.16;   /* «жидкий» шлейф */
+    y += (ty - y) * 0.16;
+    blob.style.transform = 'translate(' + x.toFixed(1) + 'px,' + y.toFixed(1) + 'px)';
+    requestAnimationFrame(loop);
+  })();
+})();
+</script>
 </body>
 </html>

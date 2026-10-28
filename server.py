@@ -60,10 +60,23 @@ DEFAULTS: dict[str, Any] = {
     "voice_bridge_url": "",
     "voice_bridge_token": "",
     "voice_music_source": "youtube",
+    # --- локальный голосовой мост (voice-bridge встроен в панель) ---
+    "bridge_enabled": False,
+    "bridge_path": "",  # путь к папке voice-bridge; пусто = ../voice-bridge рядом с панелью
+    "llm_provider": "deepseek-web",  # deepseek-web | openrouter | none
+    "deepseek_token": "",   # bearer userToken из localStorage chat.deepseek.com
+    "deepseek_cookie": "",  # куки веб-чата (aws-waf-token и т.п.), формат "a=b; c=d"
+    "llm_key": "",          # ключ OpenRouter (резерв)
+    "llm_model": "deepseek/deepseek-chat-v3-0324:free",
+    "voice_proxy": "",      # прокси для yt-dlp (например socks5://...)
 }
 
 SESSIONS: dict[str, float] = {}  # token -> expires_at
 _ssh_lock = asyncio.Lock()
+
+# «Закреплённое» время LED-часов: вендорный maind перерисовывает реальное время
+# каждые ~60 с, поэтому панель периодически подтверждает кастомное значение.
+clock_pin: dict[str, Any] = {"time": "", "brightness": 170, "active": False}
 
 
 # --------------------------------------------------------------------------- #
@@ -108,6 +121,12 @@ def init_config() -> dict[str, Any]:
 cfg = init_config()
 app = FastAPI(title="Station Panel", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.on_event("startup")
+async def _start_clock_pin() -> None:
+    """Поднять фоновую задачу подтверждения закреплённого времени на часах."""
+    asyncio.create_task(_clock_pin_loop())
 
 
 # --------------------------------------------------------------------------- #
@@ -721,6 +740,191 @@ async def api_reboot(request: Request) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
+# Телеметрия Яндекса: autostart-службы telemetry и fluent-bitd в
+# /system/vendor/quasar/quasar.cfg (JSON вендора). rootfs смонтирован ro —
+# перед правкой поднимаем rw и возвращаем обратно; исходник бэкапится один раз
+# в quasar.cfg.bak-panel. Применение — после перезагрузки колонки.
+# --------------------------------------------------------------------------- #
+TELEMETRY_CFG = "/system/vendor/quasar/quasar.cfg"
+TELEMETRY_BAK = TELEMETRY_CFG + ".bak-panel"
+_TELEMETRY_CMD = (
+    "echo __CFG__; cat " + TELEMETRY_CFG + "; echo; "
+    "echo __MOUNT__; grep ubi0:rootfs /proc/mounts; "
+    "echo __PS__; ps | grep -E 'maind --(telemetry|fluent-bitd)' | grep -v grep; "
+    "echo __BAK__; [ -f " + TELEMETRY_BAK + " ] && echo y || echo n; "
+    "echo __END__"
+)
+
+
+def _find_json_key(obj: Any, key: str) -> Any:
+    """Найти ключ рекурсивно (servicesList лежит не в корне конфига)."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for value in obj.values():
+            found = _find_json_key(value, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_json_key(item, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _telemetry_patch(text: str) -> str:
+    """Убрать telemetry/fluent-bitd из servicesList и добавить флажок.
+
+    Правим текст, а не пересобранный JSON, чтобы сохранить форматирование
+    вендорного файла; валидность проверяем json.loads до записи."""
+    lines = []
+    for line in text.split("\n"):
+        if '"servicesList"' in line:
+            line = line.replace(",telemetry", "").replace(",fluent-bitd", "")
+        lines.append(line)
+    patched = "\n".join(lines)
+    if '"fluentBitDisabled"' not in patched:
+        cut = patched.find("\n")
+        if cut < 0:
+            raise ValueError("неожиданный формат quasar.cfg")
+        patched = patched[:cut + 1] + '   "fluentBitDisabled" : true,\n' + patched[cut + 1:]
+    json.loads(patched)  # отказ до записи, если что-то сломали
+    return patched
+
+
+def _telemetry_unpatch(text: str) -> str:
+    """Вернуть службы в список и убрать флажок (запасной путь без бэкапа)."""
+    lines = []
+    for line in text.split("\n"):
+        if '"servicesList"' in line and "telemetry" not in line:
+            line = line.replace(
+                '"quasar_launcher2,updatesd,mediad,platformd"',
+                '"quasar_launcher2,updatesd,mediad,telemetry,platformd,fluent-bitd"',
+            )
+        if '"fluentBitDisabled"' in line and line.strip().endswith(","):
+            continue  # наш вставленный ключ всегда с запятой — строка уходит целиком
+        lines.append(line)
+    patched = "\n".join(lines)
+    json.loads(patched)
+    return patched
+
+
+async def _telemetry_state() -> dict[str, Any]:
+    """Снять состояние: список служб, флажок, монтирование, бэкап, процессы."""
+    code, out, err = await ssh_run(_TELEMETRY_CMD, timeout=25)
+    state: dict[str, Any] = {"ok": code == 0}
+    if code != 0:
+        state["detail"] = (err or out or "команда не выполнилась").strip()[:200]
+        return state
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in out.split("\n"):
+        tag = line.strip()
+        if tag in ("__CFG__", "__MOUNT__", "__PS__", "__BAK__", "__END__"):
+            current = tag[2:-2].lower()
+            sections[current] = []
+        elif current and current != "end":
+            sections.setdefault(current, []).append(line)
+    cfg_text = "\n".join(sections.get("cfg", [])).strip("\n").strip()
+    mount_line = "\n".join(sections.get("mount", [])).strip()
+    ps_text = "\n".join(sections.get("ps", []))
+    backup = "\n".join(sections.get("bak", [])).strip().lower().startswith("y")
+
+    services: list[str] = []
+    fluent_disabled = False
+    json_ok = False
+    try:
+        cfg = json.loads(cfg_text)
+        json_ok = True
+        raw = _find_json_key(cfg, "servicesList")
+        if isinstance(raw, str):
+            services = [item for item in raw.split(",") if item]
+        if isinstance(cfg, dict) and "fluentBitDisabled" in cfg:
+            fluent_disabled = bool(cfg["fluentBitDisabled"])
+    except Exception:
+        state["detail"] = "quasar.cfg не распознан как JSON"
+    fields = mount_line.split()
+    mounted = fields[3][:2] if len(fields) >= 4 and fields[3][:2] in ("rw", "ro") else "?"
+    state.update({
+        "json_ok": json_ok,
+        "services_list": services,
+        "telemetry_in_list": "telemetry" in services,
+        "fluent_in_list": "fluent-bitd" in services,
+        "fluent_bit_disabled": fluent_disabled,
+        "mounted": mounted,
+        "backup": backup,
+        "running_telemetry": sum(1 for line in ps_text.split("\n") if "--telemetry" in line),
+        "running_fluent": sum(1 for line in ps_text.split("\n") if "--fluent-bitd" in line),
+    })
+    return state
+
+
+@app.get("/api/telemetry")
+async def api_telemetry_get(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse(await _telemetry_state())
+
+
+@app.post("/api/telemetry")
+async def api_telemetry_put(request: Request) -> JSONResponse:
+    """Отключить (enabled:false) или вернуть телеметрию Яндекса.
+
+    Пишет quasar.cfg на колонке: remount rw → бэкап → правка → remount ro.
+    Действующим службам это не мешает — применение после перезагрузки."""
+    require_auth(request)
+    data = await request.json()
+    enable = bool(data.get("enabled", False))
+    try:
+        conn = await ssh_connect()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="SSH: " + str(exc)[:160])
+    try:
+        try:
+            await asyncio.wait_for(conn.run("mount -o remount,rw /", check=False, encoding="utf-8"), 15)
+            if not enable:
+                # бэкап исходника ровно один раз — повторные отключения не портят его
+                await asyncio.wait_for(conn.run(
+                    f"[ -f {TELEMETRY_BAK} ] || cp -p {TELEMETRY_CFG} {TELEMETRY_BAK}",
+                    check=False, encoding="utf-8"), 15)
+            current = (await asyncio.wait_for(conn.run(
+                f"cat {TELEMETRY_CFG}", check=False, encoding="utf-8"), 25)).stdout or ""
+            if not current.strip():
+                raise ValueError("quasar.cfg пуст или не читается")
+            if enable:
+                bak = await asyncio.wait_for(conn.run(
+                    f"[ -f {TELEMETRY_BAK} ] && echo y || echo n", check=False, encoding="utf-8"), 15)
+                if (bak.stdout or "").strip().lower() == "y":
+                    text = (await asyncio.wait_for(conn.run(
+                        f"cat {TELEMETRY_BAK}", check=False, encoding="utf-8"), 25)).stdout or ""
+                    json.loads(text)
+                else:
+                    text = _telemetry_unpatch(current)
+            else:
+                text = _telemetry_patch(current)
+            result = await asyncio.wait_for(conn.run(
+                f"cat > {TELEMETRY_CFG}", input=text, check=False, encoding="utf-8"), 25)
+            if result.exit_status not in (0, None):
+                raise ValueError(f"запись не удалась (status {result.exit_status})")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)[:180])
+        finally:
+            # ro возвращаем всегда — даже при ошибке правки
+            try:
+                await asyncio.wait_for(conn.run("mount -o remount,ro /", check=False, encoding="utf-8"), 15)
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    state = await _telemetry_state()
+    if not state.get("json_ok"):
+        raise HTTPException(status_code=502, detail="записан некорректный конфиг: " + str(state.get("detail", "")))
+    return JSONResponse({"ok": True, "enabled": enable, **state})
+
+
+# --------------------------------------------------------------------------- #
 # Автонастройка: SSH-ключ, SFTP, автодетект параметров
 # --------------------------------------------------------------------------- #
 def ssh_key_public_line() -> str | None:
@@ -1138,9 +1342,10 @@ def build_voice_plugin_yap(phrases: list[str], bridge_url: str, bridge_token: st
 
     host = ""
     if bridge_url:
-        match = re.match(r"^https://([^/]+)", bridge_url)
+        # локальный мост по LAN работает по http, удалённый (VPS) — по https
+        match = re.match(r"^https?://([^/]+)", bridge_url)
         if not match:
-            raise HTTPException(status_code=400, detail="адрес моста должен начинаться с https://")
+            raise HTTPException(status_code=400, detail="адрес моста должен начинаться с http:// или https://")
         host = match.group(1)
 
     phrase_list = ", ".join('"%s"' % p.replace('"', "") for p in phrases)
@@ -1223,8 +1428,8 @@ async def api_voice_config_put(request: Request) -> JSONResponse:
     cfg["voice_phrases"] = clean
     if "bridge_url" in data:
         url = str(data["bridge_url"]).strip()
-        if url and not re.match(r"^https://", url):
-            raise HTTPException(status_code=400, detail="адрес моста должен начинаться с https://")
+        if url and not re.match(r"^https?://", url):
+            raise HTTPException(status_code=400, detail="адрес моста должен начинаться с http:// или https://")
         cfg["voice_bridge_url"] = url
     if "bridge_token" in data:
         cfg["voice_bridge_token"] = str(data["bridge_token"]).strip()
@@ -1311,6 +1516,226 @@ async def api_voice_status(request: Request) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
+# Локальный голосовой мост (voice-bridge) — запускается панелью как подпроцесс
+# --------------------------------------------------------------------------- #
+BRIDGE_PORT = 8811
+_bridge_proc: asyncio.subprocess.Process | None = None
+
+
+def _detect_pc_ip() -> str | None:
+    """IP этого ПК в подсети станции — чтобы колонка достучалась до моста.
+
+    Открываем UDP-сокет к адресу станции (без реальной отправки) и смотрим,
+    с какого локального адреса ушёл пакет. Это самый надёжный способ узнать
+    свой IP в нужной подсети, когда ПК в нескольких сетях.
+    """
+    import socket
+
+    station = str(cfg.get("station_ip", "")).strip()
+    if not station:
+        return None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect((station, 80))
+            return sock.getsockname()[0]
+        finally:
+            sock.close()
+    except Exception:
+        return None
+
+
+def _bridge_dir() -> Path:
+    """Папка с кодом voice-bridge: настройка из конфига или ../voice-bridge рядом."""
+    custom = str(cfg.get("bridge_path", "")).strip()
+    if custom:
+        return Path(custom)
+    return BASE.parent / "voice-bridge"
+
+
+def _bridge_env() -> dict[str, str]:
+    """Переменные окружения для моста из настроек панели."""
+    import os as _os
+
+    env = dict(_os.environ)
+    env["VOICE_TOKEN"] = cfg["voice_bridge_token"] or secrets.token_urlsafe(24)
+    env["LLM_PROVIDER"] = str(cfg.get("llm_provider", "deepseek-web"))
+    env["LLM_KEY"] = str(cfg.get("llm_key", ""))
+    env["LLM_MODEL"] = str(cfg.get("llm_model", ""))
+    env["DEEPSEEK_TOKEN"] = str(cfg.get("deepseek_token", ""))
+    env["DEEPSEEK_COOKIE"] = str(cfg.get("deepseek_cookie", ""))
+    env["VOICE_PROXY"] = str(cfg.get("voice_proxy", ""))
+    env["VOICE_STATE"] = str(BASE / "bridge-state.json")
+    env["BRIDGE_CONFIG"] = str(BASE / "bridge-config.json")
+    return env
+
+
+async def _bridge_health(timeout: float = 2.0) -> bool:
+    """Жив ли локальный мост: быстрый GET /health."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.get(f"http://127.0.0.1:{BRIDGE_PORT}/health") as resp:
+                return resp.status == 200
+    except Exception:
+        return False
+
+
+async def _bridge_start() -> bool:
+    """Запустить мост как подпроцесс, если ещё не работает."""
+    global _bridge_proc
+    if await _bridge_health():
+        return True  # уже поднят (например, из прошлого раза)
+    bdir = _bridge_dir()
+    if not (bdir / "app.py").exists():
+        return False
+    _bridge_proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "uvicorn", "app:app",
+        "--host", "127.0.0.1", "--port", str(BRIDGE_PORT), "--log-level", "warning",
+        cwd=str(bdir), env=_bridge_env(),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    # ждём, пока поднимется (до ~8 с)
+    for _ in range(16):
+        await asyncio.sleep(0.5)
+        if await _bridge_health():
+            return True
+    return False
+
+
+async def _bridge_stop() -> None:
+    """Остановить подпроцесс моста, если он запущен нами."""
+    global _bridge_proc
+    if _bridge_proc and _bridge_proc.returncode is None:
+        try:
+            _bridge_proc.terminate()
+            await asyncio.wait_for(_bridge_proc.wait(), timeout=5)
+        except Exception:
+            try:
+                _bridge_proc.kill()
+            except Exception:
+                pass
+    _bridge_proc = None
+
+
+def _bridge_llm_ready() -> dict[str, Any]:
+    """Что настроено из LLM (без вывода секретов)."""
+    provider = str(cfg.get("llm_provider", "deepseek-web"))
+    return {
+        "provider": provider,
+        "deepseek_token": bool(cfg.get("deepseek_token")),
+        "deepseek_cookie": bool(cfg.get("deepseek_cookie")),
+        "openrouter_key": bool(cfg.get("llm_key")),
+        "model": cfg.get("llm_model", ""),
+    }
+
+
+@app.get("/api/bridge/status")
+async def api_bridge_status(request: Request) -> JSONResponse:
+    """Состояние локального моста: код найден, запущен, /health, LLM."""
+    require_auth(request)
+    bdir = _bridge_dir()
+    return JSONResponse({
+        "dir": str(bdir),
+        "code_found": (bdir / "app.py").exists(),
+        "running": await _bridge_health(),
+        "port": BRIDGE_PORT,
+        "url": cfg.get("voice_bridge_url", ""),
+        "has_token": bool(cfg.get("voice_bridge_token")),
+        "llm": _bridge_llm_ready(),
+    })
+
+
+@app.post("/api/bridge/setup")
+async def api_bridge_setup(request: Request) -> JSONResponse:
+    """Автонастройка локального моста: токен, URL по IP ПК, запуск, проверка."""
+    require_auth(request)
+    steps: list[dict[str, Any]] = []
+
+    # 1. код моста на месте?
+    bdir = _bridge_dir()
+    code_found = (bdir / "app.py").exists()
+    steps.append({"name": "код voice-bridge", "ok": code_found,
+                  "detail": str(bdir) if code_found else "не найден — укажи путь вручную"})
+    if not code_found:
+        return JSONResponse({"ok": False, "steps": steps})
+
+    # 2. токен: генерируем и сохраняем, если пуст
+    if not cfg.get("voice_bridge_token"):
+        cfg["voice_bridge_token"] = secrets.token_urlsafe(24)
+        save_config(cfg)
+    steps.append({"name": "токен моста", "ok": True, "detail": "создан и сохранён"})
+
+    # 3. URL моста по IP ПК в подсети станции (плагин на колонке должен достучаться)
+    pc_ip = _detect_pc_ip()
+    if pc_ip:
+        cfg["voice_bridge_url"] = f"http://{pc_ip}:{BRIDGE_PORT}/api/voice"
+        save_config(cfg)
+        steps.append({"name": "адрес моста", "ok": True, "detail": cfg["voice_bridge_url"]})
+    else:
+        steps.append({"name": "адрес моста", "ok": False,
+                      "detail": "не удалось определить IP ПК — задай вручную"})
+
+    # 4. запуск подпроцесса и проверка /health
+    started = await _bridge_start()
+    steps.append({"name": "запуск моста", "ok": started,
+                  "detail": f"http://127.0.0.1:{BRIDGE_PORT}" if started else "не поднялся — смотри зависимости (pip install -r voice-bridge/requirements.txt)"})
+
+    # 5. при желании сразу отправить выбранный источник музыки в мост
+    if started:
+        try:
+            status, body = await _post_bridge_config()
+            steps.append({"name": "источник музыки", "ok": 200 <= status < 300,
+                          "detail": cfg.get("voice_music_source", "youtube")})
+        except Exception as exc:
+            steps.append({"name": "источник музыки", "ok": False, "detail": str(exc)[:120]})
+
+    ok = all(s["ok"] for s in steps if s["name"] != "источник музыки")
+    return JSONResponse({"ok": ok, "steps": steps, "llm": _bridge_llm_ready()})
+
+
+async def _post_bridge_config() -> tuple[int, str]:
+    """Отправить источник музыки в локальный мост напрямую (минуя внешний URL)."""
+    url = f"http://127.0.0.1:{BRIDGE_PORT}/api/bridge/config"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        async with session.put(
+            url,
+            json={"source": cfg.get("voice_music_source", "youtube")},
+            headers={"X-Voice-Token": cfg.get("voice_bridge_token", "")},
+        ) as resp:
+            return resp.status, await resp.text()
+
+
+@app.post("/api/bridge/stop")
+async def api_bridge_stop(request: Request) -> JSONResponse:
+    """Остановить локальный мост."""
+    require_auth(request)
+    await _bridge_stop()
+    return JSONResponse({"ok": True, "running": await _bridge_health()})
+
+
+@app.put("/api/bridge/llm")
+async def api_bridge_llm(request: Request) -> JSONResponse:
+    """Сохранить настройки LLM для моста. Секреты не возвращаются."""
+    require_auth(request)
+    data = await request.json()
+    mapping = {
+        "provider": "llm_provider", "deepseek_token": "deepseek_token",
+        "deepseek_cookie": "deepseek_cookie", "llm_key": "llm_key",
+        "model": "llm_model", "proxy": "voice_proxy", "path": "bridge_path",
+    }
+    for key, field in mapping.items():
+        if key in data:
+            cfg[field] = str(data[key]).strip()
+    save_config(cfg)
+    # перезапуск, чтобы мост подхватил новые переменные окружения
+    was_running = await _bridge_health()
+    await _bridge_stop()
+    if was_running:
+        await _bridge_start()
+    return JSONResponse({"ok": True, "llm": _bridge_llm_ready(), "running": await _bridge_health()})
+
+
+# --------------------------------------------------------------------------- #
 # «Сказать на колонке»: синтез речи и воспроизведение через aplay
 # --------------------------------------------------------------------------- #
 SAY_MOODS: dict[str, str | None] = {
@@ -1379,6 +1804,43 @@ async def api_speaker_say(request: Request) -> JSONResponse:
     finally:
         mp3_path.unlink(missing_ok=True)
         wav_path.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# Общая громкость колонки — регулятор ALSA «Master» (его же двигает Алиса
+# через /system/vendor/quasar/set_volume.sh). Шкала 0..100 (%).
+# --------------------------------------------------------------------------- #
+async def _read_master_volume() -> int | None:
+    """Текущая громкость Master в % (amixer -c 0 sget Master)."""
+    code, out, _ = await ssh_run("amixer -c 0 sget Master 2>/dev/null")
+    if code != 0:
+        return None
+    match = re.search(r"Front Left:\s*Playback\s+\d+\s+\[(\d+)%\]", out)
+    return int(match.group(1)) if match else None
+
+
+@app.get("/api/volume")
+async def api_volume_get(request: Request) -> JSONResponse:
+    require_auth(request)
+    volume = await _read_master_volume()
+    if volume is None:
+        return JSONResponse({"ok": False, "detail": "не удалось прочитать громкость (amixer)"}, status_code=502)
+    return JSONResponse({"ok": True, "volume": volume})
+
+
+@app.put("/api/volume")
+async def api_volume_put(request: Request) -> JSONResponse:
+    """Поставить громкость 0..100 (та же шкала, что у кнопок и голоса Алисы)."""
+    require_auth(request)
+    data = await request.json()
+    try:
+        level = max(0, min(100, int(data.get("volume"))))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="громкость: целое 0..100")
+    code, _, err = await ssh_run(f"amixer -q set Master {level}%")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="amixer: " + err[:160])
+    return JSONResponse({"ok": True, "volume": level})
 
 
 # --------------------------------------------------------------------------- #
@@ -2031,6 +2493,61 @@ async def ws_console(websocket: WebSocket) -> None:
             await websocket.close()
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Закрепление LED-часов (вендорный maind перерисовывает реальное время каждые ~60 с)
+# --------------------------------------------------------------------------- #
+async def _clock_pin_loop() -> None:
+    """Подтверждать кастомное время каждые 5 с, пока включено закрепление.
+
+    Вендорный maind перерисовывает реальное время по своему таймеру (~раз в 30 с),
+    поэтому короткий интервал сводит мигание реального времени к минимуму.
+    """
+    while True:
+        await asyncio.sleep(5)
+        if not clock_pin.get("active") or not clock_pin.get("time"):
+            continue
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                await session.put(
+                    f"http://{cfg['station_ip']}:{cfg['yam_port']}/api/clock",
+                    json={"time": clock_pin["time"], "brightness": int(clock_pin.get("brightness", 170))},
+                )
+        except Exception:
+            pass  # станция недоступна — повторим на следующем такте
+
+
+@app.get("/api/clock/pin")
+async def api_clock_pin_get(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse(dict(clock_pin))
+
+
+@app.post("/api/clock/pin")
+async def api_clock_pin_set(request: Request) -> JSONResponse:
+    """Включить/выключить закрепление времени на LED-часах."""
+    require_auth(request)
+    data = await request.json()
+    active = bool(data.get("active"))
+    time_value = str(data.get("time", "")).strip()
+    if active and not re.fullmatch(r"\d{2}:\d{2}", time_value):
+        raise HTTPException(status_code=400, detail="время в формате ЧЧ:ММ")
+    clock_pin.update({
+        "active": active,
+        "time": time_value,
+        "brightness": int(data.get("brightness", clock_pin.get("brightness", 170))),
+    })
+    if active:
+        # первый показ — сразу же, не дожидаясь такта (PUT /api/clock отвечает 204)
+        status, _ = await yam_api(
+            "PUT", "/api/clock",
+            data=json.dumps({"time": time_value, "brightness": int(clock_pin["brightness"])}),
+            content_type="application/json",
+        )
+        if not (200 <= status < 300):
+            raise HTTPException(status_code=502, detail="не удалось показать время на колонке")
+    return JSONResponse(dict(clock_pin))
 
 
 # --------------------------------------------------------------------------- #

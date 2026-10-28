@@ -56,6 +56,98 @@ function secondsToHuman(seconds) {
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/* Красивые имена моделей (код из /api/device → человекочитаемое название).
+   CLOCK — модели с LED-кольцом, на котором панель показывает часы. */
+const MODEL_NAMES = {
+  yandexmini_2: 'Яндекс Станция Мини 2',
+  yandexmini_3: 'Яндекс Станция Мини 3',
+  yandexmini_3_pro: 'Яндекс Станция Мини 3 Про',
+  yandexmini: 'Яндекс Станция Мини',
+  yandexstation: 'Яндекс Станция',
+  yandexstation_2: 'Яндекс Станция 2',
+  yandexstation_3: 'Яндекс Станция 3',
+  yandexmidi: 'Яндекс Станция Миди',
+  yandexmax: 'Яндекс Станция Макс',
+  yandexlite: 'Яндекс Станция Лайт',
+  yandexlite_2: 'Яндекс Станция Лайт 2',
+  yandexstreet: 'Яндекс Станция Стрит',
+  yandexduo_max: 'Яндекс Станция Дуо Макс',
+  yandexduomax: 'Яндекс Станция Дуо Макс',
+  yandexstation_duo_max: 'Яндекс Станция Дуо Макс',
+  yandexduo: 'Яндекс Станция Дуо',
+  yandexstation_duo: 'Яндекс Станция Дуо',
+};
+const CLOCK_MODELS = new Set(['yandexmini_2', 'yandexmini', 'yandexstation', 'yandexstation_2']);
+function prettyModel(model) {
+  if (!model) return 'Яндекс Станция';
+  const key = String(model).toLowerCase().replace(/[-\s]+/g, '_');
+  let name = MODEL_NAMES[key];
+  if (!name) {
+    if (key.includes('mini') && key.includes('2')) name = 'Яндекс Станция Мини 2';
+    else if (key.includes('mini')) name = 'Яндекс Станция Мини';
+    else name = 'Яндекс Станция ' + String(model).replace(/[_-]+/g, ' ').trim();
+  }
+  return CLOCK_MODELS.has(key) ? name + ' с часами' : name;
+}
+
+/* Фото колонки в «Обзоре»: официальные изображения из Справки Алисы
+   (static/img/speakers/*.png). Если фото для модели нет — остаётся SVG. */
+const MODEL_PHOTOS = {
+  yandexmini_2: 'mini2.png',
+  yandexmini_3: 'mini3.png',
+  yandexmini_3_pro: 'mini3-pro.png',
+  yandexmini: 'mini1.png',
+  yandexstation_2: 'gen2.png',
+  yandexstation_3: 'gen3.png',
+  yandexmidi: 'midi.png',
+  yandexmax: 'max.png',
+  yandexlite: 'lite.png',
+  yandexlite_2: 'lite2.png',
+  yandexstreet: 'street.png',
+  yandexduo_max: 'duo-max.png',
+  yandexduomax: 'duo-max.png',
+  yandexstation_duo_max: 'duo-max.png',
+};
+
+function setDevicePhoto(model) {
+  const img = $('devicePhoto');
+  if (!img) return;
+  const key = String(model || '').toLowerCase().replace(/[-\s]+/g, '_');
+  const file = MODEL_PHOTOS[key];
+  if (!file) return;                       // фото нет — оставляем текущую картинку
+  img.src = '/static/img/speakers/' + file;
+  img.onerror = () => {                    // файл не доехал — возврат к SVG
+    img.src = '/static/img/station-mini2.svg';
+    img.onerror = null;
+  };
+}
+
+/* Компактные характеристики модели — со страниц Справки Алисы
+   (alice.yandex.ru/support/.../characteristics-*, собрано для v2). */
+const MODEL_SPECS = {
+  yandexmini_2: 'Ø97×54 мм · 260 г · 10 Вт · LED-кольцо 32 диода (часы — YNDX-00020) · 4 мика',
+  yandexmini_3: 'Ø102×60,5 мм · 326 г · 12 Вт · LED 32 сегмента · 3 мика, шумоподавление',
+  yandexmini_3_pro: 'Ø102×71 мм · 438 г · 18 Вт · модули: АКБ и климатический датчик · Zigbee 3.0',
+  yandexmini: 'Ø90×45 мм · 170 г · 3 Вт · датчик жестов TOF · 4 мика',
+  yandexstation_2: '123×99×199 мм · 1,3 кг · 30 Вт · круговая подсветка · Zigbee 3.0',
+  yandexstation_3: '132×132×201 мм · 1,76 кг · 50 Вт · эмбиент-подсветка 12 LED · Zigbee 3.0, Matter',
+  yandexmidi: '96×96×110 мм · 0,9 кг · 24 Вт · датчик присутствия · Zigbee 3.0',
+  yandexmax: '141×141×231 мм · 2,65 кг · 65 Вт · Dolby Audio · HDMI 2.0 (вывод 4K) · Zigbee',
+  yandexlite: 'Ø90×55 мм · 230 г · 5 Вт · 4 мика · 6 расцветок',
+  yandexlite_2: 'Ø90×65 мм · 350 г · 6 Вт · LED 36 сегментов (часы — YNDX-00026) · опциональный АКБ',
+  yandexstreet: 'Ø83×202 мм · 700 г · 30 Вт · АКБ 3300 мАч (до 12 ч) · защита IP67 · 3 мика',
+  yandexduo_max: '256×118×240 мм · 3,3 кг · 60 Вт · экран 10,5" 1920×1200 · камера 13 Мп · Zigbee',
+  yandexduomax: '256×118×240 мм · 3,3 кг · 60 Вт · экран 10,5" 1920×1200 · камера 13 Мп · Zigbee',
+  yandexstation_duo_max: '256×118×240 мм · 3,3 кг · 60 Вт · экран 10,5" 1920×1200 · камера 13 Мп · Zigbee',
+};
+
+function setDeviceSpecs(model) {
+  const el = $('deviceSpecs');
+  if (!el) return;
+  const key = String(model || '').toLowerCase().replace(/[-\s]+/g, '_');
+  el.textContent = MODEL_SPECS[key] || '';
+}
+
 const hex = color => {
   const value = String(color || '').trim();
   return /^#[0-9a-f]{6}$/i.test(value) ? value.toUpperCase() : '#000000';
@@ -79,6 +171,8 @@ function showTab(name) {
 
 document.querySelectorAll('.nav-item').forEach(item => item.onclick = () => showTab(item.dataset.tab));
 $('voiceGoWords').onclick = () => showTab('wakeword');
+/* ссылки-переходы на вкладки из пояснительных текстов */
+document.querySelectorAll('[data-goto-tab]').forEach(link => link.onclick = (e) => { e.preventDefault(); showTab(link.dataset.gotoTab); });
 
 $('logout').onclick = async () => {
   await api('/api/logout', { method: 'POST', body: '{}' }).catch(() => {});
@@ -146,7 +240,7 @@ async function refreshStatus() {
     $('cDiskBar').style.width = (data.disk_percent || 0) + '%';
 
     $('cYam').textContent = data.yam_online ? 'работает' : 'недоступен';
-    $('cYamSub').textContent = data.device ? `${data.device.model} · ${data.device.architecture}` : (data.yam_error || '—');
+    $('cYamSub').textContent = data.device ? `${prettyModel(data.device.model)} · ${data.device.architecture}` : (data.yam_error || '—');
     $('cPlugins').textContent = data.plugins === null ? '—' : data.plugins;
     $('cPluginsSub').textContent = data.plugins_running ? `${data.plugins_running} запущено` : 'нет запущенных';
 
@@ -161,8 +255,10 @@ async function refreshStatus() {
       : '<span class="muted small">нет данных (демон YAM недоступен)</span>';
 
     if (data.device) {
-      $('brandModel').textContent = `${data.device.model} · ${data.device.architecture}`;
-      document.title = `Панель Станции — ${data.device.model}`;
+      $('brandModel').textContent = `${prettyModel(data.device.model)} · ${data.device.architecture}`;
+      document.title = `Панель Станции — ${prettyModel(data.device.model)}`;
+      setDevicePhoto(data.device.model);
+      setDeviceSpecs(data.device.model);
     }
 
     $('linkYam').href = `http://${data.station_ip}:${state.settingsYamPort || 8099}/`;
@@ -635,6 +731,10 @@ $('clockNow').onclick = () => {
   const time = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
   setClockValue(time);
   clockSet(time, clockBrightness.value);
+  // «Сейчас» = реальное время: закрепление снимаем всегда (чекбокс мог
+  // устареть, а фоновый цикл панели иначе вернёт старое время)
+  $('clockPin').checked = false;
+  clockPinSync();
 };
 
 $('clockOff').onclick = clockOffRequest;
@@ -648,6 +748,32 @@ document.querySelectorAll('[data-clock]').forEach(button => {
 });
 
 updateClockPreview();
+
+/* закрепление времени на LED-часах: колонка сама возвращает реальное время,
+   панель переподтверждает заданное значение каждые 5 с (см. server.py) */
+async function clockPinSync() {
+  const active = $('clockPin').checked;
+  const time = $('clockTime').value;
+  if (active && !/^\d\d:\d\d$/.test(time)) {
+    $('clockPin').checked = false;
+    notify($('clockStatus'), 'сначала введите время в формате ЧЧ:ММ', 'error');
+    return;
+  }
+  try {
+    const res = await api('/api/clock/pin', {
+      method: 'POST',
+      body: JSON.stringify({ active, time, brightness: Number(clockBrightness.value) })
+    });
+    notify($('clockStatus'), res.active
+      ? `закреплено: ${res.time} — панель удерживает значение`
+      : 'закрепление снято — колонка снова показывает реальное время', 'ok');
+  } catch (error) {
+    notify($('clockStatus'), 'ошибка закрепления: ' + error.message, 'error');
+    $('clockPin').checked = false;
+  }
+}
+$('clockPin').onchange = clockPinSync;
+api('/api/clock/pin').then(pin => { $('clockPin').checked = !!pin.active; }).catch(() => {});
 
 /* ------------------------------- датчики ------------------------------- */
 async function refreshSensors() {
@@ -817,6 +943,146 @@ $('setupKeyShow').onclick = async () => {
   }
 };
 
+/* --------------------------- мастер настройки ---------------------------
+   Один прогон по всем ручкам панели: связь → станция → часы → громкость →
+   голосовой мост → слово активации → телеметрия. Шаги складываются в
+   .setup-steps тем же рендером, что и у автонастройки; ошибка одного шага
+   не прерывает остальные. */
+$('masterStart').onclick = async () => {
+  const btn = $('masterStart');
+  const steps = [];
+  const render = () => { $('masterSteps').innerHTML = steps.map(setupRenderStep).join(''); };
+  const push = (step, ok, detail) => { steps.push({ step, ok, detail: String(detail ?? '') }); render(); };
+  const failedNow = message => { notify($('masterStatus'), message, 'error'); };
+
+  btn.disabled = true;
+  steps.length = 0;
+  render();
+  notify($('masterStatus'), 'идёт мастер настройки — не закрывайте вкладку…');
+
+  try {
+    // 1. связь: детект IP, портов, SSH-ключ (существующая автонастройка)
+    let infra;
+    try {
+      infra = await api('/api/setup/full', { method: 'POST', body: '{}' });
+    } catch (error) {
+      failedNow('остановлено на связи: ' + error.message);
+      return;
+    }
+    (infra.steps || []).forEach(step => steps.push({ step: 'Связь: ' + step.step, ok: step.ok, detail: String(step.detail ?? '') }));
+    render();
+    if (!infra.ok) {
+      failedNow('остановлено: ' + (infra.error || 'колонка недоступна — проверьте, что они в одной сети'));
+      return;
+    }
+    // порты могли смениться — переподключаем терминал и статус
+    state.socket && state.socket.close();
+    setTimeout(() => { connectTerminal(); refreshStatus(); }, 300);
+
+    // 2. станция на связи
+    try {
+      const st = await api('/api/status');
+      const model = st.device ? prettyModel(st.device.model) : 'модель неизвестна';
+      push('Станция на связи', !!st.yam_online,
+        st.yam_online ? `${model} · YAM отвечает` : (st.yam_error || 'YAM не отвечает — раздел «Система»'));
+    } catch (error) {
+      push('Станция на связи', false, error.message);
+    }
+
+    // 3. LED-часы: показать текущее время (без закрепления — колонка сама
+    //    ходит по реальному времени; закрепление нужно только для чужого значения)
+    try {
+      const pin = await api('/api/clock/pin');
+      if (pin.active) {
+        push('LED-часы', true, `закреплено: ${pin.time || ''} — снять закрепление можно кнопкой «Сейчас»`);
+      } else {
+        const now = new Date();
+        const time = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+        await yam('/clock', { method: 'PUT', body: JSON.stringify({ time, brightness: 170 }) });
+        push('LED-часы', true, `${time} отправлено на кольцо, яркость 170`);
+      }
+    } catch (error) {
+      push('LED-часы', false, error.message + ' — раздел «Подсветка»');
+    }
+
+    // 4. громкость
+    try {
+      const volume = await api('/api/volume');
+      if (!volume.ok) throw new Error('нет данных');
+      push('Громкость', true,
+        `${volume.volume}%${volume.volume < 10 ? ' — очень тихо, поднимите ползунком в «Обзоре»' : ''}`);
+    } catch (error) {
+      push('Громкость', false, error.message);
+    }
+
+    // 5. голосовой мост (запускается сам, если ещё не готов)
+    try {
+      let bridge = await api('/api/bridge/status');
+      if (!(bridge.running && bridge.has_token)) {
+        await api('/api/bridge/setup', { method: 'POST', body: '{}' });
+        bridge = await api('/api/bridge/status');
+      }
+      const llm = bridge.llm || {};
+      const llmReady = !!(llm.deepseek_token || llm.deepseek_cookie || llm.openrouter_key);
+      const ok = !!(bridge.running && bridge.has_token && llmReady);
+      push('Голосовой мост', ok, ok
+        ? `запущен: ${bridge.url || ('127.0.0.1:' + bridge.port)}`
+        : 'не готов — «Система → Голосовые команды»: укажите токен моста и LLM');
+    } catch (error) {
+      push('Голосовой мост', false, error.message);
+    }
+
+    // 6. слово активации
+    try {
+      const wwStateNow = await ww('api/state');
+      const words = (wwStateNow && wwStateNow.words) || [];
+      const names = words
+        .map(word => word.phrase || word.name || word.word || '')
+        .filter(Boolean);
+      const enabledCount = words.filter(word => word.enabled !== false).length;
+      push('Слово активации', words.length > 0,
+        words.length
+          ? `${words.length} шт. (${enabledCount} вкл.): ${names.slice(0, 3).join(', ')}${names.length > 3 ? '…' : ''}`
+          : 'слов нет — раздел «Слова активации»: запишите своё слово');
+      if (words.length && !enabledCount) {
+        steps[steps.length - 1].ok = false;
+        steps[steps.length - 1].detail += ' — все слова выключены';
+        render();
+      }
+    } catch (error) {
+      push('Слово активации', false, 'служба слов не отвечает: ' + error.message);
+    }
+
+    // 7. телеметрия — информационный шаг, ничего не включает и не выключает
+    try {
+      const tel = await api('/api/telemetry');
+      if (tel.ok) {
+        const off = !(tel.telemetry_in_list || tel.fluent_in_list);
+        push('Телеметрия', true, off
+          ? 'отключена'
+          : 'включена — выключается в «Системе → Телеметрия Яндекса» (после перезагрузки колонки)');
+      } else {
+        push('Телеметрия', true, 'состояние прочитать не удалось: ' + (tel.detail || ''));
+      }
+    } catch (error) {
+      push('Телеметрия', true, 'инфо недоступно: ' + error.message);
+    }
+
+    // 8. итог
+    const failed = steps.filter(step => !step.ok).length;
+    push('Итог', failed === 0, failed === 0
+      ? 'всё настроено. Дальше: «Подсветка» — часы и LED, «Слова активации» — своё слово, «Голосовые команды» — триггеры.'
+      : `шагов с ошибкой: ${failed} — раскройте инструкцию под кнопкой и повторите`);
+    notify($('masterStatus'), failed === 0
+      ? 'мастер завершён — колонка настроена'
+      : `мастер завершён, проблем: ${failed}`, failed === 0 ? 'ok' : 'error');
+  } catch (error) {
+    failedNow('непредвиденная ошибка мастера: ' + error.message);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 /* ------------------------------- система ------------------------------- */
 async function loadSettings() {
   try {
@@ -905,6 +1171,54 @@ $('rebootBtn').onclick = async () => {
     notify($('rebootStatus'), 'ошибка: ' + error.message, 'error');
   }
 };
+
+/* ------------------------- телеметрия Яндекса -------------------------
+   servicesList в /system/vendor/quasar/quasar.cfg (см. server.py): убираем
+   telemetry и fluent-bitd, бэкап рядом. Применение — после перезагрузки. */
+async function refreshTelemetry() {
+  try {
+    const st = await api('/api/telemetry');
+    if (!st.ok) {
+      notify($('telemetryStatus'), 'не удалось прочитать: ' + (st.detail || 'нет данных'), 'error');
+      return;
+    }
+    const off = !(st.telemetry_in_list || st.fluent_in_list);
+    const running = (st.running_telemetry || 0) + (st.running_fluent || 0);
+    const bak = st.backup ? 'бэкап: есть' : 'бэкапа нет';
+    const box = $('telemetryOff');
+    if (box) box.checked = off;
+    notify($('telemetryStatus'), off
+      ? (running > 0
+        ? `отключена (${bak}) — процессы ещё работают: перезагрузите колонку`
+        : `отключена (${bak})`)
+      : (running > 0
+        ? `включена: ${st.services_list.join(', ')}`
+        : `службы возвращены (${st.services_list.join(', ')}) — перезагрузите колонку`),
+      'ok');
+  } catch (error) {
+    notify($('telemetryStatus'), 'ошибка: ' + error.message, 'error');
+  }
+}
+
+const telemetryOffBox = $('telemetryOff');
+if (telemetryOffBox) telemetryOffBox.addEventListener('change', async () => {
+  const wantOff = telemetryOffBox.checked;
+  const question = wantOff
+    ? 'Отключить телеметрию? Конфиг колонки изменится (исходник сохраняется бэкапом), применится после перезагрузки.'
+    : 'Вернуть телеметрию Яндекса в исходное состояние?';
+  if (!confirm(question)) { refreshTelemetry(); return; }
+  telemetryOffBox.disabled = true;
+  notify($('telemetryStatus'), 'правлю quasar.cfg на колонке…');
+  try {
+    await api('/api/telemetry', { method: 'POST', body: JSON.stringify({ enabled: !wantOff }) });
+    await refreshTelemetry();
+  } catch (error) {
+    notify($('telemetryStatus'), 'ошибка: ' + error.message, 'error');
+    await refreshTelemetry();
+  } finally {
+    telemetryOffBox.disabled = false;
+  }
+});
 
 /* ------------------------- обновления панели ------------------------- */
 $('panelUpdAuto').checked = localStorage.getItem('sp_panel_auto') === '1';
@@ -1562,6 +1876,122 @@ document.addEventListener('change', event => {
   }
 });
 
+/* -------------------------- внешний вид панели --------------------------
+   Тема, курсор, шрифт и жидкое стекло — вкладка «Внешний вид».
+   Настройки хранятся в localStorage браузера (не на сервере): панель одна,
+   а вкус у каждого свой. Само применение — inline-скрипт в <head> index.html,
+   здесь только обработка кликов и отметка активных кнопок. */
+const APPEARANCE_KEY = 'sp.appearance.v1';
+const APPEARANCE_DEFAULTS = { theme: 'wine', cursor: 'default', font: 'system', glass: true };
+const APPEARANCE_GROUPS = [['themeGroup', 'theme'], ['cursorGroup', 'cursor'], ['fontGroup', 'font']];
+let appearance = { ...APPEARANCE_DEFAULTS };
+try {
+  appearance = { ...APPEARANCE_DEFAULTS, ...JSON.parse(localStorage.getItem(APPEARANCE_KEY) || '{}') };
+} catch (e) { /* повреждённое хранилище — работаем с дефолтами */ }
+
+function appearanceSave() {
+  try { localStorage.setItem(APPEARANCE_KEY, JSON.stringify(appearance)); } catch (e) { /* приватный режим */ }
+}
+
+function appearanceApply() {
+  const html = document.documentElement;
+  html.dataset.theme = appearance.theme;
+  html.dataset.cursor = appearance.cursor;
+  html.dataset.font = appearance.font;
+  html.dataset.glass = appearance.glass ? 'on' : 'off';
+  APPEARANCE_GROUPS.forEach(([groupId, key]) => {
+    const group = $(groupId);
+    if (!group) return;
+    group.querySelectorAll('.preset').forEach(button => {
+      button.classList.toggle('active', button.dataset[key] === appearance[key]);
+    });
+  });
+  const glassBox = $('glassCursor');
+  if (glassBox) glassBox.checked = !!appearance.glass;
+}
+
+APPEARANCE_GROUPS.forEach(([groupId, key]) => {
+  const group = $(groupId);
+  if (!group) return;
+  group.addEventListener('click', event => {
+    const button = event.target.closest('.preset');
+    if (!button || !group.contains(button) || !button.dataset[key]) return;
+    appearance[key] = button.dataset[key];
+    appearanceSave();
+    appearanceApply();
+  });
+});
+
+const glassBox = $('glassCursor');
+if (glassBox) glassBox.addEventListener('change', () => {
+  appearance.glass = glassBox.checked;
+  appearanceSave();
+  appearanceApply();
+});
+
+const appearanceReset = $('appearanceReset');
+if (appearanceReset) appearanceReset.addEventListener('click', () => {
+  appearance = { ...APPEARANCE_DEFAULTS };
+  appearanceSave();
+  appearanceApply();
+  const label = appearanceReset.textContent;
+  appearanceReset.textContent = 'Сброшено ✓';
+  setTimeout(() => { appearanceReset.textContent = label; }, 1400);
+});
+
+appearanceApply();
+
+/* ------------------------------ громкость ------------------------------
+   Общий регулятор ALSA (Master) на колонке — GET/PUT /api/volume, шкала
+   0..100 %. Читаем при старте и раз в 30 с, пока открыт «Обзор»; во время
+   перетаскивания ползунка не опрашиваем, чтобы не дёргать значение. */
+const volumeRange = $('volumeRange');
+const volumeValue = $('volumeValue');
+const volumeStatus = $('volumeStatus');
+let volumeDragging = false;
+
+function renderVolume(level) {
+  if (!volumeRange) return;
+  volumeRange.value = level;
+  volumeRange.style.setProperty('--fill', level + '%');
+  if (volumeValue) volumeValue.textContent = level + '%';
+}
+
+async function refreshVolume() {
+  if (!volumeRange || volumeDragging) return;
+  try {
+    const data = await api('/api/volume');
+    if (data && data.ok) {
+      renderVolume(data.volume);
+      if (volumeStatus) volumeStatus.textContent = 'Сейчас: ' + data.volume + '%';
+    }
+  } catch (e) {
+    if (volumeStatus) volumeStatus.textContent = 'Громкость недоступна: ' + e.message;
+  }
+}
+
+if (volumeRange) {
+  volumeRange.addEventListener('input', () => {
+    volumeDragging = true;
+    volumeRange.style.setProperty('--fill', volumeRange.value + '%');
+    if (volumeValue) volumeValue.textContent = volumeRange.value + '%';
+    if (volumeStatus) volumeStatus.textContent = 'отпусти ползунок — применится';
+  });
+  volumeRange.addEventListener('change', async () => {
+    const level = Number(volumeRange.value);
+    try {
+      const data = await api('/api/volume', { method: 'PUT', body: JSON.stringify({ volume: level }) });
+      if (volumeStatus) volumeStatus.textContent = 'Громкость: ' + (data && data.ok ? data.volume : level) + '% — применено';
+    } catch (e) {
+      if (volumeStatus) volumeStatus.textContent = 'Не удалось выставить: ' + e.message;
+      volumeDragging = false;
+      await refreshVolume();
+      return;
+    }
+    volumeDragging = false;
+  });
+}
+
 /* -------------------------------- запуск -------------------------------- */
 (async function start() {
   showTab(localStorage.getItem('sp_tab') || 'overview');
@@ -1579,8 +2009,11 @@ document.addEventListener('change', event => {
   await loadSettings();
   await loadPlugins();
   await refreshSensors();
+  refreshVolume();
+  refreshTelemetry();
 
   setInterval(refreshStatus, 5000);
   setInterval(refreshSensors, 3000);
+  setInterval(() => { if ($('tab-overview').classList.contains('active')) refreshVolume(); }, 30000);
   setInterval(() => { if ($('tab-plugins').classList.contains('active')) loadPlugins(); }, 15000);
 })();

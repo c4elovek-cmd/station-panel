@@ -1,4 +1,4 @@
-# Остановка веб-панели Станции
+﻿# Остановка веб-панели Станции
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pidFile = Join-Path $here "run\panel.pid"
 

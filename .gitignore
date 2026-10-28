@@ -4,6 +4,7 @@ password.txt
 backups/
 soundproxy-secrets.json
 keys/
+bridge-config.json
 
 # runtime
 run/
