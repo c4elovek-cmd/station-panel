@@ -302,6 +302,7 @@ async function refreshStatus() {
       setDevicePhoto(data.device.model);
       setDeviceSpecs(data.device.model);
     }
+    adaptTabsToFeatures(features);
 
     $('linkYam').href = `http://${data.station_ip}:${state.settingsYamPort || 8099}/`;
     $('overviewUpdated').textContent = 'обновлено ' + new Date().toLocaleTimeString('ru-RU');
@@ -309,6 +310,18 @@ async function refreshStatus() {
     $('dot').className = 'dot off';
     $('statusText').textContent = 'ошибка: ' + error.message;
   }
+}
+
+/* Вкладки и блоки по железу модели: что колонка не умеет — то не показываем.
+   Возможности приходят из YAM /api/device → features (led.*, display.clock.*),
+   так панель честно живёт и на моделях без LED-кольца (Лайт и др.). */
+function adaptTabsToFeatures(features) {
+  const list = features || [];
+  const hasLed = list.some(f => String(f).startsWith('led.'));
+  const hasClock = list.some(f => String(f).startsWith('led.ring.') || String(f).includes('clock'));
+  document.querySelectorAll('[data-tab="led"]').forEach(btn => { btn.hidden = !hasLed; });
+  const clockBlock = $('clockBlock');
+  if (clockBlock) clockBlock.hidden = !hasClock;
 }
 
 /* ---------------------------- быстрые команды ---------------------------- */
