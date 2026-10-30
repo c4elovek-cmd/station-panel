@@ -2702,6 +2702,12 @@ function cloudBindOnce() {
     await api('/api/alice/cloud', { method: 'DELETE' }).catch(() => {});
     await loadAliceCloud();
   };
+  $('cloudRefresh').onclick = () => {
+    $('cloudAfter').style.display = 'none';
+    $('cloudForm').style.display = '';
+    $('cloudStatus').textContent = 'Вставьте свежую строку Cookie — старый токен заменится.';
+    $('cloudCookie').focus();
+  };
   CLOUD_TOGGLES.forEach(item => {
     const el = $(item.id);
     el.onchange = async () => {
