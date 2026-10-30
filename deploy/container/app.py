@@ -60,7 +60,17 @@ SPAWNERS = {
 
 
 def spawn_all() -> None:
-    for name, spawn in SPAWNERS.items():
+    spawners = dict(SPAWNERS)
+    tok_file = BASE / "cloudflared.token"
+    if tok_file.exists() and (BASE / "cloudflared").exists():
+        def _tunnel() -> subprocess.Popen:
+            env = dict(os.environ)
+            env["TUNNEL_TOKEN"] = tok_file.read_text(encoding="utf-8").strip()
+            return subprocess.Popen([str(BASE / "cloudflared"), "tunnel", "run",
+                                     "--protocol", "http2"],
+                                    cwd=str(BASE), env=env)
+        spawners["tunnel"] = _tunnel
+    for name, spawn in spawners.items():
         if name in PROCS and PROCS[name].poll() is None:
             continue
         try:
