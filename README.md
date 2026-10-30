@@ -105,6 +105,16 @@ python server.py
 .\start.ps1
 ```
 
+На Linux (включая VPS) — одной командой, с systemd-автозапуском:
+
+```sh
+sudo sh deploy/install.sh
+```
+
+или просто `sh deploy/start.sh` из папки `deploy` (без systemd, сам держит процессы живыми).
+Подробности — `deploy/README.md`.
+
+
 Панель откроется на `http://127.0.0.1:8787`. Пароль создаётся при первом
 запуске и лежит в `password.txt` рядом со скриптом (не публикуется).
 

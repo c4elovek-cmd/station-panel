@@ -1,0 +1,13 @@
+# Зависимости панели Станции для Linux/VPS.
+# Ставится автоматически при первом запуске start.sh, либо вручную:
+#   python3 -m pip install -r requirements-linux.txt
+fastapi>=0.110
+uvicorn>=0.29
+aiohttp>=3.9
+asyncssh>=2.14
+python-multipart>=0.0.9
+httpx>=0.27
+# опционально: mDNS-поиск станций (нужен только в домашней сети, не на VPS)
+zeroconf>=0.131
+# опционально: локальный TTS в панели (на сервере можно убрать вместе с say_engine=edge)
+edge-tts>=6.1

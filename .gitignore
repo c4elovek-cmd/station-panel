@@ -5,9 +5,16 @@ backups/
 soundproxy-secrets.json
 keys/
 bridge-config.json
+bin/
+bundles/
+!deploy/bin/
 
 # runtime
 run/
+.station/
+.shots/
+dumps/
+answer-tts.flag
 plugin-configs/
 __pycache__/
 *.pyc

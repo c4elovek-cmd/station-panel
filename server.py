@@ -27,9 +27,12 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import time
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -40,6 +43,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, File
 from fastapi.staticfiles import StaticFiles
 
 BASE = Path(__file__).resolve().parent
+PANEL_BIN = BASE / "bin"      # инструменты, скачанные из «Чек-листа» (ffmpeg, yt-dlp)
+PANEL_BUNDLES = BASE / "bundles"  # бинари для колонки, поставляемые с панелью
+
+
+def bin_tool(name: str) -> str | None:
+    """Путь к инструменту: сначала bin/ панели, затем PATH."""
+    local = PANEL_BIN / (name + (".exe" if os.name == "nt" else ""))
+    if local.exists():
+        return str(local)
+    return shutil.which(name)
 CONFIG_PATH = BASE / "config.json"
 STATIC_DIR = BASE / "static"
 PASSWORD_HINT = BASE / "password.txt"
@@ -77,6 +90,10 @@ _ssh_lock = asyncio.Lock()
 # «Закреплённое» время LED-часов: вендорный maind перерисовывает реальное время
 # каждые ~60 с, поэтому панель периодически подтверждает кастомное значение.
 clock_pin: dict[str, Any] = {"time": "", "brightness": 170, "active": False}
+clock_night: dict[str, Any] = {
+    "enabled": False, "start": "23:00", "end": "07:00",
+    "night_brightness": 12, "day_brightness": 170, "was_night": False,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -124,9 +141,11 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.on_event("startup")
-async def _start_clock_pin() -> None:
-    """Поднять фоновую задачу подтверждения закреплённого времени на часах."""
+async def _start_background_loops() -> None:
+    """Фоновые задачи: закрепление времени, ночной профиль, синхронизация громкости."""
     asyncio.create_task(_clock_pin_loop())
+    asyncio.create_task(_night_clock_loop())
+    asyncio.create_task(_volume_sync_loop())
 
 
 # --------------------------------------------------------------------------- #
@@ -574,65 +593,287 @@ async def reset_plugin_settings(plugin_id: str, request: Request) -> JSONRespons
     return JSONResponse({"ok": True, "id": plugin_id})
 
 
+# --------------------------------------------------------------------------- #
+# Обнаружение станций: mDNS (ловит и «сырые» колонки без YAM), затем скан по YAM
+# --------------------------------------------------------------------------- #
+# Сервисы, которыми анонсятся Яндекс-станции. Первый — основной (YandexIO),
+# остальные добавлены как возможные варианты: чего нет в сети, то просто молчит.
+MDNS_TYPES = (
+    "_yandexio._tcp.local.",
+    "_yandex-station._tcp.local.",
+    "_quasar._tcp.local.",
+    "_alice._tcp.local.",
+)
+MDNS_HINTS = ("yandex", "quasar", "alice", "yandexio")
+
+
+def _local_subnets() -> list[str]:
+    """Префиксы /24 всех локальных IPv4-адресов этой машины.
+
+    Нужен для скана: дефолтный IP станции может указывать не в ту сеть,
+    поэтому ищем колонки в тех подсетях, где машина реально живёт.
+    Первой идёт подсеть маршрута по умолчанию, остальные — за ней.
+    """
+    default_prefix: str | None = None
+    prefixes: list[str] = []
+
+    def add(ip: str) -> None:
+        nonlocal default_prefix
+        parts = ip.split(".")
+        if len(parts) != 4 or not all(p.isdigit() for p in parts) or ip.startswith("127."):
+            return
+        prefix = ".".join(parts[:3])
+        if prefix in prefixes:
+            return
+        prefixes.append(prefix)
+
+    # адрес интерфейса, через который уходит маршрут по умолчанию — самый вероятный
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            s_ip = s.getsockname()[0]
+        finally:
+            s.close()
+        add(s_ip)
+        default_prefix = ".".join(s_ip.split(".")[:3])
+    except Exception:
+        pass
+    # все адреса хоста по имени
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add(info[4][0])
+    except Exception:
+        pass
+    if default_prefix and default_prefix in prefixes:
+        prefixes.remove(default_prefix)
+        prefixes.insert(0, default_prefix)
+    return prefixes
+
+
+def _mdns_scan(timeout: float = 4.0) -> list[dict[str, Any]]:
+    """Слушает mDNS и собирает найденные устройства. Блокирующая — звать в executor."""
+    try:
+        from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+    except Exception:
+        return []
+
+    found: dict[str, dict[str, Any]] = {}
+
+    def addr_str(raw: Any) -> str:
+        try:
+            if isinstance(raw, (bytes, bytearray)):
+                return socket.inet_ntoa(raw)
+        except Exception:
+            pass
+        return str(raw)
+
+    def decode(props: Any) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for key, val in (props or {}).items():
+            name = key.decode(errors="replace") if isinstance(key, bytes) else str(key)
+            if isinstance(val, (bytes, bytearray)):
+                text = val.decode(errors="replace")
+            else:
+                text = "" if val is None else str(val)
+            out[name] = text
+        return out
+
+    class Listener(ServiceListener):
+        def add_service(self, zc: Any, service_type: str, name: str) -> None:
+            self.keep(zc, service_type, name)
+
+        def update_service(self, zc: Any, service_type: str, name: str) -> None:
+            self.keep(zc, service_type, name)
+
+        def remove_service(self, zc: Any, service_type: str, name: str) -> None:
+            return None
+
+        def keep(self, zc: Any, service_type: str, name: str) -> None:
+            try:
+                info = zc.get_service_info(service_type, name, timeout=1500)
+            except Exception:
+                return
+            if not info:
+                return
+            props = decode(info.properties)
+            host = (info.server or name).rstrip(".")
+            for raw in (info.addresses or []):
+                ip = addr_str(raw)
+                if not ip or ip.startswith("127."):
+                    continue
+                found[ip] = {
+                    "ip": ip,
+                    "name": props.get("name") or host.split(".")[0],
+                    "model": props.get("model") or props.get("platform") or "",
+                    "device_id": (props.get("device_id") or props.get("deviceId")
+                                  or props.get("id") or props.get("serial") or ""),
+                    "service": service_type,
+                    "source": "mDNS",
+                }
+
+    zc = None
+    browsers: list[Any] = []
+    try:
+        zc = Zeroconf()
+        listener = Listener()
+        browsers = [ServiceBrowser(zc, service_type, listener) for service_type in MDNS_TYPES]
+
+        # Заодно спрашиваем у сети список всех сервисов и добавляем «яндексоподобные»:
+        # так находятся станции, анонсящиеся под неожиданным именем.
+        try:
+            class Types(ServiceListener):
+                def add_service(self, zc2: Any, service_type: str, name: str) -> None:
+                    low = name.lower()
+                    if any(hint in low for hint in MDNS_HINTS) and name not in MDNS_TYPES:
+                        browsers.append(ServiceBrowser(zc2, name, listener))
+
+                def update_service(self, *args: Any) -> None:
+                    return None
+
+                def remove_service(self, *args: Any) -> None:
+                    return None
+
+            browsers.append(ServiceBrowser(zc, "_services._dns-sd._udp.local.", Types()))
+        except Exception:
+            pass
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.2)
+    except Exception:
+        pass
+    finally:
+        for browser in browsers:
+            try:
+                browser.cancel()
+            except Exception:
+                pass
+        if zc is not None:
+            try:
+                zc.close()
+            except Exception:
+                pass
+    return list(found.values())
+
+
+async def _yam_device(ip: str) -> dict[str, Any] | None:
+    """Ответ демона YAM (:8099) по IP — признак, что на колонке стоит YAM."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=1.2)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"http://{ip}:{cfg['yam_port']}/api/device") as resp:
+                if resp.status == 200:
+                    device = await resp.json(content_type=None)
+                    if isinstance(device, dict) and device.get("model"):
+                        return device
+    except Exception:
+        pass
+    return None
+
+
+async def _port_open(ip: str, port: int, timeout: float = 0.8) -> bool:
+    """Открыт ли TCP-порт (например, root-SSH 2222)."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 @app.post("/api/detect")
 async def api_detect(request: Request) -> JSONResponse:
-    """Найти колонку: сначала текущий IP, затем скан /24 подсети по порту YAM."""
+    """Найти станции: mDNS (включая «сырые», без YAM), затем скан подсети по YAM."""
     require_auth(request)
 
-    # сеть берём из текущего IP; если не задан — из локального адреса панели
-    network_prefix = ".".join(cfg["station_ip"].split(".")[:3]) if cfg.get("station_ip") else None
-    if not network_prefix or not all(p.isdigit() for p in network_prefix.split(".")):
-        network_prefix = None
-        try:
-            local = aiohttp.ClientSession()
-            await local.close()
-        except Exception:
-            pass
+    devices: dict[str, dict[str, Any]] = {}
 
-    async def probe(ip: str) -> str | None:
-        try:
-            timeout = aiohttp.ClientTimeout(total=1.2)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(f"http://{ip}:{cfg['yam_port']}/api/device") as resp:
-                    if resp.status == 200:
-                        device = await resp.json(content_type=None)
-                        if isinstance(device, dict) and device.get("model"):
-                            return ip
-        except Exception:
-            pass
-        return None
+    def note(ip: str, **kw: Any) -> None:
+        if not ip:
+            return
+        item = devices.setdefault(ip, {
+            "ip": ip, "name": "", "model": "", "device_id": "",
+            "source": "", "has_yam": False, "ssh": False,
+        })
+        for key, value in kw.items():
+            if key in ("has_yam", "ssh"):
+                item[key] = item[key] or bool(value)
+            elif value:
+                item[key] = value
 
-    candidates = []
     current = cfg.get("station_ip", "")
-    if network_prefix:
-        local_octet = current.split(".")[3] if current.startswith(network_prefix + ".") and current.split(".")[-1].isdigit() else None
-        for octet in range(1, 255):
-            if str(octet) == local_octet:
+    scanned = 0
+
+    # 1. Текущий IP: если отвечает YAM — это рабочая колонка.
+    if current:
+        device = await _yam_device(current)
+        if device:
+            note(current, name=device.get("name") or "", model=device.get("model") or "",
+                 device_id=device.get("device_id") or "", source="текущий IP", has_yam=True)
+
+    # 2. mDNS: так же, как alice bridge, видит станции без YAM.
+    try:
+        loop = asyncio.get_running_loop()
+        mdns = await asyncio.wait_for(loop.run_in_executor(None, _mdns_scan, 4.0), timeout=15)
+    except Exception:
+        mdns = []
+    for item in mdns:
+        note(item["ip"], name=item.get("name", ""), model=item.get("model", ""),
+             device_id=item.get("device_id", ""), source=item.get("source", "mDNS"))
+
+    # 3. Если совсем ничего не нашли — скан всех локальных подсетей по порту YAM.
+    network_prefixes = _local_subnets()
+    if current:
+        prefix = ".".join(current.split(".")[:3])
+        if prefix not in network_prefixes:
+            network_prefixes.append(prefix)
+    scanned = 0
+    if not devices and network_prefixes:
+        candidates: list[str] = []
+        for prefix in network_prefixes:
+            if not all(p.isdigit() for p in prefix.split(".")):
                 continue
-            candidates.append(f"{network_prefix}.{octet}")
+            local_octet = current.split(".")[3] if current.startswith(prefix + ".") else None
+            candidates.extend(f"{prefix}.{o}" for o in range(1, 255) if str(o) != local_octet)
+        scanned = len(candidates)
+        for start in range(0, scanned, 40):
+            batch = candidates[start:start + 40]
+            results = await asyncio.gather(*(_yam_device(ip) for ip in batch))
+            for ip, device in zip(batch, results):
+                if device:
+                    note(ip, name=device.get("name") or "", model=device.get("model") or "",
+                         device_id=device.get("device_id") or "", source="скан подсети", has_yam=True)
 
-    # текущий IP проверяем первым — железо уже настроено
-    checked_current = await probe(current) if current else None
-    if checked_current:
-        return JSONResponse({"found": True, "ip": checked_current, "scanned": 0})
+    # 4. Для найденных уточняем признаки: YAM и root-SSH.
+    for item in devices.values():
+        if not item["has_yam"]:
+            device = await _yam_device(item["ip"])
+            if device:
+                item["has_yam"] = True
+                item["model"] = item["model"] or (device.get("model") or "")
+                item["device_id"] = item["device_id"] or (device.get("device_id") or "")
+        if not item["ssh"]:
+            item["ssh"] = await _port_open(item["ip"], int(cfg.get("ssh_port") or 2222))
 
-    # параллельный скан подсети, пачками
-    found = None
-    batch_size = 40
-    for i in range(0, len(candidates), batch_size):
-        results = await asyncio.gather(*(probe(ip) for ip in candidates[i:i + batch_size]))
-        hit = next((ip for ip in results if ip), None)
-        if hit:
-            found = hit
-            break
-
-    if found:
-        cfg["station_ip"] = found
+    listed = sorted(devices.values(), key=lambda d: (not d["has_yam"], d["ip"]))
+    ready = next((d for d in listed if d["has_yam"]), None)
+    if ready:
+        cfg["station_ip"] = ready["ip"]
         save_config(cfg)
         _status_cache["ts"] = 0.0
-        print(f"[+] колонка найдена автоматически: {found}")
-        return JSONResponse({"found": True, "ip": found, "scanned": len(candidates)})
-    return JSONResponse({"found": False, "scanned": len(candidates)})
+        print(f"[+] колонка с YAM найдена автоматически: {ready['ip']}")
+        return JSONResponse({"found": True, "ip": ready["ip"], "has_yam": True,
+                             "scanned": scanned, "devices": listed})
+
+    if listed:
+        print(f"[i] найдены станции без YAM: {[d['ip'] for d in listed]}")
+    return JSONResponse({"found": False, "ip": "", "has_yam": False,
+                         "scanned": scanned, "devices": listed})
 
 
 @app.get("/api/status")
@@ -924,6 +1165,1026 @@ async def api_telemetry_put(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "enabled": enable, **state})
 
 
+@app.get("/api/system/minidumps")
+async def api_system_minidumps(request: Request) -> JSONResponse:
+    """Список минидампов падений демонов (/data/quasar/minidump) — для диагностики."""
+    require_auth(request)
+    code, out, _ = await ssh_run_bytes(
+        "ls -la /data/quasar/minidump 2>/dev/null | tail -25; echo ---; "
+        "du -sh /data/quasar/minidump 2>/dev/null")
+    if code != 0:
+        return JSONResponse({"ok": False, "items": [], "detail": "каталог недоступен"})
+    items: list[dict] = []
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        parts = line.split(None, 8)
+        if len(parts) >= 9 and (parts[0].startswith('-') or parts[0].startswith('d')) and parts[8] not in ('.', '..'):
+            items.append({"name": parts[8], "size": parts[4], "date": f"{parts[5]} {parts[6]} {parts[7]}"})
+    total = out.decode("utf-8", errors="replace").split('---')[-1].strip()
+    return JSONResponse({"ok": True, "items": items, "total": total.splitlines()[-1] if total else ''})
+
+
+# --------------------------------------------------------------------------- #
+# аудит безопасности: что открыто на колонке и что с этим делать
+# --------------------------------------------------------------------------- #
+AUDIT_TCP_PORTS = [21, 22, 23, 80, 443, 5555, 8080, 8099, 8123, 8780, 8443]
+
+
+@app.get("/api/security/audit")
+async def api_security_audit(request: Request) -> JSONResponse:
+    """Только чтение: сканируем порты колонки с ПК, смотрим слушающих демонов
+    и флаги dropbear, проверяем YAM API на анонимный доступ. Ничего не меняем."""
+    require_auth(request)
+    ip = cfg["station_ip"]
+
+    # 1. TCP-доступность портов с компьютера панели
+    tcp: dict[int, str] = {}
+
+    async def probe(port: int) -> None:
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), 0.8)
+            writer.close()
+            tcp[port] = "open"
+        except Exception:
+            tcp[port] = "closed"
+
+    await asyncio.gather(*(probe(port) for port in AUDIT_TCP_PORTS))
+
+    # 2. слушающие сокеты и процессы на самой колонке
+    code, out, _ = await ssh_run_bytes(
+        "netstat -tln 2>/dev/null | awk '$4 !~ /127.0.0.1|::1/ {print $4}' | sort -u; echo ---; "
+        "ps w | grep -E 'dropbear|adbd' | grep -v grep; echo ---; "
+        "grep -rl 'dropbear' /etc/init.d /data/opt/etc/init.d 2>/dev/null | head -3; echo ---; "
+        "[ -f /root/.ssh/authorized_keys ] && wc -l < /root/.ssh/authorized_keys || echo 0")
+    exposed, procs, init_scripts, key_lines = [], [], [], "0"
+    if code == 0:
+        parts = out.decode("utf-8", errors="replace").split("---")
+        for line in parts[0].splitlines():
+            m = re.search(r":([0-9A-Fa-f]{4})$", line.strip())
+            if m:
+                port = int(m.group(1), 16)
+                if port:
+                    exposed.append(port)
+        procs = [l.strip() for l in parts[1].splitlines() if l.strip()]
+        init_scripts = [l.strip() for l in parts[2].splitlines() if l.strip()]
+        key_lines = (parts[3].strip().splitlines() or ["0"])[-1] if len(parts) > 3 else "0"
+
+    dropbear_blank = any("dropbear" in p and " -B" in p for p in procs)
+    dropbear_cmd = next((p for p in procs if "dropbear" in p and " -r" in p), "")
+    adbd_on = any("adbd" in p for p in procs)
+
+    # 3. YAM API анонимно (с ПК, без ключей панели)
+    yam_anon = None
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"http://{ip}:{cfg['yam_port']}/api/settings") as resp:
+                yam_anon = resp.status == 200
+    except Exception:
+        yam_anon = None
+
+    findings: list[dict] = []
+    if dropbear_blank:
+        if key_lines not in ("", "0"):
+            advice = ("Ключ панели уже установлен — вход по ключу работает без пароля. Перезапусти dropbear без флага -B "
+                      "(команды для «Терминала»): kill $(pidof dropbear); " + (dropbear_cmd.replace(" -B", "") or "/data/opt/bin/dropbear -p 2222")
+                      + " &  — учти: при перезагрузке колонки -B вернётся. Постоянно: убери -B в " +
+                      (init_scripts[0] if init_scripts else "init-скрипте dropbear") + ".")
+        else:
+            advice = ("Сначала установи ключ панели: «Мастер настройки» или автонастройка в этом разделе ставит ключ на колонку. "
+                      "После этого выключай флаг -B (см. подсказку при повторной проверке) — иначе рискуешь потерять доступ к колонке.")
+        findings.append({"level": "high", "title": "SSH принимает пустой пароль (dropbear -B)", "detail":
+                         "Любое устройство в локальной сети может зайти на колонку root-ом без пароля: полный доступ к системе и микрофону.",
+                         "advice": advice})
+    elif key_lines and key_lines != "0":
+        findings.append({"level": "ok", "title": "SSH: вход по ключу, пустые пароли выключены", "detail": "", "advice": ""})
+    if yam_anon:
+        findings.append({"level": "warn", "title": f"YAM API ({cfg['yam_port']}) доступен без пароля всей сети",
+                         "detail": "Кто угодно в Wi-Fi может ставить пакеты, читать файлы и управлять подсветкой/звуком колонки.",
+                         "advice": "Сам YAM авторизации не умеет. Варианты: не выпускать порт 8099 за пределы доверенной сети (изоляция гостевого Wi-Fi на роутере), либо держать YAM выключенным, когда он не нужен."})
+    if adbd_on and tcp.get(5555) == "open":
+        findings.append({"level": "warn", "title": "ADB-консоль открыта по сети (порт 5555)",
+                         "detail": "Android Debug Bridge позволяет выполнять любые команды на колонке без пароля.",
+                         "advice": "Если ADB не нужен постоянно: в «Терминале» stop adbd; и удалить маркер автозапуска /data/quasar/activate_network_adb."})
+    if tcp.get(23) == "open":
+        findings.append({"level": "high", "title": "Telnet (23) открыт", "detail": "Незашифрованный шелл без авторизации.", "advice": "Закрыть: обычно это busybox telnetd — найти, кто запустил, и отключить."})
+    if tcp.get(22) == "open" and cfg["ssh_port"] != 22:
+        findings.append({"level": "info", "title": "SSH отвечает и на стандартном порту 22", "detail": "", "advice": "Если не нужен — отключи второй инстанс dropbear в init-скриптах."})
+    unexpected = sorted(set(exposed) - {22, cfg["ssh_port"], cfg["yam_port"], 5555, 53})
+    if unexpected:
+        findings.append({"level": "info", "title": "Другие порты, слушающие на всех интерфейсах: " + ", ".join(map(str, unexpected)),
+                         "detail": "Внутренние службы колонки (обычно безобидны, но стоит знать).", "advice": ""})
+    findings.append({"level": "info", "title": "Доступ из интернета панель проверить не может",
+                     "detail": "Проброс портов (22/2222, 8099) на роутере наружу делать не нужно — колонке достаточно локальной сети.",
+                     "advice": ""})
+
+    return JSONResponse({
+        "ok": True,
+        "ip": ip,
+        "tcp": {str(k): v for k, v in tcp.items()},
+        "exposed": exposed,
+        "key_installed": key_lines not in ("", "0"),
+        "findings": findings,
+    })
+
+
+# --------------------------------------------------------------------------- #
+# настройки Алисы: user_config.dat (protobuf-обёртка с JSON) + Wi-Fi + Matter
+# --------------------------------------------------------------------------- #
+USER_CONFIG_PATH = "/data/quasar/data/user_config.dat"
+
+# что разрешено править из панели: путь в JSON конфига -> тип значения
+ALICE_SETTING_PATHS: dict[str, type] = {
+    "account_config.aliceAdaptiveVolume.enabled": bool,
+    "account_config.audio_player.crossfadeEnabled": bool,
+    "account_config.jingle": bool,
+    "account_config.alwaysOnMicForShortcuts": bool,
+    "account_config.enabledCommandSpotters.music.playAndPause": bool,
+    "account_config.enabledCommandSpotters.music.volume": bool,
+    "account_config.enabledCommandSpotters.music.navigation": bool,
+    "account_config.enabledCommandSpotters.music.feedback": bool,
+    "account_config.enabledCommandSpotters.music.bluetooth": bool,
+    "account_config.enabledCommandSpotters.tv.navigation": bool,
+    "account_config.enabledCommandSpotters.tv.backToHome": bool,
+    "account_config.enabledCommandSpotters.smartHome.light": bool,
+    "account_config.enabledCommandSpotters.smartHome.tv": bool,
+    "account_config.enabledCommandSpotters.call.answer": bool,
+    "device_config.dndMode.enabled": bool,
+    "device_config.dndMode.features.allowIncomingCalls": bool,
+    "system_config.phone_calls.enabled": bool,
+    "system_config.wifi_capability.reassociateWhenNoInternet": bool,
+    "device_config.name": str,
+}
+
+# сторож смены Wi-Fi пароля: живёт на колонке, при потере шлюза откатывает бэкап
+WIFI_WATCHDOG_TEMPLATE = """#!/bin/sh
+# Сторож смены Wi-Fi пароля (ставит панель): при потере шлюза возвращает бэкап.
+CONF=__CONF__
+BAK=$CONF.bak-panel
+RES=/tmp/wifi_watchdog.result
+GW=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
+[ -z "$GW" ] && GW=192.168.0.1
+i=0
+while [ $i -lt 45 ]; do
+  sleep 2
+  ping -c1 -W2 $GW >/dev/null 2>&1 && { echo ok > $RES; exit 0; }
+  i=$((i+1))
+done
+cp $BAK $CONF 2>/dev/null
+kill -HUP $(pidof wpa_supplicant) 2>/dev/null
+echo rolled_back > $RES
+"""
+
+
+def _pb_varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _pb_fields(buf: bytes) -> list[tuple[int, bytes]]:
+    """Разобрать верхний уровень protobuf-сообщения на (номер поля, payload)."""
+    fields: list[tuple[int, bytes]] = []
+    pos = 0
+    while pos < len(buf):
+        tag, shift = 0, 0
+        while True:
+            byte = buf[pos]
+            pos += 1
+            tag |= (byte & 0x7F) << shift
+            shift += 7
+            if not byte & 0x80:
+                break
+        if tag & 0x07 != 2:
+            raise ValueError(f"wire type {tag & 7} не поддерживается")
+        length, shift = 0, 0
+        while True:
+            byte = buf[pos]
+            pos += 1
+            length |= (byte & 0x7F) << shift
+            shift += 7
+            if not byte & 0x80:
+                break
+        fields.append((tag >> 3, buf[pos:pos + length]))
+        pos += length
+    return fields
+
+
+def _pb_serialize(fields: list[tuple[int, bytes]]) -> bytes:
+    out = bytearray()
+    for num, payload in fields:
+        out += _pb_varint(num << 3 | 2) + _pb_varint(len(payload)) + payload
+    return bytes(out)
+
+
+def _extract_user_config(raw: bytes) -> tuple[dict, list[tuple[int, bytes]]]:
+    """Вытащить JSON из user_config.dat: поле 1 (сообщение) содержит поле 2 (JSON)."""
+    outer = _pb_fields(raw)
+    inner = next((p for n, p in outer if n == 1), None)
+    if inner is None:
+        raise ValueError("нет поля 1 в user_config.dat")
+    json_bytes = next((p for n, p in _pb_fields(inner) if n == 2), None)
+    if json_bytes is None:
+        raise ValueError("нет JSON в user_config.dat")
+    return json.loads(json_bytes.decode("utf-8")), outer
+
+
+def _rebuild_user_config(config: dict, outer: list[tuple[int, bytes]]) -> bytes:
+    inner = next(p for n, p in outer if n == 1)
+    # заменяем поле 2 и сортируем поля по номеру — как в заводском файле (1,2,3)
+    inner_fields = sorted(
+        ((2, json.dumps(config, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+         if n == 2 else (n, p) for n, p in _pb_fields(inner)),
+        key=lambda f: f[0])
+    return _pb_serialize(
+        [(1, _pb_serialize(inner_fields)) if n == 1 else (n, p) for n, p in outer])
+
+
+async def ssh_run_bytes(command: str, input_data: bytes | None = None,
+                        timeout: float = 25.0) -> tuple[int, bytes, bytes]:
+    """Как ssh_run, но без перекодировки — для бинарных файлов (user_config.dat)."""
+    try:
+        async with await ssh_connect() as conn:
+            result = await asyncio.wait_for(
+                conn.run(command, check=False, encoding=None, input=input_data), timeout)
+            return result.exit_status or 0, result.stdout or b"", result.stderr or b""
+    except asyncio.TimeoutError:
+        return 124, b"", "таймаут выполнения команды".encode()
+    except Exception as exc:
+        return 255, b"", f"{type(exc).__name__}: {exc}".encode()
+
+
+@app.get("/api/alice/settings")
+async def api_alice_settings_get(request: Request) -> JSONResponse:
+    require_auth(request)
+    code, out, err = await ssh_run_bytes(f"cat {USER_CONFIG_PATH}")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="SSH: " + err.decode(errors="replace")[:160])
+    try:
+        config, _ = _extract_user_config(out)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"конфиг не разобран: {exc}")
+    return JSONResponse({
+        "ok": True,
+        "config": config,
+        "editable": {p: t.__name__ for p, t in ALICE_SETTING_PATHS.items()},
+        "warnings": [
+            "Изменения применяются после перезагрузки колонки.",
+            "Облако Яндекса (syncd, раз в 30 минут) может вернуть значения из аккаунта — если правка слетела, повторите её.",
+        ],
+    })
+
+
+@app.put("/api/alice/settings")
+async def api_alice_settings_put(request: Request) -> JSONResponse:
+    """Применить набор правок к user_config.dat: {sets: [{path, value}]}.
+
+    Бэкап .bak-panel создаётся перед каждой записью; JSON пересобирается внутри
+    protobuf-обёртки без изменения остальных полей."""
+    require_auth(request)
+    body = await request.json()
+    sets = body.get("sets") or ([{"path": body["path"], "value": body["value"]}] if "path" in body else [])
+    if not sets:
+        raise HTTPException(status_code=400, detail="пустой набор изменений")
+    code, out, err = await ssh_run_bytes(f"cat {USER_CONFIG_PATH}")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="SSH: " + err.decode(errors="replace")[:160])
+    try:
+        config, outer = _extract_user_config(out)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"конфиг не разобран: {exc}")
+    applied: list[str] = []
+    for item in sets:
+        path = str(item.get("path", ""))
+        if path not in ALICE_SETTING_PATHS:
+            raise HTTPException(status_code=400, detail=f"путь {path} недоступен для правки")
+        target_type = ALICE_SETTING_PATHS[path]
+        if target_type is bool:
+            value = bool(item.get("value"))
+        else:
+            value = str(item.get("value") or "").strip()
+            if not 1 <= len(value) <= 64:
+                raise HTTPException(status_code=400, detail="имя устройства: от 1 до 64 символов")
+        node: Any = config
+        keys = path.split(".")
+        for key in keys[:-1]:
+            node = node.setdefault(key, {})
+            if not isinstance(node, dict):
+                raise HTTPException(status_code=400, detail=f"путь {path} конфликтует со структурой конфига")
+        node[keys[-1]] = value
+        applied.append(path)
+    blob = _rebuild_user_config(config, outer)
+    try:
+        conn = await ssh_connect()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="SSH: " + str(exc)[:160])
+    try:
+        await asyncio.wait_for(conn.run(
+            f"cp -p {USER_CONFIG_PATH} {USER_CONFIG_PATH}.bak-panel",
+            check=False, encoding="utf-8"), 15)
+        result = await asyncio.wait_for(
+            conn.run(f"cat > {USER_CONFIG_PATH}", input=blob, check=False, encoding=None), 25)
+        if result.exit_status not in (0, None):
+            raise ValueError(f"запись не удалась (status {result.exit_status})")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)[:180])
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True, "applied": applied})
+
+
+@app.get("/api/alice/wifi")
+async def api_alice_wifi_get(request: Request) -> JSONResponse:
+    """Состояние Wi-Fi колонки: сохранённые сети из wpa_supplicant.conf и сторож."""
+    require_auth(request)
+    code, out, err = await ssh_run_bytes(
+        "readlink -f /data/wpa_supplicant.conf 2>/dev/null; echo ---; "
+        "ps w 2>/dev/null | grep wpa_supplicant | grep -v grep | head -2; echo ---; "
+        "cat /data/wpa_supplicant.conf; echo ---; cat /tmp/wifi_watchdog.result 2>/dev/null || true")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="SSH: " + err.decode(errors="replace")[:160])
+    parts = out.decode("utf-8", errors="replace").split("---")
+    conf_text = parts[2] if len(parts) > 2 else ""
+    networks: list[dict] = []
+    current: dict | None = None
+    for line in conf_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("network={"):
+            current = {"ssid": "", "psk": ""}
+        elif stripped == "}" and current is not None:
+            networks.append(current)
+            current = None
+        elif current is not None:
+            if stripped.startswith("ssid="):
+                current["ssid"] = stripped[5:].strip().strip('"')
+            elif stripped.startswith("psk="):
+                current["psk"] = stripped[4:].strip().strip('"')
+    return JSONResponse({
+        "ok": True,
+        "conf_path": (parts[0] or "").strip(),
+        "process": (parts[1] or "").strip()[:120],
+        "networks": networks,
+        "watchdog": (parts[3] if len(parts) > 3 else "").strip(),
+    })
+
+
+@app.put("/api/alice/wifi/password")
+async def api_alice_wifi_password(request: Request) -> JSONResponse:
+    """Сменить пароль сохранённой Wi-Fi сети с автооткатом при потере связи.
+
+    Бэкап conf → новый conf → SIGHUP wpa_supplicant → фоновый сторож на колонке
+    90 секунд пингует шлюз; если сети нет — возвращает бэкап и перечитывает конфиг.
+    Пароль заменяется во всех сохранённых сетях (обычно она одна)."""
+    require_auth(request)
+    data = await request.json()
+    psk = str(data.get("psk", ""))
+    if not 8 <= len(psk) <= 63:
+        raise HTTPException(status_code=400, detail="пароль WPA: от 8 до 63 символов")
+    code, out, err = await ssh_run_bytes(
+        "readlink -f /data/wpa_supplicant.conf 2>/dev/null || echo /data/wpa_supplicant.conf; echo ---; "
+        "cat /data/wpa_supplicant.conf")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="SSH: " + err.decode(errors="replace")[:160])
+    parts = out.decode("utf-8", errors="replace").split("---")
+    conf_path = parts[0].strip() or "/data/wpa_supplicant.conf"
+    conf_text = parts[1] if len(parts) > 1 else ""
+    new_lines: list[str] = []
+    replaced = 0
+    in_block = False
+    for line in conf_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("network={"):
+            in_block = True
+        elif stripped == "}" and in_block:
+            in_block = False
+        if in_block and stripped.startswith("psk="):
+            new_lines.append(f'psk="{psk}"')
+            replaced += 1
+        else:
+            new_lines.append(line)
+    if not replaced:
+        raise HTTPException(status_code=400, detail="в конфиге нет сохранённых сетей с паролем")
+    new_conf = ("\n".join(new_lines) + "\n").encode("utf-8")
+    watchdog = WIFI_WATCHDOG_TEMPLATE.replace("__CONF__", conf_path).encode()
+    try:
+        conn = await ssh_connect()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="SSH: " + str(exc)[:160])
+    try:
+        try:
+            await asyncio.wait_for(conn.run(
+                f"cp -p {conf_path} {conf_path}.bak-panel", check=False, encoding="utf-8"), 15)
+            result = await asyncio.wait_for(
+                conn.run(f"cat > {conf_path}", input=new_conf, check=False, encoding=None), 20)
+            if result.exit_status not in (0, None):
+                raise ValueError(f"запись конфига не удалась (status {result.exit_status})")
+            result2 = await asyncio.wait_for(
+                conn.run("cat > /tmp/wifi_watchdog.sh", input=watchdog, check=False, encoding=None), 15)
+            if result2.exit_status not in (0, None):
+                raise ValueError("не удалось создать сторож")
+            await asyncio.wait_for(conn.run(
+                "rm -f /tmp/wifi_watchdog.result; sh /tmp/wifi_watchdog.sh >/dev/null 2>&1 &",
+                check=False, encoding="utf-8"), 10)
+            hup = await asyncio.wait_for(conn.run(
+                "kill -HUP $(pidof wpa_supplicant) 2>/dev/null || true",
+                check=False, encoding="utf-8"), 10)
+            if hup.exit_status not in (0, None):
+                raise ValueError("wpa_supplicant не перечитал конфиг")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)[:180])
+    finally:
+        conn.close()
+    return JSONResponse({
+        "ok": True,
+        "conf_path": conf_path,
+        "networks_updated": replaced,
+        "watchdog": "колонка проверяет связь ~90 секунд; при неудаче пароль откатится",
+    })
+
+
+@app.get("/api/alice/matter")
+async def api_alice_matter(request: Request) -> JSONResponse:
+    """Matter: включена ли возможность и «сырые» записи из базы устройств."""
+    require_auth(request)
+    code, out, _ = await ssh_run_bytes(
+        "strings /data/quasar/data/matter/devices.lmdb 2>/dev/null | head -60 || true")
+    names: list[str] = []
+    if code == 0:
+        for line in out.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if len(line) >= 4 and line.lower() not in ("devices", "state", "scenarios", "db_exists"):
+                names.append(line)
+    return JSONResponse({"ok": True, "records": names[:40]})
+
+
+# --------------------------------------------------------------------------- #
+# облачные функции через аккаунт Яндекса: куки -> x_token -> API квазара
+# Эндпоинты те же, что у приложения «Дом с Алисой» (iot.quasar.yandex.ru),
+# значения применяются в облаке сразу и спускаются на колонку сами.
+# --------------------------------------------------------------------------- #
+PASSPORT_CLIENT_ID = "c0ebe342af7d48fbbbfcf2d2eedb8f9e"
+PASSPORT_CLIENT_SECRET = "ad0a908f0aa341a182a37ecd75bc319e"
+CLOUD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+CLOUD_STATE: dict = {"session": None, "csrf": None, "login": None}
+
+# быстрые облачные тумблеры /m/user/settings: id в панели -> payload
+CLOUD_SETTINGS_TOGGLES: dict[str, dict] = {
+    "c-dj": {"on": {"music": {"announce_tracks": True}}, "off": {"music": {"announce_tracks": False}}},
+    "c-whisper": {"on": {"tts_whisper": True}, "off": {"tts_whisper": False}},
+    "c-sh-silent": {"on": {"iot": {"response_reaction_type": "sound"}}, "off": {"iot": {"response_reaction_type": "nlg"}}},
+    "c-hide-orders": {"on": {"order": {"hide_item_names": True}}, "off": {"order": {"hide_item_names": False}}},
+}
+
+
+def _cloud_session() -> aiohttp.ClientSession:
+    session = CLOUD_STATE["session"]
+    if session is None or session.closed:
+        raise HTTPException(status_code=400, detail="облачная сессия не открыта — сохраните куку аккаунта")
+    return session
+
+
+async def cloud_short_info(x_token: str) -> dict:
+    async with aiohttp.ClientSession() as s:
+        async with s.get(
+                "https://mobileproxy.passport.yandex.net/1/bundle/account/short_info/",
+                params={"avatar_size": "islands-300"},
+                headers={"Authorization": f"OAuth {x_token}", "User-Agent": CLOUD_UA},
+                timeout=aiohttp.ClientTimeout(total=20)) as r:
+            return await r.json()
+
+
+async def cloud_open_session(x_token: str) -> dict:
+    """Открыть облачную сессию: x_token -> куки паспорта (как в YandexStation)."""
+    await cloud_close_session()
+    session = aiohttp.ClientSession(headers={"User-Agent": CLOUD_UA})
+    # фикс YandexStation: без этого aiohttp квотирует куки Session_id,
+    # и Яндекс отдаёт 403 на всех POST/PUT (мутациях)
+    setattr(session.cookie_jar, "_quote_cookie", False)
+    try:
+        async with session.post(
+                "https://mobileproxy.passport.yandex.net/1/bundle/auth/x_token/",
+                data={"type": "x-token", "retpath": "https://www.yandex.ru"},
+                headers={"Ya-Consumer-Authorization": f"OAuth {x_token}"},
+                timeout=aiohttp.ClientTimeout(total=20)) as r:
+            resp = await r.json()
+        if resp.get("status") != "ok" or not resp.get("track_id"):
+            raise ValueError("паспорт не принял x_token: " + str(resp)[:120])
+        host = resp.get("passport_host") or "https://passport.yandex.ru"
+        async with session.get(f"{host}/auth/session/", params={"track_id": resp["track_id"]},
+                               allow_redirects=False,
+                               timeout=aiohttp.ClientTimeout(total=20)) as r2:
+            if r2.status not in (200, 302):
+                raise ValueError(f"сессия не создана (HTTP {r2.status})")
+    except Exception:
+        await session.close()
+        raise
+    CLOUD_STATE["session"] = session
+    CLOUD_STATE["csrf"] = None
+    return resp
+
+
+async def cloud_close_session() -> None:
+    session = CLOUD_STATE["session"]
+    CLOUD_STATE.update(session=None, csrf=None)
+    if session is not None and not session.closed:
+        try:
+            await session.close()
+        except Exception:
+            pass
+
+
+async def cloud_request(method: str, url: str, payload: Any = None, retry: int = 2) -> Any:
+    """Запрос к облаку с куками сессии; для не-GET нужен x-csrf-token."""
+    session = _cloud_session()
+    headers: dict = {}
+    if method.lower() != "get":
+        csrf = CLOUD_STATE["csrf"]
+        if not csrf:
+            async with session.get("https://yandex.ru/iot",
+                                   timeout=aiohttp.ClientTimeout(total=20)) as r:
+                raw = await r.text()
+            m = re.search(r'"csrfToken2":"(.+?)"', raw)
+            if not m:
+                raise HTTPException(status_code=502, detail="не удалось получить CSRF-токен облака")
+            csrf = CLOUD_STATE["csrf"] = m[1]
+        headers["x-csrf-token"] = csrf
+    kwargs: dict = {"headers": headers, "timeout": aiohttp.ClientTimeout(total=25)}
+    if payload is not None:
+        kwargs["json"] = payload
+    async with session.request(method, url, **kwargs) as r:
+        text = await r.text()
+    if r.status == 403 and retry:
+        CLOUD_STATE["csrf"] = None
+        return await cloud_request(method, url, payload, retry - 1)
+    if r.status == 401 and retry:
+        x_token = str(cfg.get("yandex_x_token") or "")
+        if x_token:
+            await cloud_open_session(x_token)
+            return await cloud_request(method, url, payload, retry - 1)
+    if r.status != 200:
+        raise HTTPException(status_code=502, detail=f"{url.split('//')[-1]}: HTTP {r.status}: {text[:140]}")
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+@app.get("/api/alice/cloud")
+async def api_alice_cloud_get(request: Request) -> JSONResponse:
+    require_auth(request)
+    x_token = str(cfg.get("yandex_x_token") or "")
+    return JSONResponse({
+        "ok": True,
+        "configured": bool(x_token),
+        "session_open": CLOUD_STATE["session"] is not None and not CLOUD_STATE["session"].closed,
+        "login": CLOUD_STATE.get("login"),
+    })
+
+
+@app.put("/api/alice/cloud")
+async def api_alice_cloud_put(request: Request) -> JSONResponse:
+    """Сохранить куку аккаунта Яндекса: обмен на x_token и проверка.
+
+    Кука берётся из браузера (alice.yandex.ru, F12 -> Сеть -> заголовок Cookie).
+    В config.json панели хранится только x_token — кука не нужна после обмена."""
+    require_auth(request)
+    data = await request.json()
+    cookie = str(data.get("cookie") or "").strip()
+    if not cookie or "=" not in cookie:
+        raise HTTPException(status_code=400, detail="вставьте строку заголовка Cookie (key=value; ...)")
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.post(
+                    "https://mobileproxy.passport.yandex.net/1/bundle/oauth/token_by_sessionid",
+                    data={"client_id": PASSPORT_CLIENT_ID, "client_secret": PASSPORT_CLIENT_SECRET},
+                    headers={"Ya-Client-Host": "passport.yandex.ru", "Ya-Client-Cookie": cookie,
+                             "User-Agent": CLOUD_UA},
+                    timeout=aiohttp.ClientTimeout(total=25)) as r:
+                resp = await r.json()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="паспорт недоступен: " + str(exc)[:120])
+    x_token = resp.get("access_token")
+    if not x_token:
+        raise HTTPException(status_code=400, detail="куки не приняты: " + str(resp.get("error_description") or resp.get("error") or resp)[:140])
+    info = await cloud_short_info(x_token)
+    if not info.get("uid"):
+        raise HTTPException(status_code=400, detail="x_token получен, но аккаунт не читается: " + str(info)[:120])
+    cfg["yandex_x_token"] = x_token
+    save_config(cfg)
+    try:
+        await cloud_open_session(x_token)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="токен сохранён, но сессия не открыта: " + str(exc)[:140])
+    login = str(info.get("login") or info.get("uid") or "?")
+    CLOUD_STATE["login"] = login
+    return JSONResponse({"ok": True, "login": login})
+
+
+@app.delete("/api/alice/cloud")
+async def api_alice_cloud_delete(request: Request) -> JSONResponse:
+    """Забыть сохранённый x_token и закрыть сессию."""
+    require_auth(request)
+    await cloud_close_session()
+    cfg.pop("yandex_x_token", None)
+    save_config(cfg)
+    CLOUD_STATE["login"] = None
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/alice/cloud/devices")
+async def api_alice_cloud_devices(request: Request) -> JSONResponse:
+    """Список устройств аккаунта из облака (проверка, что кука рабочая)."""
+    require_auth(request)
+    data = await cloud_request("GET", "https://iot.quasar.yandex.ru/m/v3/user/devices")
+    if data.get("status") != "ok":
+        raise HTTPException(status_code=502, detail="облако ответило: " + str(data)[:140])
+    speakers: list[dict] = []
+    for house in data.get("households", []):
+        for dev in house.get("all", []):
+            if str(dev.get("type", "")).startswith("devices.types.smart_speaker"):
+                speakers.append({
+                    "id": dev.get("id"),
+                    "name": dev.get("name"),
+                    "platform": (dev.get("quasar_info") or {}).get("platform") or dev.get("platform"),
+                    "online": dev.get("online"),
+                    "house": house.get("name"),
+                })
+    return JSONResponse({"ok": True, "login": CLOUD_STATE.get("login"), "speakers": speakers})
+
+
+@app.get("/api/alice/cloud/config")
+async def api_alice_cloud_config(request: Request) -> JSONResponse:
+    """Полный облачный конфиг аккаунта (quasar.yandex.ru/get_account_config)."""
+    require_auth(request)
+    data = await cloud_request("GET", "https://quasar.yandex.ru/get_account_config")
+    if data.get("status") != "ok":
+        raise HTTPException(status_code=502, detail="облако ответило: " + str(data)[:140])
+    return JSONResponse({"ok": True, "config": data.get("config")})
+
+
+@app.post("/api/alice/cloud/config")
+async def api_alice_cloud_config_post(request: Request) -> JSONResponse:
+    """Дописать патч в облачный конфиг аккаунта (ключи как в user_config.dat)."""
+    require_auth(request)
+    data = await request.json()
+    patch = data.get("patch")
+    if not isinstance(patch, dict) or not patch:
+        raise HTTPException(status_code=400, detail="нужен непустой объект patch")
+    current = await cloud_request("GET", "https://quasar.yandex.ru/get_account_config")
+    if current.get("status") != "ok":
+        raise HTTPException(status_code=502, detail="конфиг не прочитан: " + str(current)[:140])
+    payload = current.get("config") or {}
+    payload.update(patch)
+    result = await cloud_request("POST", "https://quasar.yandex.ru/set_account_config", payload)
+    if result.get("status") != "ok":
+        raise HTTPException(status_code=502, detail="облако отклонило: " + str(result)[:140])
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/alice/cloud/settings")
+async def api_alice_cloud_settings_post(request: Request) -> JSONResponse:
+    """Тумблеры пользовательских настроек (DJ, шёпот, умный дом, заказы).
+
+    Тело: {id: "c-dj", value: true} либо {payload: {...}} напрямую."""
+    require_auth(request)
+    data = await request.json()
+    payload = data.get("payload")
+    if payload is None:
+        toggle_id = str(data.get("id") or "")
+        toggle = CLOUD_SETTINGS_TOGGLES.get(toggle_id)
+        if not toggle:
+            raise HTTPException(status_code=400, detail=f"неизвестный тумблер {toggle_id}")
+        payload = toggle["on" if bool(data.get("value")) else "off"]
+    result = await cloud_request("POST", "https://iot.quasar.yandex.ru/m/user/settings", payload)
+    if isinstance(result, dict) and result.get("status") not in (None, "ok"):
+        raise HTTPException(status_code=502, detail="облако отклонило: " + str(result)[:140])
+    return JSONResponse({"ok": True, "payload": payload})
+
+
+@app.get("/api/alice/cloud/settings")
+async def api_alice_cloud_settings_get(request: Request) -> JSONResponse:
+    """Попытка прочитать текущие /m/user/settings (эндпоинт чтения не документирован)."""
+    require_auth(request)
+    try:
+        data = await cloud_request("GET", "https://iot.quasar.yandex.ru/m/user/settings")
+    except HTTPException as exc:
+        return JSONResponse({"ok": False, "detail": str(exc.detail)[:100]})
+    return JSONResponse({"ok": True, "settings": data})
+
+
+@app.post("/api/alice/cloud/action")
+async def api_alice_cloud_action(request: Request) -> JSONResponse:
+    """Команда устройству через облако: {id, item_type, instance, value}.
+
+    Например pause: instance="pause", value=true (toggle), громкость:
+    instance="volume", value=0..100 (range). Тот же механизм, что у
+    приложения «Дом с Алисой»."""
+    require_auth(request)
+    data = await request.json()
+    device_id = str(data.get("id") or "")
+    item_type = str(data.get("item_type") or "speaker")
+    instance = str(data.get("instance") or "")
+    value = data.get("value")
+    if not device_id or not instance:
+        raise HTTPException(status_code=400, detail="нужны id и instance")
+    cap_type = str(data.get("type") or ("devices.capabilities.toggle" if instance in ("pause", "mute") else "devices.capabilities.range"))
+    payload = {"actions": [{"type": cap_type, "state": {"instance": instance, "value": value}}]}
+    result = await cloud_request(
+        "POST", f"https://iot.quasar.yandex.ru/m/user/{item_type}s/{device_id}/actions", payload)
+    if isinstance(result, dict) and result.get("status") not in (None, "ok"):
+        raise HTTPException(status_code=502, detail="облако отклонило: " + str(result)[:140])
+    return JSONResponse({"ok": True, "result": result})
+
+
+# --------------------------------------------------------------------------- #
+# Чек-лист: панель сама проверяет всё, что ей нужно, и умеет докачать.
+# --------------------------------------------------------------------------- #
+CHECKLIST_PIP_PACKAGES = ["fastapi", "uvicorn", "aiohttp", "asyncssh", "multipart", "zeroconf", "pycaw", "comtypes", "edge-tts"]
+FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+
+
+def _has_tool(name: str) -> bool:
+    return bin_tool(name) is not None
+
+
+async def _download_to(url: str, dest: Path) -> str:
+    """Скачать файл потоком (для больших архивов), вернуть размер в МБ."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    timeout = aiohttp.ClientTimeout(total=900, sock_read=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status} от {url}")
+            with open(dest, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1 << 20):
+                    f.write(chunk)
+    return f"{dest.stat().st_size / 1048576:.1f}"
+
+
+async def _checklist_items() -> list[dict]:
+    import importlib.metadata
+    import importlib.util
+
+    items: list[dict] = []
+
+    # 1. python-пакеты
+    missing_pkgs = [p for p in CHECKLIST_PIP_PACKAGES if importlib.util.find_spec(p) is None]
+    versions = []
+    for p in CHECKLIST_PIP_PACKAGES:
+        try:
+            versions.append(f"{p} {importlib.metadata.version(p if p != 'multipart' else 'python-multipart')}")
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    items.append({
+        "id": "pip", "title": "Python-пакеты панели",
+        "status": "missing" if missing_pkgs else "ok",
+        "detail": ("нет: " + ", ".join(missing_pkgs)) if missing_pkgs else " · ".join(versions),
+        "hint": "fastapi/uvicorn/aiohttp/asyncssh/python-multipart — ставятся кнопкой в python -m pip.",
+        "action": missing_pkgs and "Установить",
+    })
+
+    # 2-3. ffmpeg / ffplay
+    for tool, title, hint in (
+        ("ffmpeg", "FFmpeg (конвертация звука, TTS)", "Скачается с gyan.dev (~100 МБ), ляжет в папку панели bin\\."),
+        ("ffplay", "FFplay (плеер «на ПК»)", "Ставится вместе с FFmpeg одной кнопкой."),
+    ):
+        ok = _has_tool(tool)
+        items.append({"id": tool, "title": title, "status": "ok" if ok else "missing",
+                      "detail": bin_tool(tool) or "не найден ни в PATH, ни в bin\\ панели",
+                      "hint": hint, "action": None if ok else ("Установить" + ("" if tool != "ffmpeg" else " (~100 МБ)"))})
+
+    # 4. yt-dlp
+    ok = _has_tool("yt-dlp")
+    items.append({"id": "ytdlp", "title": "yt-dlp (поиск музыки для плеера «на ПК»)",
+                  "status": "ok" if ok else "missing",
+                  "detail": bin_tool("yt-dlp") or "не найден",
+                  "hint": "Один exe (~17 МБ) с GitHub, ляжет в bin\\ панели.",
+                  "action": None if ok else "Установить"})
+
+    # 5. ssh-ключ на колонке
+    code, out, _ = await ssh_run_bytes(
+        "[ -f /root/.ssh/authorized_keys ] && grep -c station-panel /root/.ssh/authorized_keys || echo 0")
+    key_ok = code == 0 and out.decode().strip() not in ("", "0")
+    items.append({"id": "sshkey", "title": "SSH-ключ панели на колонке",
+                  "status": "ok" if key_ok else "missing",
+                  "detail": "вход по ключу работает" if key_ok else "панель ходит по пустому паролю (dropbear -B)",
+                  "hint": "Ключ избавляет от пустого пароля — потом можно выключить -B (см. «Аудит безопасности»).",
+                  "action": None if key_ok else "Установить"})
+
+    # 6. колонка: music-плагины + мост (один ssh-вызов)
+    code, out, _ = await ssh_run_bytes(
+        "echo S=$(command -v soundya >/dev/null 2>&1 && echo y || echo n)"
+        "; echo P=$([ -d /data/opt/spotify-connect ] && echo y || echo n)"
+        "; echo V=$([ -d /data/quazar/yam/data/plugins/station-voice ] && echo y || echo n)")
+    text = out.decode() if code == 0 else "S=n; P=n; V=n"
+    has = lambda tag: (re.search(tag + r"=(y|n)", text) or [None, "n"])[1] == "y"
+    items.append({"id": "soundya", "title": "SoundCloud-плеер (soundya) на колонке",
+                  "status": "ok" if has("S") else "missing",
+                  "detail": "установлен, управление во вкладке «Музыка»" if has("S") else "не установлен",
+                  "hint": "Ставится пакетом во вкладке «Пакеты» (реестр yapkg).", "action": None})
+    items.append({"id": "spotiya", "title": "Spotify Connect (spotiya) на колонке",
+                  "status": "ok" if has("P") else "missing",
+                  "detail": "установлен" if has("P") else "не установлен",
+                  "hint": "Пакет во вкладке «Пакеты».", "action": None})
+    items.append({"id": "bridge", "title": "Голосовой мост (свои команды)",
+                  "status": "ok" if has("V") else "missing",
+                  "detail": "плагин station-voice стоит на колонке" if has("V") else "плагина station-voice нет на колонке",
+                  "hint": "Ставится из «Системы» → «Голосовые команды» → «Показать ключи»/мастер.", "action": None})
+
+    # 7. демон слов на 8780
+    ww = "missing"
+    try:
+        _, w = await asyncio.wait_for(asyncio.open_connection(cfg["station_ip"], 8780), 0.7)
+        w.close()
+        ww = "ok"
+    except Exception:
+        pass
+    items.append({"id": "wakeword", "title": "Демон слов активации (:8780)",
+                  "status": ww,
+                  "detail": "работает, вкладка «Слова» активна" if ww == "ok" else "не запущен на колонке",
+                  "hint": "Требует отдельного бинаря под модель колонки — пока ставится вручную.",
+                  "action": None})
+    return items
+
+
+@app.get("/api/checklist")
+async def api_checklist(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse({"ok": True, "items": await _checklist_items()})
+
+
+@app.post("/api/checklist/install")
+async def api_checklist_install(request: Request) -> JSONResponse:
+    """Установка одного пункта чек-листа: pip | ffmpeg | ytdlp | sshkey."""
+    require_auth(request)
+    data = await request.json()
+    what = str(data.get("id") or "")
+    PANEL_BIN.mkdir(parents=True, exist_ok=True)
+
+    if what == "pip":
+        req = BASE / "requirements.txt"
+        if not req.exists():
+            raise HTTPException(status_code=404, detail="requirements.txt не найден рядом с панелью")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "-r", str(req), "--disable-pip-version-check",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await asyncio.wait_for(proc.communicate(), 600)
+        tail = out.decode("utf-8", "replace").strip().splitlines()[-3:]
+        if proc.returncode != 0:
+            raise HTTPException(status_code=502, detail="pip: " + " | ".join(tail)[:200])
+        items = await _checklist_items()
+        return JSONResponse({"ok": True, "output": " | ".join(tail), "items": items})
+
+    if what in ("ffmpeg", "ffplay", "ytdlp"):
+        if what == "ytdlp":
+            dest = PANEL_BIN / "yt-dlp.exe" if os.name == "nt" else PANEL_BIN / "yt-dlp"
+            mb = await _download_to(YTDLP_URL, dest)
+            if os.name != "nt":
+                dest.chmod(0o755)
+            return JSONResponse({"ok": True, "output": f"yt-dlp скачан ({mb} МБ) → {dest}"})
+        # ffmpeg: zip ~100 МБ, внутри ffmpeg-…-essentials_build/bin/*.exe
+        import zipfile
+        dest = PANEL_BIN / "ffmpeg-essentials.zip"
+        mb = await _download_to(FFMPEG_URL, dest)
+        wanted = ("ffmpeg.exe", "ffplay.exe", "ffprobe.exe") if os.name == "nt" else ("ffmpeg", "ffplay", "ffprobe")
+        taken = []
+        with zipfile.ZipFile(dest) as z:
+            for info in z.infolist():
+                base = info.filename.replace("\\", "/").rsplit("/", 1)[-1]
+                if base in wanted:
+                    with open(PANEL_BIN / base, "wb") as f:
+                        f.write(z.read(info))
+                    taken.append(base)
+        dest.unlink(missing_ok=True)
+        if "ffmpeg.exe" not in taken and "ffmpeg" not in taken:
+            raise HTTPException(status_code=502, detail="в архиве не нашлись ffmpeg.exe/ffplay.exe")
+        return JSONResponse({"ok": True, "output": f"ffmpeg скачан ({mb} МБ), извлечено: {', '.join(taken)} → bin\\"})
+
+    if what == "sshkey":
+        result = await setup_ssh_key()
+        if not result["installed"]:
+            raise HTTPException(status_code=502, detail="ключ не установился: " + result["error"][:180])
+        return JSONResponse({"ok": True, "output": "ключ панели установлен на колонку"})
+
+    raise HTTPException(status_code=400, detail=f"неизвестный пункт: {what}")
+
+
+# --------------------------------------------------------------------------- #
+# Каталог пакетов: реестр yapkg -> скачивание + sha256 + установка в YAM
+# --------------------------------------------------------------------------- #
+YAPKG_REGISTRY = "https://raw.githubusercontent.com/nyakokitsu/yapkg/registry/index.json"
+_catalog_cache: dict[str, Any] = {"ts": 0.0, "pkgs": []}
+
+
+async def _fetch_registry() -> list:
+    if time.time() - _catalog_cache["ts"] < 600 and _catalog_cache["pkgs"]:
+        return _catalog_cache["pkgs"]
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(YAPKG_REGISTRY) as resp:
+            if resp.status != 200:
+                raise HTTPException(status_code=502, detail=f"реестр: HTTP {resp.status}")
+            data = await resp.json(content_type=None)
+    pkgs = data.get("packages", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    _catalog_cache.update(ts=time.time(), pkgs=pkgs)
+    return pkgs
+
+
+@app.get("/api/packages/catalog")
+async def api_packages_catalog(request: Request) -> JSONResponse:
+    """Каталог yapkg: пакеты с пометками installed/running из YAM."""
+    require_auth(request)
+    try:
+        pkgs = await _fetch_registry()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"реестр недоступен: {exc}"[:160])
+    installed: dict[str, bool] = {}
+    try:
+        st, plugins = await yam_api("GET", "/api/plugins")
+        for p in (plugins if isinstance(plugins, list) else []):
+            m = p.get("manifest") or {}
+            if m.get("id"):
+                installed[str(m["id"])] = bool(p.get("running"))
+    except Exception:
+        pass
+    by_id: dict[str, dict] = {}
+    for p in pkgs:
+        pid = str(p.get("id") or "")
+        if not pid:
+            continue
+        cur = by_id.get(pid)
+        if cur is None or str(p.get("version") or "") >= str(cur.get("version") or ""):
+            by_id[pid] = p
+    items = []
+    for pid, p in sorted(by_id.items()):
+        items.append({
+            "id": pid,
+            "name": p.get("name") or pid,
+            "version": p.get("version") or "",
+            "description": str(p.get("description") or "")[:220],
+            "sha256": p.get("sha256") or "",
+            "installed": pid in installed,
+            "running": installed.get(pid) is True,
+        })
+    return JSONResponse({"ok": True, "items": items})
+
+
+@app.post("/api/packages/catalog/install")
+async def api_packages_catalog_install(request: Request) -> JSONResponse:
+    """Скачать .yap из реестра (проверка sha256) и установить в YAM с автозапуском."""
+    require_auth(request)
+    data = await request.json()
+    pid = str(data.get("id") or "")
+    if not pid:
+        raise HTTPException(status_code=400, detail="нужен id пакета")
+    pkgs = await _fetch_registry()
+    entry = None
+    for p in pkgs:
+        if str(p.get("id") or "") == pid:
+            if entry is None or str(p.get("version") or "") >= str(entry.get("version") or ""):
+                entry = p
+    if not entry or not entry.get("url"):
+        raise HTTPException(status_code=404, detail="пакет не найден в реестре")
+    timeout = aiohttp.ClientTimeout(total=600, sock_read=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(str(entry["url"])) as resp:
+            if resp.status != 200:
+                raise HTTPException(status_code=502, detail=f"скачивание: HTTP {resp.status}")
+            blob = await resp.read()
+    if entry.get("sha256"):
+        import hashlib
+        got = hashlib.sha256(blob).hexdigest()
+        if got != str(entry["sha256"]).lower():
+            raise HTTPException(status_code=502, detail=f"sha256 не совпал: {got[:20]}…")
+    import io as _io
+
+    boundary = "----stationpanel" + secrets.token_hex(8)
+    part = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="package"; filename="{pid}.yap"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8") + blob + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    status, body = await yam_api("POST", "/api/plugins", data=part,
+                                 content_type=f"multipart/form-data; boundary={boundary}")
+    if status not in (200, 201):
+        return JSONResponse({"detail": f"YAM вернул {status}: {str(body)[:200]}"}, status_code=502)
+    st1, _ = await yam_api("POST", f"/api/plugins/{pid}/toggle")
+    st2, _ = await yam_api("POST", f"/api/plugins/{pid}/start")
+    return JSONResponse({"ok": True, "id": pid, "version": entry.get("version"),
+                         "size": len(blob), "toggle": st1, "start": st2})
+
+
 # --------------------------------------------------------------------------- #
 # Автонастройка: SSH-ключ, SFTP, автодетект параметров
 # --------------------------------------------------------------------------- #
@@ -937,7 +2198,9 @@ async def setup_ssh_key() -> dict[str, Any]:
     """Сгенерировать ключ панели и установить его в authorized_keys колонки.
 
     Идемпотентно: перед добавлением убираем свою старую строку, поэтому
-    повторный запуск не плодит дубли в ~/.ssh/authorized_keys.
+    повторный запуск не плодит дубли в ~/.ssh/authorized_keys. Корневая ФС
+    колонки смонтирована read-only — на время записи делаем remount rw/ro,
+    успех подтверждаем только фактическим наличием ключа в файле.
     """
     KEY_DIR.mkdir(exist_ok=True)
     if not KEY_PRIV.exists():
@@ -950,16 +2213,36 @@ async def setup_ssh_key() -> dict[str, Any]:
     pub_line = KEY_PUB.read_text(encoding="utf-8").strip()
 
     script = (
-        'umask 077; mkdir -p ~/.ssh; '
-        'touch ~/.ssh/authorized_keys; '
-        'grep -v "station-panel" ~/.ssh/authorized_keys > ~/.ssh/ak_new; '
-        f'echo "{pub_line}" >> ~/.ssh/ak_new; '
-        'mv ~/.ssh/ak_new ~/.ssh/authorized_keys; '
-        'chmod 600 ~/.ssh/authorized_keys; echo OK'
+        'umask 077; mkdir -p ~/.ssh && '
+        'grep -v "station-panel" ~/.ssh/authorized_keys > ~/.ssh/ak_new 2>/dev/null; '
+        f'echo "{pub_line}" >> ~/.ssh/ak_new && '
+        'mv ~/.ssh/ak_new ~/.ssh/authorized_keys && '
+        'chmod 600 ~/.ssh/authorized_keys && '
+        'grep -q station-panel ~/.ssh/authorized_keys && echo OK'
     )
-    code, out, err = await ssh_run(script, timeout=20)
-    ok = code == 0 and "OK" in out
-    return {"installed": ok, "public_key": pub_line, "error": err.strip() if not ok else ""}
+    error = ""
+    try:
+        conn = await ssh_connect()
+    except Exception as exc:
+        return {"installed": False, "public_key": pub_line, "error": f"{type(exc).__name__}: {exc}"[:200]}
+    try:
+        try:
+            await asyncio.wait_for(conn.run("mount -o remount,rw /", check=False, encoding="utf-8"), 15)
+            result = await asyncio.wait_for(conn.run(script, check=False, encoding="utf-8"), 25)
+            ok = result.exit_status == 0 and "OK" in (result.stdout or "")
+            if not ok:
+                error = ((result.stderr or "").strip() or "ключ не появился в authorized_keys")[:200]
+        except Exception as exc:
+            ok = False
+            error = f"{type(exc).__name__}: {exc}"[:200]
+        finally:
+            try:
+                await asyncio.wait_for(conn.run("mount -o remount,ro /", check=False, encoding="utf-8"), 15)
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    return {"installed": ok, "public_key": pub_line, "error": error}
 
 
 async def sftp_probe() -> dict[str, Any]:
@@ -982,18 +2265,23 @@ async def sftp_probe() -> dict[str, Any]:
 
 def _probe_ip_sync(ip: str) -> str | None:
     """Синхронная проверка одного IP: отвечает ли YAM (для asyncio.to_thread)."""
-    try:
-        import urllib.request
+    import urllib.request
 
-        with urllib.request.urlopen(  # noqa: S310
-            f"http://{ip}:{cfg['yam_port']}/api/device", timeout=1.5
-        ) as resp:
-            if resp.status == 200:
-                device = json.loads(resp.read(4096))
-                if isinstance(device, dict) and device.get("model"):
-                    return ip
-    except Exception:
-        pass
+    ports: list[int] = []
+    for port in (cfg["yam_port"], 8099, 8080, 80):
+        if port not in ports:
+            ports.append(int(port))
+    for port in ports:
+        try:
+            with urllib.request.urlopen(  # noqa: S310
+                f"http://{ip}:{port}/api/device", timeout=1.5
+            ) as resp:
+                if resp.status == 200:
+                    device = json.loads(resp.read(4096))
+                    if isinstance(device, dict) and device.get("model"):
+                        return ip
+        except Exception:
+            continue
     return None
 
 
@@ -1049,21 +2337,27 @@ async def api_setup_full(request: Request) -> JSONResponse:
         except Exception:
             pass
     if not found_ip:
-        network_prefix = ".".join(str(cfg.get("station_ip", "")).split(".")[:3])
-        if not all(p.isdigit() for p in network_prefix.split(".")):
-            return JSONResponse({"ok": False, "steps": steps,
-                                 "error": "не знаю, какую подсеть сканировать — задайте IP станции"})
-        current = cfg["station_ip"]
-        local_octet = current.split(".")[3] if current.startswith(network_prefix + ".") else None
-        candidates = [f"{network_prefix}.{o}" for o in range(1, 255) if str(o) != local_octet]
-        for i in range(0, len(candidates), 40):
-            batch = candidates[i:i + 40]
-            scanned += len(batch)
-            results = await asyncio.gather(*(asyncio.to_thread(_probe_ip_sync, ip) for ip in batch))
-            hit = next((ip for ip in results if ip), None)
-            if hit:
-                found_ip = hit
-                break
+        network_prefixes = _local_subnets()
+        if current and ".".join(current.split(".")[:3]) not in network_prefixes:
+            network_prefixes.append(".".join(current.split(".")[:3]))
+        candidates = []
+        for prefix in network_prefixes:
+            if not all(p.isdigit() for p in prefix.split(".")):
+                continue
+            local_octet = current.split(".")[3] if current.startswith(prefix + ".") else None
+            candidates.extend(f"{prefix}.{o}" for o in range(1, 255) if str(o) != local_octet)
+        if candidates:
+            for i in range(0, len(candidates), 40):
+                batch = candidates[i:i + 40]
+                scanned += len(batch)
+                results = await asyncio.gather(*(asyncio.to_thread(_probe_ip_sync, ip) for ip in batch))
+                hit = next((ip for ip in results if ip), None)
+                if hit:
+                    found_ip = hit
+                    break
+    if not found_ip and not candidates:
+        return JSONResponse({"ok": False, "steps": steps,
+                             "error": "не удалось определить локальную сеть — задайте IP станции вручную"})
     steps.append({"step": "IP станции", "ok": bool(found_ip),
                   "detail": found_ip or "не найдена — проверьте, что колонка в той же сети"})
     if not found_ip:
@@ -1158,7 +2452,11 @@ async def api_put_config(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
     if data.get("station_ip"):
-        cfg["station_ip"] = str(data["station_ip"]).strip()
+        ip = str(data["station_ip"]).strip()
+        parts = ip.split(".")
+        if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            raise HTTPException(status_code=400, detail=f"некорректный IP станции: {ip!r}")
+        cfg["station_ip"] = ip
     for key in ("ssh_port", "yam_port"):
         if data.get(key):
             cfg[key] = int(data[key])
@@ -1273,6 +2571,19 @@ local TRIGGERS = {__PHRASES__}
 local BRIDGE_URL = __BRIDGE_URL__
 local BRIDGE_TOKEN = __TOKEN__
 
+-- Медиа-команды без слова «Алиса»: точные фразы -> команда мосту
+local MEDIA = {
+  ["стоп"] = "stop",
+  ["пауза"] = "pause",
+  ["продолжи"] = "play",
+  ["дальше"] = "next",
+  ["следующий"] = "next",
+  ["следующий трек"] = "next",
+  ["назад"] = "prev",
+  ["предыдущий"] = "prev",
+  ["предыдущий трек"] = "prev",
+}
+
 local function normalize(text)
   -- как в yamd: буквы/цифры остаются, остальное — пробел; пробелы схлопываем
   local out = tostring(text):lower():gsub("[^%wа-яё ]", " ")
@@ -1320,14 +2631,75 @@ local function handle(transcript, query)
   -- звуковые ответы появятся позже (нужен TTS-файл в пакете)
 end
 
+local function handle_media(cmd)
+  if BRIDGE_URL == "" then
+    print("[station-voice] мост не настроен в панели")
+    return
+  end
+  local media_url = BRIDGE_URL:gsub("/api/voice$", "/api/media")
+  local url = media_url .. (media_url:find("?", 1, true) and "&" or "?") .. "token=" .. BRIDGE_TOKEN
+  local ok, response = pcall(alice.http.post, url, '{"media":"' .. cmd .. '"}')
+  if not ok or type(response) ~= "table" then
+    print("[station-voice] мост недоступен (media)")
+    return
+  end
+  print("[station-voice] media " .. cmd .. " -> " .. tostring(response.status) .. ": " .. tostring(response.body):sub(1, 200))
+end
+
+local function match_media(transcript)
+  local spoken = normalize(transcript)
+  if spoken == "" then return nil end
+  return MEDIA[spoken]
+end
+
+-- «Алиса, включи …» -> перехват: играет soundya, голос отвечает «включаю …»
+local function match_play(transcript)
+  local spoken = normalize(transcript)
+  local m = spoken:match("^алиса включи (.+)$")
+      or spoken:match("^алиса поставь (.+)$")
+      or spoken:match("^алиса запусти (.+)$")
+      or spoken:match("^включи (.+)$")
+      or spoken:match("^поставь (.+)$")
+  if m and #m > 1 then return m end
+  return nil
+end
+
+local function handle_play(query)
+  if BRIDGE_URL == "" then
+    print("[station-voice] мост не настроен в панели")
+    return
+  end
+  local media_url = BRIDGE_URL:gsub("/api/voice$", "/api/media")
+  local url = media_url .. (media_url:find("?", 1, true) and "&" or "?") .. "token=" .. BRIDGE_TOKEN
+  local body = '{"play":"' .. json_escape(query) .. '"}'
+  local ok, response = pcall(alice.http.post, url, body)
+  if not ok or type(response) ~= "table" then
+    print("[station-voice] мост недоступен (play)")
+    return
+  end
+  print("[station-voice] play '" .. query .. "' -> " .. tostring(response.status) .. ": " .. tostring(response.body):sub(1, 200))
+end
+
 print("[station-voice] слушаю: " .. table.concat(TRIGGERS, ", "))
 while true do
   local ok, event = pcall(alice.ipc.next_speech, 60000)
   if ok and type(event) == "table" and type(event.transcript) == "string" then
-    local query = match_trigger(event.transcript)
-    if query then
+    local media = match_media(event.transcript)
+    if media then
       pcall(alice.command.cancel)
-      pcall(handle, event.transcript, query == "" and "привет" or query)
+      pcall(handle_media, media)
+    else
+      local play_query = match_play(event.transcript)
+      if play_query then
+        pcall(alice.command.cancel)
+        pcall(handle_play, play_query)
+      else
+        local query = match_trigger(event.transcript)
+        if query then
+          pcall(alice.command.cancel)
+          pcall(handle, event.transcript, query == "" and "привет" or query)
+        end
+      end
     end
   end
   alice.sleep(50)
@@ -1355,7 +2727,7 @@ def build_voice_plugin_yap(phrases: list[str], bridge_url: str, bridge_token: st
     toml = (
         f'id = "{VOICE_PLUGIN_ID}"\n'
         'name = "Station Voice"\n'
-        'version = "1.1.1"\n'
+        'version = "1.2.0"\n'
         'entry = "main.lua"\n'
         'description = "Голосовые команды панели Станции"\n'
         "\n"
@@ -1462,6 +2834,45 @@ async def api_voice_bridge_config(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.api_route("/bridge/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def bridge_proxy(path: str, request: Request) -> Response:
+    """Проксировать локальный мост (:8811) — удобно для UI и тестов из браузера."""
+    require_auth(request)
+    url = f"http://127.0.0.1:{BRIDGE_PORT}/{path}"
+    query = request.url.query
+    if "token=" not in query and cfg.get("voice_bridge_token"):
+        query = (query + "&" if query else "") + "token=" + __import__("urllib.parse", fromlist=["quote"]).quote(str(cfg["voice_bridge_token"]))
+    if query:
+        url += "?" + query
+    body = await request.body()
+    try:
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(request.method, url, data=body or None,
+                                       headers={"Content-Type": request.headers.get("content-type", "application/json")}) as resp:
+                payload = await resp.read()
+                return Response(content=payload, status_code=resp.status,
+                                media_type=resp.headers.get("content-type", "application/json"))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"мост недоступен: {exc}")
+
+
+@app.post("/api/voice/answer-tts")
+async def api_voice_answer_tts(request: Request) -> JSONResponse:
+    """Вкл/выкл озвучку ответов моста на колонке (флаг-файл, мост читает на лету)."""
+    require_auth(request)
+    data = await request.json()
+    enabled = bool(data.get("enabled"))
+    cfg["bridge_answer_tts"] = enabled
+    save_config(cfg)
+    flag = BASE / "answer-tts.flag"
+    if enabled:
+        flag.write_text("on", encoding="utf-8")
+    else:
+        flag.unlink(missing_ok=True)
+    return JSONResponse({"ok": True, "enabled": enabled})
+
+
 @app.post("/api/voice/deploy")
 async def api_voice_deploy(request: Request) -> JSONResponse:
     """Собрать .yap с текущими фразами и установить на колонку."""
@@ -1484,12 +2895,12 @@ async def api_voice_deploy(request: Request) -> JSONResponse:
         if status not in (200, 201):
             return JSONResponse({"detail": f"YAM вернул {status}: {body}"}, status_code=502)
 
-        # включить пакет и поставить на автозапуск
+        # включить пакет, автозапуск и СТАРТ (остановка в конце оставляла плагин мёртвым)
         await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/toggle")
-        await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/stop")
         status, body = await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/service/enable")
         if status not in (200, 202, 204):
             return JSONResponse({"detail": f"автозапуск: YAM вернул {status}: {body}"}, status_code=502)
+        await yam_api("POST", f"/api/plugins/{VOICE_PLUGIN_ID}/start")
         return JSONResponse({"ok": True, "manifest": body})
     except HTTPException:
         raise
@@ -1567,6 +2978,20 @@ def _bridge_env() -> dict[str, str]:
     env["VOICE_PROXY"] = str(cfg.get("voice_proxy", ""))
     env["VOICE_STATE"] = str(BASE / "bridge-state.json")
     env["BRIDGE_CONFIG"] = str(BASE / "bridge-config.json")
+    env["YSE_SSH_HOST"] = str(cfg.get("station_ip", ""))
+    env["YSE_SSH_PORT"] = str(cfg.get("ssh_port", "2222"))
+    env["YSE_SSH_USER"] = str(cfg.get("ssh_user", "root"))
+    if KEY_PRIV.exists():
+        env["YSE_SSH_KEY"] = str(KEY_PRIV)
+    # озвучка ответов моста: движок как в «Сказать на колонке»
+    env["YSE_TTS_ENGINE"] = str(cfg.get("say_engine", "edge"))
+    env["YSE_ELEVEN_KEY"] = str(cfg.get("eleven_api_key", ""))
+    env["YSE_ELEVEN_PROXY"] = str(cfg.get("eleven_proxy", ""))
+    env["YSE_ELEVEN_VOICE"] = str(cfg.get("eleven_voice_id", ""))
+    env["YSE_ELEVEN_MODEL"] = str(cfg.get("eleven_model", "eleven_multilingual_v2"))
+    env["YSE_ALICE_X_TOKEN"] = str(cfg.get("yandex_x_token", ""))
+    env["YSE_FFMPEG"] = bin_tool("ffmpeg") or ""
+    env["YSE_TTS_FLAG"] = str(BASE / "answer-tts.flag")
     return env
 
 
@@ -1590,7 +3015,7 @@ async def _bridge_start() -> bool:
         return False
     _bridge_proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "uvicorn", "app:app",
-        "--host", "127.0.0.1", "--port", str(BRIDGE_PORT), "--log-level", "warning",
+        "--host", str(cfg.get("bridge_host", "0.0.0.0")), "--port", str(BRIDGE_PORT), "--log-level", "warning",
         cwd=str(bdir), env=_bridge_env(),
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
@@ -1631,13 +3056,16 @@ def _bridge_llm_ready() -> dict[str, Any]:
 
 @app.get("/api/bridge/status")
 async def api_bridge_status(request: Request) -> JSONResponse:
-    """Состояние локального моста: код найден, запущен, /health, LLM."""
+    """Состояние локального моста: код найден, запущен (поднимаем при необходимости), /health, LLM."""
     require_auth(request)
     bdir = _bridge_dir()
+    running = await _bridge_health()
+    if not running and (bdir / "app.py").exists():
+        running = await _bridge_start()
     return JSONResponse({
         "dir": str(bdir),
         "code_found": (bdir / "app.py").exists(),
-        "running": await _bridge_health(),
+        "running": running,
         "port": BRIDGE_PORT,
         "url": cfg.get("voice_bridge_url", ""),
         "has_token": bool(cfg.get("voice_bridge_token")),
@@ -1750,6 +3178,199 @@ SAY_MOODS: dict[str, str | None] = {
 }
 SAY_VOICES = {"svetlana": "ru-RU-SvetlanaNeural", "dmitry": "ru-RU-DmitryNeural"}
 SAY_REMOTE = "/tmp/station-panel-say.wav"
+# Сценарий облачного TTS Алисы: один на панель, текст меняется перед каждым запуском.
+ALICE_SCENARIO_NAME = "Панель Станции — голос"
+ELEVEN_MODELS = [
+    ("eleven_multilingual_v2", "Multilingual v2 — лучшее качество (русский есть)"),
+    ("eleven_turbo_v2_5", "Turbo v2.5 — быстрее и дешевле"),
+    ("eleven_flash_v2_5", "Flash v2.5 — самый быстрый"),
+]
+
+
+async def _alice_say(text: str) -> None:
+    """Произнести текст родным голосом Алисы на колонке.
+
+    Через облачную сессию Яндекса (yandex_x_token) находим/создаём сценарий
+    с capability «tts», меняем в нём текст и запускаем — колонка произносит
+    текст тем же голосом, что и свои ответы. Протокол актуальный (v4),
+    как в интеграции YandexStation.
+    """
+    # 1. устройства: колонка лежит в household.all
+    devices = await cloud_request("GET", "https://iot.quasar.yandex.ru/m/v3/user/devices")
+    speaker = None
+    for h in devices.get("households", []):
+        for d in h.get("all", []):
+            if str(d.get("type", "")).startswith("devices.types.media_device") or \
+               str(d.get("type", "")).startswith("devices.types.smart_speaker"):
+                speaker = d
+                break
+        if speaker:
+            break
+    if speaker is None:
+        raise HTTPException(status_code=404, detail="колонка не найдена в аккаунте Яндекса")
+    speaker_id = speaker["id"]
+
+    # 2. сценарии — ищем наш
+    scenarios = await cloud_request("GET", "https://iot.quasar.yandex.ru/m/user/scenarios")
+    scenario_id = None
+    for s in scenarios.get("scenarios", []):
+        if s.get("name") == ALICE_SCENARIO_NAME:
+            scenario_id = s["id"]
+            break
+
+    scenario_payload = {
+        "name": ALICE_SCENARIO_NAME,
+        "icon": "home",
+        "triggers": [{"trigger": {"type": "scenario.trigger.voice", "value": ALICE_SCENARIO_NAME}}],
+        "steps": [{
+            "type": "scenarios.steps.actions.v2",
+            "parameters": {
+                "items": [{
+                    "id": speaker_id,
+                    "type": "step.action.item.device",
+                    "value": {
+                        "id": speaker_id,
+                        "item_type": "device",
+                        "capabilities": [{
+                            "type": "devices.capabilities.quasar",
+                            "state": {"instance": "tts", "value": {"text": text}},
+                        }],
+                    },
+                }],
+            },
+        }],
+    }
+    if scenario_id:
+        # 3а. обновляем текст в существующем сценарии
+        await cloud_request("PUT", f"https://iot.quasar.yandex.ru/m/v4/user/scenarios/{scenario_id}", scenario_payload)
+    else:
+        # 3б. создаём сценарий
+        created = await cloud_request("POST", "https://iot.quasar.yandex.ru/m/v4/user/scenarios", scenario_payload)
+        scenario_id = created.get("scenario_id")
+        if not scenario_id:
+            raise HTTPException(status_code=502, detail="Яндекс не создал сценарий: " + json.dumps(created, ensure_ascii=False)[:140])
+
+    # 4. запускаем сценарий — колонка произносит текст голосом Алисы
+    await cloud_request("POST", f"https://iot.quasar.yandex.ru/m/user/scenarios/{scenario_id}/actions", {})
+
+
+
+async def _eleven_tts(text: str, voice_id: str, model: str) -> bytes:
+    """Синтез через ElevenLabs API (mp3 44.1 кГц). Ключ и прокси — в config.json.
+
+    API ElevenLabs закрыт геоблокировкой из РФ — запросы идут через прокси
+    (тот же steelproxy, что у плеера «на ПК»), если он задан."""
+    key = str(cfg.get("eleven_api_key") or "")
+    if not key:
+        raise HTTPException(status_code=400, detail="ключ ElevenLabs не задан — впиши его в настройках «Сказать на колонке»")
+    if not voice_id:
+        raise HTTPException(status_code=400, detail="не выбран голос ElevenLabs")
+    proxy = str(cfg.get("eleven_proxy") or "").strip() or None
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                params={"output_format": "mp3_44100_128"},
+                headers={"xi-api-key": key, "Content-Type": "application/json",
+                         "Accept": "audio/mpeg"},
+                json={"text": text, "model_id": model or "eleven_multilingual_v2"},
+                proxy=proxy,
+        ) as resp:
+            data = await resp.read()
+            if resp.status != 200:
+                detail = data.decode("utf-8", "replace")[:200]
+                raise HTTPException(status_code=502, detail=f"ElevenLabs HTTP {resp.status}: {detail}")
+            return data
+
+
+@app.get("/api/say/config")
+async def api_say_config_get(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse({
+        "ok": True,
+        "engine": cfg.get("say_engine", "edge"),
+        "has_key": bool(cfg.get("eleven_api_key")),
+        "voice_id": cfg.get("eleven_voice_id", ""),
+        "model": cfg.get("eleven_model", "eleven_multilingual_v2"),
+        "proxy": cfg.get("eleven_proxy", "http://4ys1MYfr:IAWl3Vmz@isp01.steelproxy.com:3071"),
+        "models": [{"id": i, "name": n} for i, n in ELEVEN_MODELS],
+    })
+
+
+@app.put("/api/say/config")
+async def api_say_config_put(request: Request) -> JSONResponse:
+    """Настройки синтеза речи: движок, ключ и голос ElevenLabs."""
+    require_auth(request)
+    data = await request.json()
+    engine = str(data.get("engine") or "edge")
+    if engine not in ("edge", "elevenlabs", "alice"):
+        raise HTTPException(status_code=400, detail="движок: edge, elevenlabs или alice")
+    cfg["say_engine"] = engine
+    if "eleven_api_key" in data and str(data["eleven_api_key"]).strip():
+        cfg["eleven_api_key"] = str(data["eleven_api_key"]).strip()
+    if "eleven_voice_id" in data:
+        cfg["eleven_voice_id"] = str(data["eleven_voice_id"]).strip()
+    if "eleven_model" in data:
+        model = str(data["eleven_model"]).strip()
+        if model and not any(model == i for i, _ in ELEVEN_MODELS):
+            raise HTTPException(status_code=400, detail="неизвестная модель ElevenLabs")
+        cfg["eleven_model"] = model or "eleven_multilingual_v2"
+    if "eleven_proxy" in data:
+        cfg["eleven_proxy"] = str(data["eleven_proxy"]).strip()
+    save_config(cfg)
+    return JSONResponse({"ok": True, "engine": cfg["say_engine"], "has_key": bool(cfg.get("eleven_api_key"))})
+
+
+@app.get("/api/say/voices")
+async def api_say_voices(request: Request) -> JSONResponse:
+    """Список голосов выбранного движка."""
+    require_auth(request)
+    engine = str(request.query_params.get("engine") or cfg.get("say_engine", "edge"))
+    if engine == "alice":
+        return JSONResponse({"ok": True, "voices": [{"id": "alice", "name": "Алиса (родной голос)"}]})
+    if engine == "edge":
+        return JSONResponse({"ok": True, "voices": [{"id": k, "name": v.split("-")[-1].replace("Neural", " (Эдж)")} for k, v in SAY_VOICES.items()]})
+    key = str(cfg.get("eleven_api_key") or "")
+    if not key:
+        return JSONResponse({"ok": False, "voices": [], "detail": "сначала впиши ключ ElevenLabs"})
+    proxy = str(cfg.get("eleven_proxy") or "").strip() or None
+    timeout = aiohttp.ClientTimeout(total=40)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get("https://api.elevenlabs.io/v1/voices",
+                               headers={"xi-api-key": key}, proxy=proxy) as resp:
+            data = await resp.json(content_type=None)
+    if resp.status != 200:
+        detail = (data if isinstance(data, str) else json.dumps(data, ensure_ascii=False))[:120] if data else f"HTTP {resp.status}"
+        hint = " — похоже на геоблокировку: задай прокси в настройках голоса" if resp.status in (301, 302) else ""
+        return JSONResponse({"ok": False, "voices": [], "detail": f"ElevenLabs HTTP {resp.status}: {detail}{hint}"})
+    voices = [{"id": v.get("voice_id"), "name": v.get("name")} for v in data.get("voices", [])]
+    return JSONResponse({"ok": True, "voices": voices})
+
+
+@app.get("/api/say/quota")
+async def api_say_quota(request: Request) -> JSONResponse:
+    """Остаток символов ElevenLabs (тарифный лимит месяца)."""
+    require_auth(request)
+    key = str(cfg.get("eleven_api_key") or "")
+    if not key:
+        return JSONResponse({"ok": False, "detail": "ключ не задан"})
+    proxy = str(cfg.get("eleven_proxy") or "").strip() or None
+    timeout = aiohttp.ClientTimeout(total=40)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://api.elevenlabs.io/v1/user/subscription",
+                                   headers={"xi-api-key": key}, proxy=proxy) as resp:
+                data = await resp.json(content_type=None)
+        if resp.status != 200:
+            return JSONResponse({"ok": False, "detail": f"HTTP {resp.status}"})
+        return JSONResponse({
+            "ok": True,
+            "used": data.get("character_count"),
+            "limit": data.get("character_limit"),
+            "next_reset": data.get("next_character_count_reset_unix") or data.get("next_character_count_reset_unix_ms"),
+        })
+    except Exception as exc:
+        return JSONResponse({"ok": False, "detail": str(exc)[:120]})
 
 
 @app.post("/api/speaker/say")
@@ -1759,28 +3380,53 @@ async def api_speaker_say(request: Request) -> JSONResponse:
     text = str(data.get("text", "")).strip()
     if not text or len(text) > 500:
         raise HTTPException(status_code=400, detail="текст от 1 до 500 символов")
-    voice = SAY_VOICES.get(str(data.get("voice", "svetlana")))
-    mood = str(data.get("mood", "normal"))
-    if not voice or mood not in SAY_MOODS:
-        raise HTTPException(status_code=400, detail="неизвестный голос или интонация")
+
+    engine = str(data.get("engine") or cfg.get("say_engine", "edge"))
+    if engine not in ("edge", "elevenlabs", "alice"):
+        engine = "edge"
 
     import tempfile
 
-    import edge_tts
+    # Родной голос Алисы: текст уходит в облако, колонка произносит сама.
+    # Интонации (mood) недоступны — Яндекс не даёт менять темп/высоту фразы.
+    if engine == "alice":
+        if not cfg.get("yandex_x_token"):
+            raise HTTPException(status_code=400, detail="нет входа в Яндекс: вкладка «Алиса» → облачные тумблеры → войти")
+        await _alice_say(text)
+        return JSONResponse({"ok": True, "voice": "alice", "mood": "normal", "engine": "alice"})
+
+    if engine == "edge":
+        voice = SAY_VOICES.get(str(data.get("voice", "svetlana")))
+        if not voice:
+            raise HTTPException(status_code=400, detail="неизвестный голос Эджа")
+    else:
+        voice = str(data.get("voice") or cfg.get("eleven_voice_id") or "")
+    mood = str(data.get("mood", "normal"))
+    if mood not in SAY_MOODS:
+        raise HTTPException(status_code=400, detail="неизвестная интонация")
 
     tmp_dir = Path(tempfile.gettempdir())
     mp3_path = tmp_dir / f"station-say-{secrets.token_hex(4)}.mp3"
     wav_path = tmp_dir / f"station-say-{secrets.token_hex(4)}.wav"
     try:
         try:
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(str(mp3_path))
+            if engine == "elevenlabs":
+                mp3_path.write_bytes(await _eleven_tts(
+                    text, voice or str(cfg.get("eleven_voice_id") or ""),
+                    str(cfg.get("eleven_model") or "eleven_multilingual_v2")))
+            else:
+                import edge_tts
+
+                communicate = edge_tts.Communicate(text, voice)
+                await communicate.save(str(mp3_path))
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"синтез речи не удался: {exc}")
 
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = bin_tool("ffmpeg")
         if not ffmpeg:
-            raise HTTPException(status_code=500, detail="ffmpeg не найден в PATH")
+            raise HTTPException(status_code=500, detail="ffmpeg не найден — установи во вкладке «Чек-лист»")
         command = [ffmpeg, "-y", "-loglevel", "error", "-i", str(mp3_path)]
         if SAY_MOODS[mood]:
             command += ["-af", SAY_MOODS[mood]]
@@ -1809,7 +3455,14 @@ async def api_speaker_say(request: Request) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 # Общая громкость колонки — регулятор ALSA «Master» (его же двигает Алиса
 # через /system/vendor/quasar/set_volume.sh). Шкала 0..100 (%).
+# Синхронизация с ПК: громкость ПК → колонка; изменение на колонке — в ползунок.
 # --------------------------------------------------------------------------- #
+volume_state: dict[str, Any] = {
+    "col": None, "pc": None, "last_pc": None,
+    "last_pushed_col": None, "last_reported_col": None,
+}
+
+
 async def _read_master_volume() -> int | None:
     """Текущая громкость Master в % (amixer -c 0 sget Master)."""
     code, out, _ = await ssh_run("amixer -c 0 sget Master 2>/dev/null")
@@ -1819,13 +3472,112 @@ async def _read_master_volume() -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _read_pc_volume() -> int | None:
+    """Громкость динамиков Windows (0..100) через Core Audio (pycaw).
+
+    Вызывается из фонового потока — COM нужно инициализировать в нём же."""
+    try:
+        import comtypes
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        from pycaw.pycaw import AudioUtilities
+        return int(AudioUtilities.GetSpeakers().volume_percent)
+    except Exception:
+        return None
+
+
+def _set_pc_volume(level: int) -> bool:
+    try:
+        import comtypes
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        from pycaw.pycaw import AudioUtilities
+        device = AudioUtilities.GetSpeakers()
+        device.EndpointVolume.SetMasterVolumeLevelScalar(level / 100.0, None)
+        return True
+    except Exception:
+        return False
+
+
+async def _volume_sync_loop() -> None:
+    """Каждые 2 с читает громкость ПК; при изменении гонит её на колонку.
+    Каждые 6 с читает громкость колонки в кэш (для ползунка панели)."""
+    tick = 0
+    while True:
+        await asyncio.sleep(2)
+        tick += 1
+        try:
+            pc = await asyncio.to_thread(_read_pc_volume)
+            if pc is not None:
+                volume_state["pc"] = pc
+                sync_on = bool(cfg.get("volume_sync_enabled"))
+                if (sync_on and volume_state["last_pc"] is not None
+                        and pc != volume_state["last_pc"] and volume_state["col"] is not None):
+                    code, _, err = await ssh_run(f"amixer -q set Master {pc}%")
+                    if code == 0:
+                        volume_state["col"] = pc
+                        volume_state["last_pushed_col"] = pc
+                        volume_state["last_reported_col"] = pc
+                    else:
+                        sys.stderr.write("volume sync: " + err[:120] + "\n")
+            volume_state["last_pc"] = pc
+        except Exception:
+            pass
+        if tick % 3:
+            continue
+        try:
+            col = await _read_master_volume()
+            if col is not None:
+                volume_state["col"] = col
+                pushed = volume_state["last_pushed_col"]
+                if pushed is None or col != pushed:
+                    volume_state["last_reported_col"] = col
+        except Exception:
+            pass
+        if tick % 5:
+            continue
+        # сторож: упавший station-voice блокирует wake word («component attached but stopped»)
+        try:
+            st, plugins = await yam_api("GET", "/api/plugins")
+            for p in (plugins if isinstance(plugins, list) else []):
+                if (p.get("manifest") or {}).get("id") == "station-voice" and not p.get("running"):
+                    await yam_api("POST", "/api/plugins/station-voice/start")
+        except Exception:
+            pass
+
+
+async def _start_volume_loop() -> None:
+    asyncio.create_task(_volume_sync_loop())
+
+
 @app.get("/api/volume")
 async def api_volume_get(request: Request) -> JSONResponse:
     require_auth(request)
-    volume = await _read_master_volume()
+    volume = volume_state["col"]
+    if volume is None:
+        volume = await _read_master_volume()
+        volume_state["col"] = volume
     if volume is None:
         return JSONResponse({"ok": False, "detail": "не удалось прочитать громкость (amixer)"}, status_code=502)
-    return JSONResponse({"ok": True, "volume": volume})
+    return JSONResponse({
+        "ok": True, "volume": volume,
+        "pc": volume_state["pc"],
+        "sync": bool(cfg.get("volume_sync_enabled")),
+    })
+
+
+@app.post("/api/volume/sync")
+async def api_volume_sync(request: Request) -> JSONResponse:
+    """Включить/выключить синхронизацию громкости ПК → колонка."""
+    require_auth(request)
+    data = await request.json()
+    cfg["volume_sync_enabled"] = bool(data.get("enabled"))
+    save_config(cfg)
+    return JSONResponse({"ok": True, "sync": bool(cfg.get("volume_sync_enabled"))})
 
 
 @app.put("/api/volume")
@@ -1841,6 +3593,21 @@ async def api_volume_put(request: Request) -> JSONResponse:
     if code != 0:
         raise HTTPException(status_code=502, detail="amixer: " + err[:160])
     return JSONResponse({"ok": True, "volume": level})
+
+
+@app.put("/api/volume/pc")
+async def api_volume_pc_put(request: Request) -> JSONResponse:
+    """Громкость динамиков ПК (0..100) — отдельно от колонки."""
+    require_auth(request)
+    data = await request.json()
+    try:
+        level = max(0, min(100, int(data.get("volume"))))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="громкость: целое 0..100")
+    if not _set_pc_volume(level):
+        raise HTTPException(status_code=500, detail="не удалось выставить громкость ПК (pycaw)")
+    volume_state["pc"] = level
+    return JSONResponse({"ok": True, "pc": level})
 
 
 # --------------------------------------------------------------------------- #
@@ -2292,8 +4059,12 @@ async def api_music_soundya_token(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
     token = str(data.get("token", "")).strip()
-    if len(token) < 40:
-        raise HTTPException(status_code=400, detail="похоже, это не oauth_token")
+    # формат куки oauth_token у SoundCloud: <версия>-<uid>-<время>-<секрет>
+    # (например 2-332675-1600559952-phiBI8CyfxpF4); на случай смены формата
+    # допускаем и просто длинную строку без пробелов
+    if not (re.fullmatch(r"[0-9]{1,3}-[0-9]{2,15}-[0-9]{8,14}-[A-Za-z0-9_\-]{6,64}", token)
+            or (20 <= len(token) <= 300 and not re.search(r"\s", token))):
+        raise HTTPException(status_code=400, detail="не похоже на oauth_token: это значение куки oauth_token с soundcloud.com, вида 2-332675-1600559952-…")
     code, current, _ = await ssh_run_bytes("cat /data/opt/soundya/config.json 2>/dev/null", timeout=15)
     try:
         config = json.loads(current.decode("utf-8", "replace") or "{}")
@@ -2347,9 +4118,9 @@ async def api_player_local(request: Request) -> JSONResponse:
     if not query:
         raise HTTPException(status_code=400, detail="пустой запрос")
     source = str(data.get("source", "youtube")).lower()
-    ytdlp = shutil.which("yt-dlp")
+    ytdlp = bin_tool("yt-dlp")
     if not ytdlp:
-        raise HTTPException(status_code=500, detail="yt-dlp не установлен на ПК")
+        raise HTTPException(status_code=500, detail="yt-dlp не установлен на ПК — установи во вкладке «Чек-лист»")
     search = {"soundcloud": "scsearch5:"}.get(source, "ytsearch1:")
     _kill_local_player()
     info = None
@@ -2383,9 +4154,9 @@ async def api_player_local(request: Request) -> JSONResponse:
     url = info.get("url") or info.get("webpage_url")
     title = info.get("title") or query
 
-    ffplay = shutil.which("ffplay")
+    ffplay = bin_tool("ffplay")
     if not ffplay:
-        raise HTTPException(status_code=500, detail="ffplay не найден (ставится вместе с ffmpeg)")
+        raise HTTPException(status_code=500, detail="ffplay не найден (ставится вместе с ffmpeg в «Чек-листе»)")
     LOCAL_PLAYER["proc"] = subprocess.Popen(
         [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", "80", url],
         creationflags=subprocess.CREATE_NO_WINDOW,
@@ -2548,6 +4319,229 @@ async def api_clock_pin_set(request: Request) -> JSONResponse:
         if not (200 <= status < 300):
             raise HTTPException(status_code=502, detail="не удалось показать время на колонке")
     return JSONResponse(dict(clock_pin))
+
+
+# --------------------------------------------------------------------------- #
+# Ночной профиль LED-часов: в заданное окно панель держит низкую яркость,
+# показывая реальное время; днём один раз возвращает дневную яркость.
+# Работает, пока запущена панель; закрепление времени (pin) приоритетнее.
+# --------------------------------------------------------------------------- #
+def _hhmm_in_window(hhmm: str, start: str, end: str) -> bool:
+    try:
+        minutes = int(hhmm[:2]) * 60 + int(hhmm[3:5])
+        start_m = int(start[:2]) * 60 + int(start[3:5])
+        end_m = int(end[:2]) * 60 + int(end[3:5])
+    except (ValueError, IndexError):
+        return False
+    if start_m == end_m:
+        return False
+    return start_m <= minutes < end_m if start_m < end_m else minutes >= start_m or minutes < end_m
+
+
+async def _night_clock_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        if not clock_night.get("enabled") or clock_pin.get("active"):
+            continue
+        now = datetime.now().strftime("%H:%M")
+        in_window = _hhmm_in_window(now, str(clock_night["start"]), str(clock_night["end"]))
+        target = None
+        if in_window:
+            target = int(clock_night["night_brightness"])
+            clock_night["was_night"] = True
+        elif clock_night.get("was_night"):
+            target = int(clock_night["day_brightness"])
+            clock_night["was_night"] = False
+        if target is None:
+            continue
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                await session.put(
+                    f"http://{cfg['station_ip']}:{cfg['yam_port']}/api/clock",
+                    json={"time": now, "brightness": target},
+                )
+        except Exception:
+            pass  # станция недоступна — повторим на следующем такте
+
+
+@app.get("/api/clock/night")
+async def api_clock_night_get(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse(dict(clock_night))
+
+
+@app.post("/api/clock/night")
+async def api_clock_night_set(request: Request) -> JSONResponse:
+    """Настройки ночного профиля: окно времени и яркости (0–255)."""
+    require_auth(request)
+    data = await request.json()
+    for key in ("start", "end"):
+        value = str(data.get(key, clock_night[key]))
+        if not re.fullmatch(r"\d{2}:\d{2}", value):
+            raise HTTPException(status_code=400, detail=f"«{key}» в формате ЧЧ:ММ")
+        clock_night[key] = value
+    for key in ("night_brightness", "day_brightness"):
+        if key in data:
+            value = int(data[key])
+            if not 0 <= value <= 255:
+                raise HTTPException(status_code=400, detail="яркость 0–255")
+            clock_night[key] = value
+    clock_night["enabled"] = bool(data.get("enabled"))
+    if not clock_night["enabled"]:
+        clock_night["was_night"] = False
+    return JSONResponse(dict(clock_night))
+
+
+# --------------------------------------------------------------------------- #
+# Системные звуки колонки: /data/quasar/data/sounds/*.opus — приветствие
+# активации, ошибки и т.д. Замена с бэкапом; загрузка конвертируется в opus.
+# --------------------------------------------------------------------------- #
+SOUNDS_DIR = "/data/quasar/data/sounds"
+SOUND_SUBDIRS = ["common", "ru-RU"]
+
+
+def _ffmpeg_bin() -> str:
+    found = bin_tool("ffmpeg")
+    if not found:
+        raise HTTPException(status_code=500, detail="ffmpeg не найден на ПК с панелью — установи его во вкладке «Чек-лист»")
+    return found
+
+
+@app.get("/api/sounds")
+async def api_sounds_list(request: Request) -> JSONResponse:
+    require_auth(request)
+    code, out, err = await ssh_run_bytes(
+        f"ls -la {SOUNDS_DIR}/common/ {SOUNDS_DIR}/ru-RU/ 2>/dev/null")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="SSH: " + err.decode(errors="replace")[:160])
+    sounds: list[dict] = []
+    current: str | None = None
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        if line.startswith(f"{SOUNDS_DIR}/") and line.rstrip().endswith(":"):
+            current = line.rstrip().rstrip(":").rstrip("/").split("/")[-1]
+            continue
+        parts = line.split(None, 8)
+        if current and len(parts) >= 9 and parts[0].startswith("-") and parts[8].endswith(".opus"):
+            sounds.append({"dir": current, "name": parts[8], "size": parts[4],
+                           "date": f"{parts[5]} {parts[6]} {parts[7]}", "backup": ""})
+    # бэкапы: отдельный проход
+    code2, out2, _ = await ssh_run_bytes(f"ls {SOUNDS_DIR}/*/*.bak-panel 2>/dev/null")
+    backups = {line.split("/")[-1].replace(".bak-panel", "") for line in out2.decode(errors="replace").splitlines() if line.strip()}
+    for item in sounds:
+        item["backup"] = "да" if item["name"] in backups else ""
+    return JSONResponse({"ok": True, "sounds": sounds})
+
+
+@app.get("/api/sounds/file")
+async def api_sounds_file(request: Request, name: str, backup: str = "") -> Response:
+    """Прослушивание звука (или его бэкапа) — стримим opus как есть."""
+    require_auth(request)
+    if not re.fullmatch(r"[a-zA-Z0-9_\-]+\.opus", name) or "/" in name:
+        raise HTTPException(status_code=400, detail="некорректное имя файла")
+    subdir = "ru-RU" if name != "alice-iot-sounds-turn-on.opus" and name != "alice-iot-sounds-turn-off.opus" else "common"
+    if not any(s["dir"] == subdir and s["name"] == name for s in (await api_sounds_list_data())):
+        raise HTTPException(status_code=404, detail="такого звука нет на колонке")
+    suffix = ".bak-panel" if backup == "1" else ""
+    code, out, err = await ssh_run_bytes(f"cat {SOUNDS_DIR}/{subdir}/{name}{suffix}")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="SSH: " + err.decode(errors="replace")[:160])
+    return Response(content=out, media_type="audio/ogg")
+
+
+async def api_sounds_list_data() -> list[dict]:
+    """Внутренний хелпер: тот же список, что у GET /api/sounds, без обёртки."""
+    code, out, _ = await ssh_run_bytes(f"ls -la {SOUNDS_DIR}/common/ {SOUNDS_DIR}/ru-RU/ 2>/dev/null")
+    sounds: list[dict] = []
+    current: str | None = None
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        if line.startswith(f"{SOUNDS_DIR}/") and line.rstrip().endswith(":"):
+            current = line.rstrip().rstrip(":").rstrip("/").split("/")[-1]
+            continue
+        parts = line.split(None, 8)
+        if current and len(parts) >= 9 and parts[0].startswith("-") and parts[8].endswith(".opus"):
+            sounds.append({"dir": current, "name": parts[8]})
+    return sounds
+
+
+@app.post("/api/sounds/upload")
+async def api_sounds_upload(request: Request) -> JSONResponse:
+    """Заменить системный звук: принимаем opus/ogg/wav/mp3, конвертируем в opus.
+
+    Оригинал бэкапится один раз в <имя>.bak-panel и восстанавливается кнопкой."""
+    require_auth(request)
+    form = await request.form()
+    upload = form.get("file")
+    name = str(form.get("name") or "")
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(status_code=400, detail="нужен файл")
+    if not re.fullmatch(r"[a-zA-Z0-9_\-]+\.opus", name):
+        raise HTTPException(status_code=400, detail="выбери имя существующего звука")
+    data = await upload.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="файл пуст")
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="файл больше 8 МБ")
+    subdir = "common" if name.startswith("alice-iot") else "ru-RU"
+    sounds = await api_sounds_list_data()
+    if not any(s["dir"] == subdir and s["name"] == name for s in sounds):
+        raise HTTPException(status_code=404, detail="такого звука нет на колонке")
+
+    # конвертация в opus (48 кГц, mono) локально через ffmpeg
+    ffmpeg = _ffmpeg_bin()
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "input.bin"
+        dst = Path(tmp) / "out.opus"
+        src.write_bytes(data)
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-y", "-loglevel", "error", "-i", str(src),
+            "-c:a", "libopus", "-b:a", "24k", "-ar", "48000", "-ac", "1", str(dst),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, stderr = await asyncio.wait_for(proc.communicate(), 60)
+        if proc.returncode != 0 or not dst.exists():
+            raise HTTPException(status_code=400, detail="ffmpeg не смог сконвертировать: " + stderr.decode(errors="replace")[-160:])
+        opus = dst.read_bytes()
+    if len(opus) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="сконвертированный звук больше 2 МБ")
+
+    remote = f"{SOUNDS_DIR}/{subdir}/{name}"
+    try:
+        conn = await ssh_connect()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="SSH: " + str(exc)[:160])
+    try:
+        await asyncio.wait_for(conn.run(
+            f"[ -f {remote}.bak-panel ] || cp -p {remote} {remote}.bak-panel",
+            check=False, encoding="utf-8"), 15)
+        result = await asyncio.wait_for(conn.run(f"cat > {remote}", input=opus, check=False, encoding=None), 25)
+        if result.exit_status not in (0, None):
+            raise ValueError(f"запись не удалась (status {result.exit_status})")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)[:180])
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True, "name": name, "size": len(opus), "backup": "создан при первой замене"})
+
+
+@app.post("/api/sounds/restore")
+async def api_sounds_restore(request: Request) -> JSONResponse:
+    """Вернуть оригинальный звук из бэкапа .bak-panel."""
+    require_auth(request)
+    data = await request.json()
+    name = str(data.get("name") or "")
+    if not re.fullmatch(r"[a-zA-Z0-9_\-]+\.opus", name):
+        raise HTTPException(status_code=400, detail="некорректное имя файла")
+    subdir = "common" if name.startswith("alice-iot") else "ru-RU"
+    remote = f"{SOUNDS_DIR}/{subdir}/{name}"
+    code, out, err = await ssh_run_bytes(
+        f"[ -f {remote}.bak-panel ] && cp -p {remote}.bak-panel {remote} && echo OK || echo NOBACKUP")
+    text = out.decode(errors="replace").strip()
+    if "NOBACKUP" in text:
+        raise HTTPException(status_code=404, detail="бэкапа этого звука нет — его не меняли")
+    if "OK" not in text:
+        raise HTTPException(status_code=502, detail="SSH: " + err.decode(errors="replace")[:160])
+    return JSONResponse({"ok": True, "name": name})
 
 
 # --------------------------------------------------------------------------- #

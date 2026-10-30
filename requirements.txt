@@ -1,6 +1,11 @@
-fastapi>=0.115
-uvicorn[standard]>=0.30
+# Зависимости панели Станции. Установка: python -m pip install -r requirements.txt
+# (или одной кнопкой во вкладке «Чек-лист»)
+fastapi>=0.110
+uvicorn>=0.29
 aiohttp>=3.9
 asyncssh>=2.14
 python-multipart>=0.0.9
-edge-tts>=7.0
+edge-tts>=6.1
+zeroconf>=0.131
+pycaw>=20240210
+comtypes>=1.2

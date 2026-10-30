@@ -56,6 +56,9 @@ function secondsToHuman(seconds) {
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/* SVG-иконки из спрайта index.html (#i-*): svgIcon('play'), svgIcon('warn', 'ic-lvl-high') */
+const svgIcon = (name, cls = '') => `<svg class="ic ${cls}"><use href="#i-${name}"/></svg>`;
+
 /* Красивые имена моделей (код из /api/device → человекочитаемое название).
    CLOCK — модели с LED-кольцом, на котором панель показывает часы. */
 const MODEL_NAMES = {
@@ -166,6 +169,11 @@ function showTab(name) {
   if (name === 'console') setTimeout(() => { state.fit && state.fit.fit(); state.term && state.term.focus(); }, 60);
   if (name === 'sensors') drawCharts();
   if (name === 'wakeword') { wwRefresh(); if (!wwTimer) wwTimer = setInterval(wwRefresh, 700); }
+  if (name === 'alice') loadAliceAll();
+  if (name === 'system') { loadMinidumps(); runSecurityAudit(); loadSounds(); }
+  if (name === 'led') { ledAnimLoad(); loadNightClock(); }
+  if (name === 'checklist') loadChecklist();
+  if (name === 'plugins') loadCatalog();
   localStorage.setItem('sp_tab', name);
 }
 
@@ -182,6 +190,32 @@ $('logout').onclick = async () => {
 /* ---------------------- автоопределение колонки ---------------------- */
 let detecting = false;
 
+/* Список найденных станций: с YAM — рабочие, без YAM — «сырые» (видны по mDNS,
+   как в alice bridge: рут и YAM на них ещё не установлены). */
+function renderDetectList(devices) {
+  const box = $('detectList');
+  if (!box) return;
+  const list = Array.isArray(devices) ? devices : [];
+  if (!list.length) { box.innerHTML = ''; return; }
+  box.innerHTML = list.map(d => `
+    <div class="setup-step ${d.has_yam ? 'ok' : 'warn'}" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+      <div style="flex:1; min-width:170px">
+        <b>${esc(d.name || 'станция')}</b>
+        <div class="muted small">${esc(d.ip)} · найдена: ${esc(d.source || 'сеть')}${d.model ? ' · ' + esc(d.model) : ''}</div>
+        ${d.has_yam ? '' : '<span class="advice">YAM не установлен: панель на этой колонке почти ничего не увидит. Сначала рут, затем установка YAM из «Чек-листа».</span>'}
+      </div>
+      ${d.has_yam ? '<span class="chip">YAM</span>' : '<span class="chip">без YAM</span>'}
+      ${d.ssh ? '<span class="chip">SSH</span>' : ''}
+      <button class="btn sm" data-pick="${esc(d.ip)}">Использовать</button>
+    </div>`).join('');
+  box.querySelectorAll('[data-pick]').forEach(button => button.onclick = () => {
+    const ip = button.dataset.pick;
+    $('cfgIp').value = ip;
+    $('cfgSave').click();
+    notify($('cfgStatus'), 'выбран IP станции: ' + ip, 'ok');
+  });
+}
+
 async function detectStation(silent = false) {
   if (detecting) return null;
   detecting = true;
@@ -194,10 +228,15 @@ async function detectStation(silent = false) {
   }
   try {
     const result = await api('/api/detect', { method: 'POST', body: '{}' });
+    renderDetectList(result.devices);
     if (result.found) {
       $('ipText').textContent = result.ip;
       $('cfgIp').value = result.ip;
       if (!silent) notify($('cfgStatus'), 'найдена колонка: ' + result.ip, 'ok');
+    } else if ((result.devices || []).length) {
+      $('statusText').textContent = 'найдены станции без YAM: ' + result.devices.length;
+      $('dot').className = 'dot off';
+      if (!silent) notify($('cfgStatus'), 'найдены станции без YAM — на них нужен рут и YAM', 'error');
     } else if (!silent) {
       $('statusText').textContent = 'колонка не найдена в подсети';
       $('dot').className = 'dot off';
@@ -255,7 +294,10 @@ async function refreshStatus() {
       : '<span class="muted small">нет данных (демон YAM недоступен)</span>';
 
     if (data.device) {
-      $('brandModel').textContent = `${prettyModel(data.device.model)} · ${data.device.architecture}`;
+      /* В шапке — только название модели (две строки вместо многоточия),
+         архитектура уходит в подсказку: в узком сайдбаре она не помещается. */
+      $('brandModel').textContent = prettyModel(data.device.model);
+      $('brandModel').title = `${prettyModel(data.device.model)} · ${data.device.architecture}`;
       document.title = `Панель Станции — ${prettyModel(data.device.model)}`;
       setDevicePhoto(data.device.model);
       setDeviceSpecs(data.device.model);
@@ -828,9 +870,27 @@ function drawChart(canvas, seriesKey, color, unit, cursorX) {
   const step = width / (values.length - 1) || 1;
   const yOf = i => height - 12 - ((values[i] - min) / span) * (height - 30);
 
-  // линия+заливка
+  // линия+заливка: монотонная кубическая интерполяция — плавная кривая без выбросов за min/max
   ctx.beginPath();
-  values.forEach((_, i) => { i ? ctx.lineTo(i * step, yOf(i)) : ctx.moveTo(0, yOf(0)); });
+  {
+    const n = values.length;
+    const slopes = [];
+    for (let i = 0; i < n - 1; i++) slopes.push((values[i + 1] - values[i]) / step);
+    const tangents = [slopes[0]];
+    for (let i = 1; i < n - 1; i++) {
+      if (slopes[i - 1] * slopes[i] <= 0) tangents.push(0);
+      else {
+        const w1 = 2 * step + step, w2 = step + 2 * step;
+        tangents.push((w1 + w2) / (w1 / slopes[i - 1] + w2 / slopes[i]));
+      }
+    }
+    tangents.push(slopes[n - 2]);
+    ctx.moveTo(0, yOf(0));
+    for (let i = 0; i < n - 1; i++) {
+      const x0 = i * step, x1 = (i + 1) * step, y0 = yOf(i), y1 = yOf(i + 1);
+      ctx.bezierCurveTo(x0 + step / 3, y0 + tangents[i] * step / 3, x1 - step / 3, y1 - tangents[i + 1] * step / 3, x1, y1);
+    }
+  }
   ctx.strokeStyle = color;
   ctx.lineWidth = 2;
   ctx.stroke();
@@ -846,11 +906,14 @@ function drawChart(canvas, seriesKey, color, unit, cursorX) {
   ctx.font = '12px ui-monospace, Consolas, monospace';
   ctx.fillText(`${values[values.length - 1].toFixed(1)} ${unit} · min ${min.toFixed(1)} · max ${max.toFixed(1)}`, 10, 16);
 
-  // тултип по позиции курсора
+  // тултип по позиции курсора: линейная интерполяция между точками — курсор движется плавно
   if (cursorX == null) return;
-  const index = Math.max(0, Math.min(values.length - 1, Math.round(cursorX / step)));
-  const x = index * step;
-  const y = yOf(index);
+  const f = Math.max(0, Math.min(values.length - 1, cursorX / step));
+  const i0 = Math.min(values.length - 2, Math.floor(f));
+  const frac = f - i0;
+  const value = values[i0] + (values[i0 + 1] - values[i0]) * frac;
+  const x = f * step;
+  const y = height - 12 - ((value - min) / span) * (height - 30);
 
   ctx.strokeStyle = color + '55';
   ctx.lineWidth = 1;
@@ -864,9 +927,9 @@ function drawChart(canvas, seriesKey, color, unit, cursorX) {
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  const ago = Math.round((values.length - 1 - index) * 3);
+  const ago = Math.round((values.length - 1 - f) * 3);
   const when = ago <= 1 ? 'сейчас' : ago + ' с назад';
-  const line = `${values[index].toFixed(1)} ${unit} · ${when}`;
+  const line = `${value.toFixed(1)} ${unit} · ${when}`;
   ctx.font = '12px "Segoe UI", system-ui';
   const w = ctx.measureText(line).width + 18;
   const bx = Math.min(Math.max(x - w / 2, 4), width - w - 4);
@@ -902,9 +965,9 @@ function drawCharts() {
 
 /* ------------------------- автонастройка ------------------------- */
 function setupRenderStep(step) {
-  const mark = step.ok ? '✓' : '✗';
   const cls = step.ok ? 'ok' : 'err';
-  return `<div class="setup-step ${cls}"><b>${mark} ${step.step}:</b> ${step.detail}</div>`;
+  const mark = step.ok ? svgIcon('check', 'ic-lvl-ok') : svgIcon('x', 'ic-lvl-high');
+  return `<div class="setup-step ${cls}"><b>${mark} ${esc(step.step)}:</b> ${esc(step.detail)}</div>`;
 }
 
 $('setupFull').onclick = async () => {
@@ -1084,6 +1147,17 @@ $('masterStart').onclick = async () => {
 };
 
 /* ------------------------------- система ------------------------------- */
+/* рекомендованный YAM-профиль подсветки по платформе колонки (YAM /api/device → model) */
+function ledProfileForModel(model) {
+  const m = String(model || '').toLowerCase();
+  if (!m) return null;
+  if (m.includes('mini2') || m === 'yandexmini_2') return 'mini2';
+  if (m.includes('micro')) return 'micro';
+  if (m.includes('plum')) return 'plum';
+  if (m.includes('midi')) return 'midi';
+  return null; // макс/станция/дуо и неизвестные — профиль не подбираем
+}
+
 async function loadSettings() {
   try {
     const [config, settings] = await Promise.all([api('/api/config'), yam('/settings')]);
@@ -1096,6 +1170,18 @@ async function loadSettings() {
     $('termPort').textContent = config.ssh_port;
 
     const led = settings.led || {};
+    const recommended = ledProfileForModel(state.status?.device?.model);
+    const autoKey = 'sp_ledAuto:' + (state.status?.device?.model || '?');
+    if (recommended && led.profile !== recommended && !localStorage.getItem(autoKey)) {
+      // автоподбор: один раз на модель; ручной выбор после этого не перебивается
+      try {
+        settings.led.profile = recommended;
+        await yam('/settings', { method: 'PUT', body: JSON.stringify(settings) });
+        localStorage.setItem(autoKey, '1');
+        led.profile = recommended;
+        notify($('yamStatus'), `профиль подсветки подобран по модели: ${recommended}`, 'ok');
+      } catch (_) { /* подберём при следующей загрузке */ }
+    }
     $('yamProfile').value = led.profile || 'mini2';
     $('yamCount').value = led.count || 6;
     $('yamBinaries').checked = !!settings.allow_plugin_binaries;
@@ -1106,6 +1192,333 @@ async function loadSettings() {
     notify($('yamStatus'), 'настройки демона недоступны: ' + error.message, 'error');
   }
 }
+
+/* ---------------------- каталог пакетов (реестр yapkg) ---------------------- */
+let catalogItems = [];
+
+async function loadCatalog() {
+  const box = $('catList');
+  box.textContent = 'загружаю реестр…';
+  try {
+    const data = await api('/api/packages/catalog');
+    catalogItems = data.items || [];
+    renderCatalog(catalogItems);
+  } catch (error) {
+    box.textContent = 'ошибка: ' + error.message;
+  }
+}
+
+function renderCatalog(items) {
+  $('catCount').textContent = items.length + ' шт';
+  $('catList').innerHTML = items.length ? items.map(item => `
+    <div class="setup-step" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+      <div style="flex:1; min-width:220px">
+        <b>${esc(item.name)}</b> <span class="muted small">v${esc(item.version || '?')} · id ${esc(item.id)}</span>
+        <div class="muted small" style="margin-top:2px">${esc(item.description || '')}</div>
+      </div>
+      ${item.running
+        ? '<span class="chip">работает</span>'
+        : item.installed
+          ? '<span class="chip">установлен</span>'
+          : `<button class="btn sm primary" data-catinstall="${esc(item.id)}">Установить</button>`}
+    </div>`).join('') : '<p class="muted small">пусто</p>';
+  $('catList').querySelectorAll('[data-catinstall]').forEach(btn => btn.onclick = () => installCatalogItem(btn.dataset.catinstall, btn));
+}
+
+async function installCatalogItem(id, btn) {
+  const busy = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'ставлю…';
+  try {
+    const result = await api('/api/packages/catalog/install', { method: 'POST', body: JSON.stringify({ id }) });
+    notify($('pkgStatus'), `пакет ${id} установлен (${result.version || ''}), автозапуск включён`, 'ok');
+    await loadCatalog();
+    await loadPlugins();
+  } catch (error) {
+    notify($('pkgStatus'), 'ошибка: ' + error.message, 'error');
+    btn.disabled = false;
+    btn.textContent = busy;
+  }
+}
+
+$('catRefresh').onclick = loadCatalog;
+$('catSearch').oninput = () => {
+  const q = $('catSearch').value.trim().toLowerCase();
+  renderCatalog(q ? catalogItems.filter(i => (i.name + ' ' + i.id + ' ' + i.description).toLowerCase().includes(q)) : catalogItems);
+};
+
+/* ---------------------- минидампы падений демонов ---------------------- */
+async function loadMinidumps() {
+  const box = $('mdList');
+  try {
+    const data = await api('/api/system/minidumps');
+    $('mdCount').textContent = `${data.items.length} шт${data.total ? ' · ' + data.total : ''}`;
+    box.textContent = data.items.length
+      ? data.items.map(i => `${i.date}  ${String(i.size).padStart(8)}  ${i.name}`).join('\n')
+      : 'падений не зафиксировано — каталог пуст';
+  } catch (error) {
+    box.textContent = 'ошибка: ' + error.message;
+  }
+}
+$('mdRefresh').onclick = loadMinidumps;
+
+/* ------------------------- аудит безопасности -------------------------
+   Только чтение: сканируем порты колонки с ПК, слушающих демонов и флаги
+   dropbear; показываем находки с подсказками. Ничего не выключаем. */
+const SEC_MARK = { high: 'warn', warn: 'warn', info: 'info', ok: 'check' };
+
+async function runSecurityAudit() {
+  const box = $('secFindings');
+  $('secChip').textContent = 'проверяю…';
+  box.textContent = 'сканирую порты и демонов колонки…';
+  try {
+    const data = await api('/api/security/audit');
+    box.innerHTML = (data.findings || []).map(f => {
+      const lvl = f.level === 'ok' ? 'ok' : f.level === 'high' ? 'err' : f.level;
+      const iconCls = f.level === 'high' ? 'ic-lvl-high' : f.level === 'warn' ? 'ic-lvl-warn' : f.level === 'ok' ? 'ic-lvl-ok' : 'ic-lvl-info';
+      return `<div class="setup-step ${lvl}"><b>${svgIcon(SEC_MARK[f.level] || 'info', iconCls)} ${esc(f.title)}</b>` +
+        (f.detail ? `${esc(f.detail)}` : '') +
+        (f.advice ? `<span class="advice">Что делать: ${esc(f.advice)}</span>` : '') + `</div>`;
+    }).join('');
+    const bad = (data.findings || []).filter(f => f.level === 'high').length;
+    const warn = (data.findings || []).filter(f => f.level === 'warn').length;
+    $('secChip').textContent = bad ? `${bad} критично` : warn ? `${warn} с осторожностью` : 'порядок';
+  } catch (error) {
+    box.textContent = 'ошибка: ' + error.message;
+    $('secChip').textContent = 'ошибка';
+  }
+}
+$('secAudit').onclick = runSecurityAudit;
+
+/* -------------------- редактор LED-анимаций --------------------
+   Кадры = палитры, раскладывающиеся на кольцо как пресеты; панель
+   гонит их циклом через YAM /led. Играет, пока открыта панель. */
+function ledAnimLoad() {
+  try { state.animFrames = JSON.parse(localStorage.getItem('sp_ledAnim') || 'null') || null; } catch (_) { state.animFrames = null; }
+  if (!Array.isArray(state.animFrames) || !state.animFrames.length) {
+    state.animFrames = [
+      { colors: ['#7A55FF', '#FF5A8A'], ms: 400 },
+      { colors: ['#FF5A8A', '#7A55FF'], ms: 400 },
+    ];
+  }
+  ledAnimRender();
+}
+
+function ledAnimSave() {
+  localStorage.setItem('sp_ledAnim', JSON.stringify(state.animFrames));
+}
+
+function ledAnimRender() {
+  const box = $('ledAnimFrames');
+  box.innerHTML = state.animFrames.map((frame, i) => `
+    <div class="setup-step" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+      <b style="min-width:34px">#${i + 1}</b>
+      <div class="led-grid" style="gap:6px">${frame.colors.map((c, j) =>
+        `<div class="led"><input type="color" value="${c}" data-animc="${i}.${j}"><span>${j + 1}</span></div>`).join('')}</div>
+      <label class="row" style="gap:5px; font-size:12px; color:var(--muted)"><input type="number" min="80" max="10000" step="20" value="${frame.ms}" data-animms="${i}" style="width:84px"> мс</label>
+      <button class="btn sm ghost" data-animup="${i}" title="выше">${svgIcon('up')}</button>
+      <button class="btn sm ghost" data-animdown="${i}" title="ниже">${svgIcon('down')}</button>
+      <button class="btn sm ghost" data-animdel="${i}" title="удалить">${svgIcon('x')}</button>
+    </div>`).join('') || '<p class="muted small">Кадров нет — добавь первый.</p>';
+  $('ledAnimChip').textContent = state.animFrames.length + ' кадр(ов)';
+  box.querySelectorAll('[data-animc]').forEach(input => input.oninput = () => {
+    const [fi, ci] = input.dataset.animc.split('.').map(Number);
+    state.animFrames[fi].colors[ci] = input.value.toUpperCase();
+    ledAnimSave();
+  });
+  box.querySelectorAll('[data-animms]').forEach(input => input.onchange = () => {
+    state.animFrames[+input.dataset.animms].ms = Math.max(80, Number(input.value) || 400);
+    ledAnimSave();
+  });
+  box.querySelectorAll('[data-animup]').forEach(btn => btn.onclick = () => {
+    const i = +btn.dataset.animup;
+    if (i === 0) return;
+    [state.animFrames[i - 1], state.animFrames[i]] = [state.animFrames[i], state.animFrames[i - 1]];
+    ledAnimSave(); ledAnimRender();
+  });
+  box.querySelectorAll('[data-animdown]').forEach(btn => btn.onclick = () => {
+    const i = +btn.dataset.animdown;
+    if (i >= state.animFrames.length - 1) return;
+    [state.animFrames[i + 1], state.animFrames[i]] = [state.animFrames[i], state.animFrames[i + 1]];
+    ledAnimSave(); ledAnimRender();
+  });
+  box.querySelectorAll('[data-animdel]').forEach(btn => btn.onclick = () => {
+    state.animFrames.splice(+btn.dataset.animdel, 1);
+    ledAnimSave(); ledAnimRender();
+  });
+}
+
+let ledAnimToken = 0;
+$('ledAnimAdd').onclick = () => {
+  const last = state.animFrames[state.animFrames.length - 1];
+  state.animFrames.push({ colors: (last?.colors || ['#7A55FF', '#FF5A8A']).slice(), ms: last?.ms || 400 });
+  ledAnimSave(); ledAnimRender();
+};
+$('ledAnimPlay').onclick = async () => {
+  if (!state.animFrames.length) { $('ledAnimStatus').textContent = 'Сначала добавь кадры.'; return; }
+  const token = ++ledAnimToken;
+  $('ledAnimChip').textContent = 'играет…';
+  let i = 0;
+  while (token === ledAnimToken) {
+    const frame = state.animFrames[i % state.animFrames.length];
+    i += 1;
+    try {
+      await yam('/led', { method: 'POST', body: JSON.stringify({ colors: ringColors(frame.colors) }) });
+    } catch (error) {
+      $('ledAnimStatus').textContent = 'колонка недоступна: ' + error.message;
+      $('ledAnimChip').textContent = 'ошибка';
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.max(80, frame.ms)));
+  }
+};
+$('ledAnimStop').onclick = () => {
+  ledAnimToken += 1;
+  $('ledAnimChip').textContent = 'остановлено';
+};
+
+/* -------------------- ночной профиль часов -------------------- */
+async function loadNightClock() {
+  try {
+    const data = await api('/api/clock/night');
+    $('nightEnabled').checked = !!data.enabled;
+    $('nightStart').value = data.start || '23:00';
+    $('nightEnd').value = data.end || '07:00';
+    $('nightBrightness').value = data.night_brightness ?? 12;
+    $('nightDay').value = data.day_brightness ?? 170;
+    $('nightStatus').textContent = data.enabled
+      ? (data.was_night ? 'сейчас ночное окно — держу низкую яркость' : 'включено, ждёт окна ' + data.start + '–' + data.end)
+      : 'выключено';
+  } catch (error) {
+    $('nightStatus').textContent = 'ошибка: ' + error.message;
+  }
+}
+
+$('nightSave').onclick = async () => {
+  const status = $('nightStatus');
+  try {
+    const data = await api('/api/clock/night', {
+      method: 'POST',
+      body: JSON.stringify({
+        enabled: $('nightEnabled').checked,
+        start: $('nightStart').value.trim(),
+        end: $('nightEnd').value.trim(),
+        night_brightness: Number($('nightBrightness').value),
+        day_brightness: Number($('nightDay').value),
+      })
+    });
+    status.textContent = data.enabled ? 'сохранено — включено, окно ' + data.start + '–' + data.end : 'сохранено — выключено';
+  } catch (error) {
+    status.textContent = 'ошибка: ' + error.message;
+  }
+};
+
+/* -------------------- системные звуки колонки -------------------- */
+async function loadSounds() {
+  const box = $('sndList');
+  try {
+    const data = await api('/api/sounds');
+    const sounds = data.sounds || [];
+    $('sndChip').textContent = sounds.length + ' шт';
+    box.innerHTML = sounds.map(s => `
+      <div class="setup-step" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+        <b style="min-width:250px">${esc(s.name)}</b>
+        <span class="muted small">${s.dir} · ${s.size} Б${s.backup ? ' · есть бэкап' : ''}</span>
+        <button class="btn sm ghost" data-sndplay="${s.name}" title="прослушать">${svgIcon('play')}</button>
+        <label class="btn sm file" style="padding:3px 10px">заменить<input type="file" accept=".opus,.ogg,.wav,.mp3,.m4a,.flac" data-sndfile="${s.name}" hidden></label>
+        ${s.backup ? `<button class="btn sm ghost" data-sndrestore="${s.name}" title="вернуть оригинал">${svgIcon('undo')}</button>` : ''}
+      </div>`).join('');
+    box.querySelectorAll('[data-sndplay]').forEach(btn => btn.onclick = () => {
+      const audio = $('sndAudio');
+      audio.style.display = '';
+      audio.src = '/api/sounds/file?name=' + encodeURIComponent(btn.dataset.sndplay);
+      audio.play().catch(() => {});
+    });
+    box.querySelectorAll('[data-sndfile]').forEach(input => input.onchange = async () => {
+      const name = input.dataset.sndfile;
+      const file = input.files[0];
+      if (!file) return;
+      $('sndStatus').textContent = 'конвертирую и заливаю ' + name + '…';
+      const form = new FormData();
+      form.append('name', name);
+      form.append('file', file);
+      try {
+        await api('/api/sounds/upload', { method: 'POST', body: form });
+        $('sndStatus').textContent = 'заменено: ' + name + '. Оригинал в бэкапе.';
+        await loadSounds();
+      } catch (error) {
+        $('sndStatus').textContent = 'ошибка: ' + error.message;
+      }
+    });
+    box.querySelectorAll('[data-sndrestore]').forEach(btn => btn.onclick = async () => {
+      $('sndStatus').textContent = 'восстанавливаю ' + btn.dataset.sndrestore + '…';
+      try {
+        await api('/api/sounds/restore', { method: 'POST', body: JSON.stringify({ name: btn.dataset.sndrestore }) });
+        $('sndStatus').textContent = 'оригинал возвращён: ' + btn.dataset.sndrestore;
+        await loadSounds();
+      } catch (error) {
+        $('sndStatus').textContent = 'ошибка: ' + error.message;
+      }
+    });
+  } catch (error) {
+    box.textContent = 'ошибка: ' + error.message;
+    $('sndChip').textContent = 'ошибка';
+  }
+}
+$('sndRefresh').onclick = loadSounds;
+
+/* ------------------------- чек-лист готовности -------------------------
+   Панель проверяет пакеты ПК, инструменты (ffmpeg/ffplay/yt-dlp), SSH-ключ,
+   плагины на колонке и демон слов; недостающее ставится кнопкой отсюда. */
+async function loadChecklist() {
+  const box = $('clList');
+  box.textContent = 'проверяю…';
+  $('clUpdated').textContent = '';
+  try {
+    renderChecklist(await api('/api/checklist'));
+    $('clUpdated').textContent = 'проверено ' + new Date().toLocaleTimeString();
+  } catch (error) {
+    box.textContent = 'ошибка: ' + error.message;
+  }
+}
+
+function renderChecklist(data) {
+  const items = data.items || [];
+  const done = items.filter(i => i.status === 'ok').length;
+  $('clSummary').textContent = `${done} из ${items.length} готово`;
+  $('clList').innerHTML = items.map(item => {
+    const ok = item.status === 'ok';
+    const icon = ok ? svgIcon('check', 'ic-lvl-ok') : svgIcon('warn', 'ic-lvl-warn');
+    return `<div class="setup-step ${ok ? 'ok' : 'warn'}" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+      <b style="min-width:24px">${icon}</b>
+      <div style="flex:1; min-width:220px">
+        <b>${esc(item.title)}</b>
+        <div class="muted small" style="margin-top:2px">${esc(item.detail || '')}${item.hint ? ' — ' + esc(item.hint) : ''}</div>
+      </div>
+      ${item.action ? `<button class="btn sm primary" data-clinstall="${item.id}">${esc(item.action)}</button>` : ''}
+    </div>`;
+  }).join('');
+  $('clList').querySelectorAll('[data-clinstall]').forEach(btn => btn.onclick = () => installChecklistItem(btn.dataset.clinstall, btn));
+}
+
+async function installChecklistItem(id, btn) {
+  const status = $('clStatus');
+  const busy = btn.textContent;
+  btn.disabled = true;
+  status.textContent = 'Устанавливаю: ' + id + (id === 'ffmpeg' ? ' — качается большой архив, это может занять пару минут…' : '…');
+  try {
+    const result = await api('/api/checklist/install', { method: 'POST', body: JSON.stringify({ id }) });
+    status.textContent = result.output || 'готово';
+    if (result.items) renderChecklist(result); else await loadChecklist();
+  } catch (error) {
+    status.textContent = 'Ошибка: ' + error.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = busy;
+  }
+}
+
+$('clRefresh').onclick = loadChecklist;
 
 $('cfgSave').onclick = async () => {
   try {
@@ -1298,7 +1711,78 @@ $('voiceDeploy').onclick = async () => {
   }
 };
 
-/* ------------------------- сказать на колонке ------------------------- */
+/* ------------------------- сказать на колонке -------------------------
+   Два движка: Эдж (бесплатный) и ElevenLabs (выше качество; API из РФ —
+   через прокси). Голос/интонации Эджа и фильтры интонаций работают в обоих. */
+async function sayLoadEngine() {
+  try {
+    const data = await api('/api/say/config');
+    sayApplyVisibility(data.engine, data);
+    $('sayEngine').value = data.engine;
+    if (data.has_key) $('sayKey').placeholder = 'ключ сохранён в панели — можно ввести новый';
+    $('sayModel').innerHTML = (data.models || []).map(m => `<option value="${m.id}" ${m.id === data.model ? 'selected' : ''}>${esc(m.name)}</option>`).join('');
+    $('sayProxy').value = data.proxy || '';
+    if (data.engine === 'elevenlabs' && data.has_key) await sayLoadElevenVoices(data.voice_id);
+  } catch (error) {
+    $('sayEngineHint').textContent = 'ошибка: ' + error.message;
+  }
+}
+
+function sayApplyVisibility(engine, data) {
+  const eleven = engine === 'elevenlabs';
+  const alice = engine === 'alice';
+  $('sayElevenBox').style.display = eleven ? '' : 'none';
+  $('sayVoice').style.display = eleven || alice ? 'none' : '';
+  // интонации работают только в синтезе (Эдж/ElevenLabs) — у Алисы фраза играется её движком
+  $('sayMood').style.display = alice ? 'none' : '';
+  $('sayEngineHint').textContent = alice
+    ? 'родной голос Алисы из облака; нужен вход в Яндекс (вкладка «Алиса»)'
+    : eleven
+    ? (data && data.has_key ? 'ключ задан' : 'ключ не задан')
+    : 'бесплатный синтез Microsoft';
+}
+
+async function sayLoadElevenVoices(selectedId) {
+  const v = await api('/api/say/voices?engine=elevenlabs').catch(() => null);
+  if (v && v.ok) {
+    $('sayVoiceEl').innerHTML = v.voices.map(x => `<option value="${x.id}" ${x.id === selectedId ? 'selected' : ''}>${esc(x.name)}</option>`).join('')
+      || '<option value="">голосов нет</option>';
+  } else if (v) {
+    $('sayEngineHint').textContent = v.detail || 'список голосов недоступен';
+  }
+  const q = await api('/api/say/quota').catch(() => null);
+  if (q && q.ok && typeof q.used === 'number') {
+    $('sayEngineHint').textContent = `символов: ${q.used} из ${q.limit} в этом месяце`;
+  }
+}
+
+$('sayEngine').onchange = () => {
+  const engine = $('sayEngine').value;
+  sayApplyVisibility(engine, { has_key: true });
+  if (engine === 'elevenlabs' && !$('sayVoiceEl').options.length) sayLoadElevenVoices('');
+};
+
+$('sayKeySave').onclick = async () => {
+  notify($('sayStatus'), 'сохраняю настройки голоса…');
+  try {
+    await api('/api/say/config', {
+      method: 'PUT',
+      body: JSON.stringify({
+        engine: $('sayEngine').value,
+        eleven_api_key: $('sayKey').value.trim(),
+        eleven_model: $('sayModel').value,
+        eleven_voice_id: $('sayVoiceEl').value,
+        eleven_proxy: $('sayProxy').value.trim()
+      })
+    });
+    $('sayKey').value = '';
+    notify($('sayStatus'), 'сохранено', 'ok');
+    await sayLoadEngine();
+  } catch (error) {
+    notify($('sayStatus'), 'ошибка: ' + error.message, 'error');
+  }
+};
+
 $('sayBtn').onclick = async () => {
   const text = $('sayText').value.trim();
   if (!text) {
@@ -1310,15 +1794,21 @@ $('sayBtn').onclick = async () => {
   try {
     await api('/api/speaker/say', {
       method: 'POST',
-      body: JSON.stringify({ text, voice: $('sayVoice').value, mood: $('sayMood').value })
+      body: JSON.stringify({
+        text,
+        engine: $('sayEngine').value,
+        voice: $('sayEngine').value === 'elevenlabs' ? $('sayVoiceEl').value : $('sayVoice').value,
+        mood: $('sayMood').value
+      })
     });
-    notify($('sayStatus'), 'колонка произнесла текст', 'ok');
+    notify($('sayStatus'), $('sayEngine').value === 'alice' ? 'Алиса произнесла текст' : 'колонка произнесла текст', 'ok');
   } catch (error) {
     notify($('sayStatus'), 'ошибка: ' + error.message, 'error');
   } finally {
     $('sayBtn').disabled = false;
   }
 };
+sayLoadEngine();
 
 /* ------------------------- файловый менеджер ------------------------- */
 let filesCurrent = '/data';
@@ -1376,12 +1866,14 @@ async function loadFiles(path) {
           actions.appendChild(dl);
           if (!entry.is_dir) {
             const edit = document.createElement('span');
-            edit.textContent = '✏ ';
+            edit.innerHTML = svgIcon('pencil');
+            edit.style.cursor = 'pointer';
             edit.onclick = event => { event.stopPropagation(); openFileEditor(path + '/' + entry.name); };
             actions.appendChild(edit);
           }
           const del = document.createElement('span');
-          del.textContent = '✕';
+          del.innerHTML = svgIcon('x');
+          del.style.cursor = 'pointer';
           del.onclick = async event => {
             event.stopPropagation();
             if (!confirm('Удалить ' + (entry.is_dir ? 'папку со всем содержимым' : 'файл') + ' ' + name + '?')) return;
@@ -1540,15 +2032,22 @@ async function musicStatus() {
   try {
     const data = await api('/api/music/status');
     const s = data.soundya || {};
-    $('soundyaChip').textContent = s.running ? 'работает' : 'остановлен';
+    $('soundyaPanel').style.display = s.installed === false ? 'none' : '';
+    $('soundyaChip').textContent = s.running ? 'работает' : (s.installed === false ? 'не установлен' : 'остановлен');
     $('soundyaStatus').textContent = s.raw || '';
     const p = data.spotiya || {};
+    $('spotiyaPanel').style.display = p.installed === false ? 'none' : '';
     spotiyaPaused = !!p.paused;
     if (typeof p.volume === 'number') spotiyaVolume = p.volume;
     $('spotiyaChip').textContent = p.installed ? (p.active ? (p.paused ? 'на паузе' : 'играет') : 'готов') : 'не установлен';
     $('spotiyaStatus').textContent = p.installed
       ? `${p.artist ? p.artist + ' — ' : ''}${p.title || 'ничего не играет'} · громкость ${p.volume ?? '?'} · голос ${p.voice ? 'ВКЛ(!)' : 'выкл'} · AirPlay ${p.airplay ? 'работает' : 'выкл'}${p.error ? ' · ' + p.error : ''}`
       : (p.raw || '');
+    const missing = [];
+    if (s.installed === false) missing.push('SoundCloud (soundya)');
+    if (p.installed === false) missing.push('Spotify (spotiya)');
+    $('musicMissing').style.display = missing.length ? '' : 'none';
+    $('musicMissing').textContent = missing.length ? `Не установлено: ${missing.join(', ')}. Поставить можно во вкладке «Пакеты».` : '';
   } catch (error) {
     $('soundyaChip').textContent = 'ошибка';
   }
@@ -1745,8 +2244,8 @@ function wwRenderEnroll() {
   $('wwAmbientMsg').textContent = e.has_ambient ? 'записано' : '';
   $('wwSpeechMsg').textContent = e.speech_secs > 0 ? 'записано' : '';
   $('wwTakes').innerHTML = (e.takes || []).map((d, i) => `<span class="ww-take">#${i + 1} ${Number(d).toFixed(2)} с
-      <button class="btn sm ghost" data-ww-play-take="${i}" title="Послушать">▶</button>
-      <button class="btn sm ghost" data-ww-del-take="${i}" title="Удалить">✕</button></span>`).join('');
+      <button class="btn sm ghost" data-ww-play-take="${i}" title="Послушать">${svgIcon('play')}</button>
+      <button class="btn sm ghost" data-ww-del-take="${i}" title="Удалить">${svgIcon('x')}</button></span>`).join('');
 }
 
 /* срабатывания */
@@ -1908,6 +2407,12 @@ function appearanceApply() {
   });
   const glassBox = $('glassCursor');
   if (glassBox) glassBox.checked = !!appearance.glass;
+  const glassQuick = $('glassQuick');
+  if (glassQuick) {
+    glassQuick.classList.toggle('active', !!appearance.glass);
+    const label = $('glassQuickLabel');
+    if (label) label.textContent = appearance.glass ? 'Пузырь: вкл' : 'Пузырь: выкл';
+  }
 }
 
 APPEARANCE_GROUPS.forEach(([groupId, key]) => {
@@ -1925,6 +2430,14 @@ APPEARANCE_GROUPS.forEach(([groupId, key]) => {
 const glassBox = $('glassCursor');
 if (glassBox) glassBox.addEventListener('change', () => {
   appearance.glass = glassBox.checked;
+  appearanceSave();
+  appearanceApply();
+});
+
+/* быстрый тумблер пузыря в сайдбаре — переключает тот же glass-флаг */
+const glassQuick = $('glassQuick');
+if (glassQuick) glassQuick.addEventListener('click', () => {
+  appearance.glass = !appearance.glass;
   appearanceSave();
   appearanceApply();
 });
@@ -1963,11 +2476,29 @@ async function refreshVolume() {
     const data = await api('/api/volume');
     if (data && data.ok) {
       renderVolume(data.volume);
-      if (volumeStatus) volumeStatus.textContent = 'Сейчас: ' + data.volume + '%';
+      const parts = ['Сейчас: ' + data.volume + '%'];
+      if (typeof data.pc === 'number') parts.push('ПК: ' + data.pc + '%');
+      if (volumeSync && volumeSync.checked !== !!data.sync) volumeSync.checked = !!data.sync;
+      if (volumeStatus) volumeStatus.textContent = parts.join(' · ');
     }
   } catch (e) {
     if (volumeStatus) volumeStatus.textContent = 'Громкость недоступна: ' + e.message;
   }
+}
+
+const volumeSync = $('volumeSync');
+if (volumeSync) {
+  volumeSync.onchange = async () => {
+    try {
+      const data = await api('/api/volume/sync', { method: 'POST', body: JSON.stringify({ enabled: volumeSync.checked }) });
+      if (volumeStatus) volumeStatus.textContent = data.sync
+        ? 'Синхронизация включена: громкость ПК повторяется на колонке (колонка → ползунок обновляется сам)'
+        : 'Синхронизация выключена';
+    } catch (error) {
+      if (volumeStatus) volumeStatus.textContent = 'ошибка: ' + error.message;
+      volumeSync.checked = !volumeSync.checked;
+    }
+  };
 }
 
 if (volumeRange) {
@@ -1992,6 +2523,272 @@ if (volumeRange) {
   });
 }
 
+/* ------------------------- настройки Алисы -------------------------
+   Локальные настройки колонки из user_config.dat (protobuf с JSON внутри):
+   тумблеры звука/быстрых команд/DND/звонков/Wi-Fi, имя устройства, Matter. */
+const ALICE_TOGGLES = [
+  { id: 'a-adaptive', path: 'account_config.aliceAdaptiveVolume.enabled' },
+  { id: 'a-crossfade', path: 'account_config.audio_player.crossfadeEnabled' },
+  { id: 'a-jingle', path: 'account_config.jingle' },
+  { id: 'a-alwayson', path: 'account_config.alwaysOnMicForShortcuts' },
+  { id: 'a-m-playpause', path: 'account_config.enabledCommandSpotters.music.playAndPause' },
+  { id: 'a-m-volume', path: 'account_config.enabledCommandSpotters.music.volume' },
+  { id: 'a-m-tracks', path: 'account_config.enabledCommandSpotters.music.navigation' },
+  { id: 'a-m-feedback', path: 'account_config.enabledCommandSpotters.music.feedback' },
+  { id: 'a-m-bt', path: 'account_config.enabledCommandSpotters.music.bluetooth' },
+  { id: 'a-tv-nav', path: 'account_config.enabledCommandSpotters.tv.navigation' },
+  { id: 'a-tv-home', path: 'account_config.enabledCommandSpotters.tv.backToHome' },
+  { id: 'a-sh-light', path: 'account_config.enabledCommandSpotters.smartHome.light' },
+  { id: 'a-sh-tv', path: 'account_config.enabledCommandSpotters.smartHome.tv' },
+  { id: 'a-call-answer', path: 'account_config.enabledCommandSpotters.call.answer' },
+  { id: 'a-dnd', path: 'device_config.dndMode.enabled' },
+  { id: 'a-dnd-calls', path: 'device_config.dndMode.features.allowIncomingCalls' },
+  { id: 'a-calls', path: 'system_config.phone_calls.enabled' },
+  { id: 'a-wifi-auto', path: 'system_config.wifi_capability.reassociateWhenNoInternet' },
+];
+
+const aliceDeep = (config, path) => path.split('.').reduce((obj, key) => (obj == null ? obj : obj[key]), config);
+const ACCESS_NAMES = { without: 'без ограничений', moderate: 'умеренный', children: 'детский', kids: 'для малышей', toddlers: 'для малышей' };
+
+async function aliceSet(path, value, source) {
+  try {
+    await api('/api/alice/settings', { method: 'PUT', body: JSON.stringify({ sets: [{ path, value }] }) });
+    const label = source && source.label ? ` «${source.label}»` : '';
+    $('aliceUpdated').textContent = `сохранено${label} — применится после перезагрузки колонки`;
+  } catch (err) {
+    if (source && source.type === 'checkbox') source.el.checked = !source.el.checked;
+    $('aliceUpdated').textContent = 'ошибка: ' + err.message;
+  }
+}
+
+async function loadAlice() {
+  const data = await api('/api/alice/settings');
+  const config = data.config || {};
+  ALICE_TOGGLES.forEach(item => {
+    const el = $(item.id);
+    if (!el) return;
+    const value = aliceDeep(config, item.path);
+    if (typeof value === 'boolean') el.checked = value;
+    el.disabled = false;
+  });
+  const labelOf = { 'a-adaptive': 'адаптивная громкость', 'a-crossfade': 'кроссфейд', 'a-jingle': 'звук активации', 'a-alwayson': 'слушать без «Алисы»' };
+  ALICE_TOGGLES.forEach(item => {
+    const el = $(item.id);
+    if (!el || el.dataset.aliceBound) return;
+    el.dataset.aliceBound = '1';
+    el.onchange = () => aliceSet(item.path, el.checked, { type: 'checkbox', el, label: labelOf[item.id] || item.path.split('.').pop() });
+  });
+  $('a-name').value = typeof config.device_config?.name === 'string' ? config.device_config.name : '';
+  $('a-locale').textContent = config.device_config?.locale || '—';
+  const spotter = config.account_config?.spotter;
+  $('a-spotter').textContent = spotter === 'alisa' ? '«Алиса»' : (spotter || '—');
+  $('a-access').textContent = ACCESS_NAMES[config.account_config?.contentAccess] || config.account_config?.contentAccess || '—';
+  $('a-child-access').textContent = ACCESS_NAMES[config.account_config?.childContentAccess] || config.account_config?.childContentAccess || '—';
+}
+
+async function loadAliceWifi() {
+  const data = await api('/api/alice/wifi');
+  const nets = data.networks || [];
+  const box = $('aWifiNets');
+  if (!nets.length) {
+    box.innerHTML = '<p class="muted small" style="margin:0">Сохранённых сетей не найдено.</p>';
+  } else {
+    box.innerHTML = nets.map((net, i) => {
+      const psk = net.psk ? '•'.repeat(Math.min(net.psk.length, 12)) : '—';
+      return `<p class="muted small" style="margin:0 0 4px">Сеть ${i + 1}: <b>${esc(net.ssid || '(без имени)')}</b> · пароль: <span class="mono">${esc(psk)}</span></p>`;
+    }).join('');
+  }
+  const wd = data.watchdog;
+  if (wd === 'ok') $('aWifiStatus').textContent = 'Прошлая смена пароля прошла успешно, связь стабильна.';
+  else if (wd === 'rolled_back') $('aWifiStatus').textContent = 'Прошлая попытка не удалась: конфиг был откатен к прежнему паролю.';
+}
+
+async function loadAliceMatter() {
+  const data = await api('/api/alice/matter');
+  const box = $('aMatterList');
+  box.textContent = (data.records && data.records.length)
+    ? data.records.join('\n')
+    : 'Устройств Matter не найдено. Подключите первое через приложение: «Подключение умных устройств» → «Matter».';
+}
+
+function loadAliceAll() {
+  $('aliceUpdated').textContent = '';
+  loadAlice().catch(err => { $('aliceUpdated').textContent = 'ошибка загрузки: ' + err.message; });
+  loadAliceCloud().catch(err => { $('cloudStatus').textContent = 'облако: ' + err.message; });
+  loadAliceWifi().catch(() => {});
+  loadAliceMatter().catch(() => { $('aMatterList').textContent = 'не удалось прочитать базу Matter'; });
+}
+
+$('aNameSave').onclick = async () => {
+  const name = $('a-name').value.trim();
+  if (!name) { $('aliceUpdated').textContent = 'имя не может быть пустым'; return; }
+  await aliceSet('device_config.name', name, { type: 'name' });
+};
+
+$('aWifiEye').onclick = () => {
+  const input = $('aWifiPsk');
+  input.type = input.type === 'password' ? 'text' : 'password';
+};
+
+$('aWifiSave').onclick = async () => {
+  const psk = $('aWifiPsk').value;
+  const status = $('aWifiStatus');
+  if (psk.length < 8 || psk.length > 63) { status.textContent = 'Пароль WPA: от 8 до 63 символов.'; return; }
+  status.textContent = 'Применяю: записываю конфиг и перечитываю wpa_supplicant…';
+  try {
+    await api('/api/alice/wifi/password', { method: 'PUT', body: JSON.stringify({ psk }) });
+  } catch (err) {
+    status.textContent = 'Ошибка: ' + err.message;
+    return;
+  }
+  $('aWifiPsk').value = '';
+  const deadline = Date.now() + 110000;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    let watchdog = '';
+    try {
+      const data = await api('/api/alice/wifi');
+      watchdog = data.watchdog || '';
+    } catch (_) { /* колонка могла мигнуть сетью — продолжаем опрос */ }
+    if (watchdog === 'ok') { status.textContent = 'Готово: колонка на связи с новым паролем.'; return; }
+    if (watchdog === 'rolled_back') { status.textContent = 'Связь не восстановилась — пароль откачен к прежнему.'; return; }
+    status.textContent = 'Жду подключения колонки… (' + Math.round((deadline - Date.now()) / 1000) + ' с)';
+  }
+  status.textContent = 'Статус неизвестен: проверьте связь с колонкой.';
+};
+
+/* --------------- облачные функции (кука аккаунта Яндекса) ---------------
+   Панель обменивает куку на x_token паспорта и ходит в те же API, что
+   приложение «Дом с Алисой» (iot.quasar.yandex.ru). Значения применяются
+   в облаке мгновенно и спускаются на колонку без перезагрузки. */
+const CLOUD_TOGGLES = [
+  { id: 'c-dj', label: 'режим DJ' },
+  { id: 'c-whisper', label: 'ответ шепотом' },
+  { id: 'c-sh-silent', label: 'умный дом без лишних слов' },
+  { id: 'c-hide-orders', label: 'скрывать названия товаров' },
+];
+
+function cloudBindOnce() {
+  if ($('cloudSave').dataset.bound) return;
+  $('cloudSave').dataset.bound = '1';
+  $('cloudSave').onclick = async () => {
+    const status = $('cloudStatus');
+    const cookie = $('cloudCookie').value.trim();
+    if (!cookie) { status.textContent = 'Вставьте строку Cookie (key=value; …).'; return; }
+    status.textContent = 'Обмениваю куку на токен паспорта…';
+    try {
+      const r = await api('/api/alice/cloud', { method: 'PUT', body: JSON.stringify({ cookie }) });
+      $('cloudCookie').value = '';
+      status.textContent = 'Кука принята: аккаунт ' + (r.login || '?') + '.';
+      await loadAliceCloud();
+    } catch (err) {
+      status.textContent = 'Ошибка: ' + err.message;
+    }
+  };
+  $('cloudForget').onclick = async () => {
+    await api('/api/alice/cloud', { method: 'DELETE' }).catch(() => {});
+    await loadAliceCloud();
+  };
+  CLOUD_TOGGLES.forEach(item => {
+    const el = $(item.id);
+    el.onchange = async () => {
+      try {
+        await api('/api/alice/cloud/settings', { method: 'POST', body: JSON.stringify({ id: item.id, value: el.checked }) });
+        $('cloudStatus').textContent = `Применено в облаке: ${item.label}.`;
+      } catch (err) {
+        el.checked = !el.checked;
+        $('cloudStatus').textContent = 'Ошибка облака: ' + err.message;
+      }
+    };
+  });
+  const devicesDetails = $('cloudDevices').closest('details');
+  devicesDetails.ontoggle = async () => {
+    if (!devicesDetails.open || devicesDetails.dataset.loaded) return;
+    devicesDetails.dataset.loaded = '1';
+    try {
+      const r = await api('/api/alice/cloud/devices');
+      $('cloudDevices').textContent = (r.speakers || []).map(s =>
+        `${s.online ? '●' : '○'} ${s.name} (${s.platform || 'платформа ?'}) — ${s.house || 'без дома'} — id ${s.id}`
+      ).join('\n') || 'колонок в облаке не найдено';
+      if (r.login && $('cloudLogin').textContent === '—') $('cloudLogin').textContent = r.login;
+    } catch (err) {
+      devicesDetails.dataset.loaded = '';
+      $('cloudDevices').textContent = 'ошибка: ' + err.message;
+    }
+  };
+  const configDetails = $('cloudConfig').closest('details');
+  configDetails.ontoggle = async () => {
+    if (!configDetails.open || configDetails.dataset.loaded) return;
+    configDetails.dataset.loaded = '1';
+    try {
+      const r = await api('/api/alice/cloud/config');
+      $('cloudConfig').textContent = JSON.stringify(r.config, null, 2);
+    } catch (err) {
+      configDetails.dataset.loaded = '';
+      $('cloudConfig').textContent = 'ошибка: ' + err.message;
+    }
+  };
+}
+
+async function loadAliceCloud() {
+  cloudBindOnce();
+  const data = await api('/api/alice/cloud');
+  const status = $('cloudStatus');
+  if (!data.configured) {
+    status.textContent = 'Кука не задана — вставьте её по инструкции ниже, чтобы открыть облачные тумблеры.';
+    $('cloudForm').style.display = '';
+    $('cloudAfter').style.display = 'none';
+    return;
+  }
+  $('cloudForm').style.display = 'none';
+  $('cloudAfter').style.display = '';
+  status.textContent = data.session_open ? 'Облачная сессия открыта.' : 'Токен сохранён; сессия откроется при первом переключении.';
+  $('cloudLogin').textContent = data.login || '—';
+  try {
+    const s = await api('/api/alice/cloud/settings');
+    if (s.ok) {
+      const st = (s.settings && s.settings.settings) || s.settings || {};
+      const set = (id, v) => { if (typeof v === 'boolean') $(id).checked = v; };
+      set('c-dj', st.music ? st.music.announce_tracks : undefined);
+      set('c-whisper', st.tts_whisper);
+      set('c-sh-silent', st.iot && st.iot.response_reaction_type ? st.iot.response_reaction_type === 'sound' : undefined);
+      set('c-hide-orders', st.order ? st.order.hide_item_names : undefined);
+    }
+  } catch (_) { /* чтение состояния не поддержано облаком — тумблеры остаются как есть */ }
+}
+
+/* ----------------------------- 3D tilt карточек -----------------------------
+   .card и .panel наклоняются за курсором (inline-перспектива + rotateX/Y) и
+   подсвечиваются бликом (--glare-x/--glare-y, CSS в style.css). Включаем только
+   при точном указателе (мышь) и без prefers-reduced-motion — на тач-устройствах
+   класс .tilt не ставится вовсе; элементы с .no-tilt пропускаются. */
+(function initTilt() {
+  if (!matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  document.querySelectorAll('.card, .panel').forEach(el => {
+    if (el.classList.contains('no-tilt') || el.querySelector('.term-wrap')) return;
+    const maxAngle = el.classList.contains('card') ? 7 : 4;
+    el.classList.add('tilt');
+    el.addEventListener('pointermove', event => {
+      if (event.pointerType !== 'mouse') return;
+      const rect = el.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;   // скрытая секция — не считаем
+      const x = (event.clientX - rect.left) / rect.width - 0.5;
+      const y = (event.clientY - rect.top) / rect.height - 0.5;
+      el.classList.add('live');
+      el.style.transform = `perspective(900px) rotateX(${(-y * maxAngle).toFixed(2)}deg) rotateY(${(x * maxAngle).toFixed(2)}deg)`;
+      el.style.setProperty('--glare-x', ((x + 0.5) * 100).toFixed(1) + '%');
+      el.style.setProperty('--glare-y', ((y + 0.5) * 100).toFixed(1) + '%');
+    });
+    el.addEventListener('pointerleave', () => {
+      el.classList.remove('live');
+      el.style.transform = '';
+      el.style.removeProperty('--glare-x');
+      el.style.removeProperty('--glare-y');
+    });
+  });
+})();
+
 /* -------------------------------- запуск -------------------------------- */
 (async function start() {
   showTab(localStorage.getItem('sp_tab') || 'overview');
@@ -2014,6 +2811,6 @@ if (volumeRange) {
 
   setInterval(refreshStatus, 5000);
   setInterval(refreshSensors, 3000);
-  setInterval(() => { if ($('tab-overview').classList.contains('active')) refreshVolume(); }, 30000);
+  setInterval(() => { if (!document.hidden) refreshVolume(); }, 3000);
   setInterval(() => { if ($('tab-plugins').classList.contains('active')) loadPlugins(); }, 15000);
 })();
