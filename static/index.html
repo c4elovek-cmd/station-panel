@@ -22,7 +22,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Nunito:wght@400;600;700&family=JetBrains+Mono:wght@400;500&family=Playfair+Display:wght@500;600&display=swap">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
-<link rel="stylesheet" href="/static/style.css?v=20261031">
+<link rel="stylesheet" href="/static/style.css?v=20261032">
 </head>
 <body>
 <!-- SVG-спрайт иконок: <svg class="ic"><use href="#i-имя"/></svg>. Стиль — как у навигации -->
@@ -902,6 +902,24 @@ scp -P 2222 file.txt root@192.168.0.172:/tmp/</pre>
         </div>
 
         <div class="panel">
+          <h3>Развернуть панель на сервере (VPS по SFTP)</h3>
+          <p class="muted small" style="margin:0 0 8px">Панель упакует себя (сервер, статика, мост, chisel, супервизор) и зальёт на свежий сервер хостинга по SFTP. На сервере нужен образ Python (например, «python generic» в LymuCloud). Порт панели — внешний порт сервера (его выдаёт хостинг), он же пойдёт в chisel.env колонки. Потребуется ~20 МБ.</p>
+          <div class="row wrap">
+            <input class="input" id="vpsHost" placeholder="адрес SFTP (например, moscow-1.lymucloud.ru)" style="flex:1; min-width:200px">
+            <input class="input" id="vpsPort" value="2022" style="width:90px">
+            <input class="input" id="vpsUser" placeholder="логин SFTP" style="flex:1; min-width:160px">
+            <input class="input" id="vpsPass" type="password" placeholder="пароль SFTP" style="flex:1; min-width:160px">
+          </div>
+          <div class="row wrap" style="margin-top:8px">
+            <input class="input" id="vpsPanelPort" placeholder="порт панели на сервере (например 19170)" style="width:240px">
+            <label class="check"><input type="checkbox" id="vpsKeys" checked> скопировать SSH-ключи колонки</label>
+            <label class="check"><input type="checkbox" id="vpsTunnel" checked> настроить туннель на колонке</label>
+            <button class="btn primary" id="vpsDeployBtn">Развернуть</button>
+          </div>
+          <pre class="pre" id="vpsLog" style="display:none; max-height:260px; margin-top:10px"></pre>
+        </div>
+
+        <div class="panel">
           <h3>Обновления панели</h3>
           <p class="muted small" id="panelUpdInfo" style="margin:0 0 8px">Обновления из GitHub ещё ни разу не проверялись.</p>
           <label class="check"><input type="checkbox" id="panelUpdAuto"> Автопроверка раз в сутки</label>
@@ -1100,7 +1118,7 @@ scp -P 2222 file.txt root@192.168.0.172:/tmp/</pre>
 
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/addon-fit.js"></script>
-<script src="/static/app.js?v=20261031"></script>
+<script src="/static/app.js?v=20261032"></script>
 <script>
 /* liquid-glass кружок за курсором — декоративный, pointer-events:none в CSS */
 (function () {

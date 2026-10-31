@@ -13,3 +13,4 @@ websockets>=12
 zeroconf>=0.131
 # опционально: локальный TTS в панели (на сервере можно убрать вместе с say_engine=edge)
 edge-tts>=6.1
+paramiko>=3.4  # автоустановка панели на VPS по SFTP

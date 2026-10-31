@@ -1686,6 +1686,65 @@ if ($('panelUpdAuto').checked) {
   setInterval(() => panelUpdateCheck(true), 24 * 3600 * 1000);
 }
 
+/* ------------------- развернуть панель на сервере (SFTP) ------------------- */
+let vpsPoll = null;
+
+$('vpsDeployBtn').onclick = async () => {
+  const host = $('vpsHost').value.trim();
+  const user = $('vpsUser').value.trim();
+  const pass = $('vpsPass').value;
+  const panelPort = Number($('vpsPanelPort').value) || 0;
+  const setupTunnel = $('vpsTunnel').checked;
+  if (!host || !user || !pass) {
+    $('vpsLog').style.display = '';
+    $('vpsLog').textContent = 'заполни адрес, логин и пароль SFTP';
+    return;
+  }
+  if (setupTunnel && !panelPort) {
+    $('vpsLog').style.display = '';
+    $('vpsLog').textContent = 'укажи порт панели на сервере — он нужен для туннеля колонки';
+    return;
+  }
+  const btn = $('vpsDeployBtn');
+  btn.disabled = true;
+  $('vpsLog').style.display = '';
+  $('vpsLog').textContent = 'подключаюсь…';
+  try {
+    const r = await api('/api/vps/deploy', {
+      method: 'POST',
+      body: JSON.stringify({
+        host, user, password: pass,
+        port: Number($('vpsPort').value) || 22,
+        panel_port: panelPort,
+        include_keys: $('vpsKeys').checked,
+        setup_tunnel: setupTunnel,
+      }),
+    });
+    vpsPollJob(r.job, btn);
+  } catch (error) {
+    $('vpsLog').textContent = 'ошибка: ' + error.message;
+    btn.disabled = false;
+  }
+};
+
+function vpsPollJob(jobId, btn) {
+  if (vpsPoll) clearInterval(vpsPoll);
+  vpsPoll = setInterval(async () => {
+    let s;
+    try {
+      s = await api('/api/vps/deploy/status?job=' + jobId);
+    } catch (e) {
+      return; // transient
+    }
+    $('vpsLog').textContent = s.lines.join('\n') + '\n[' + s.status + ']';
+    if (s.ok !== null) {
+      clearInterval(vpsPoll);
+      vpsPoll = null;
+      btn.disabled = false;
+    }
+  }, 2000);
+}
+
 /* ------------------------- голосовые команды ------------------------- */
 async function loadVoiceConfig() {
   try {

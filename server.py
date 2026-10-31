@@ -2254,7 +2254,7 @@ async def sftp_probe() -> dict[str, Any]:
     try:
         async with await ssh_connect() as conn:
             try:
-                sftp = await conn.start_sftp()
+                sftp = await conn.start_sftp_client()
                 await sftp.listdir(".")
                 return {"sftp": "subsystem", "detail": "SFTP-подсистема доступна"}
             except (asyncssh.SFTPError, OSError, NotImplementedError) as exc:
@@ -2283,6 +2283,196 @@ def _probe_ip_sync(ip: str) -> str | None:
         except Exception:
             continue
     return None
+
+
+# --------------------------------------------------------------------------- #
+# развёртывание панели на VPS по SFTP
+# --------------------------------------------------------------------------- #
+VPS_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _vps_requirements() -> bytes:
+    """requirements для контейнера: linux-набор + websockets для WS-терминала."""
+    text = (BASE / "requirements-linux.txt").read_text(encoding="utf-8")
+    if "websockets" not in text:
+        text += "\n# WS uvicorn (терминал в браузере; на VPS uvicorn без [standard])\nwebsockets>=12\n"
+    return text.encode("utf-8")
+
+
+def _vps_config_payload() -> bytes:
+    """Конфиг для сервера: станция приходит через chisel-туннель (127.0.0.1),
+    панель слушает только localhost, пароль панели наследуется."""
+    payload = {
+        "station_ip": "127.0.0.1",
+        "ssh_port": int(cfg.get("ssh_port", 2222)),
+        "ssh_user": cfg.get("ssh_user", "root"),
+        "yam_port": int(cfg.get("yam_port", 8099)),
+        "wakeword_port": int(cfg.get("wakeword_port", 8780)),
+        "panel_port": 8787,
+        "panel_host": "127.0.0.1",
+        "password_salt": cfg.get("password_salt", ""),
+        "password_hash": cfg.get("password_hash", ""),
+        "session_hours": cfg.get("session_hours", 72),
+        "voice_bridge_url": "http://127.0.0.1:8765/api/voice",
+        "voice_bridge_token": cfg.get("voice_bridge_token", ""),
+        "voice_music_source": cfg.get("voice_music_source", "youtube"),
+        "bridge_enabled": False,
+        "say_engine": "ipc",
+        "yandex_x_token": cfg.get("yandex_x_token", ""),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _vps_package(include_keys: bool) -> list[tuple[str, Any, int]]:
+    """Состав поставки: (путь на сервере, источник: путь или bytes, права)."""
+    items: list[tuple[str, Any, int]] = [
+        ("app.py", BASE / "deploy" / "container" / "app.py", 0o755),
+        ("chisel", BASE / "deploy" / "bin" / "chisel", 0o755),
+        ("requirements.txt", _vps_requirements(), 0o644),
+        ("panel/server.py", BASE / "server.py", 0o644),
+        ("panel/config.json", _vps_config_payload(), 0o600),
+        ("bridge/app.py", (BASE.parent / "voice-bridge" / "app.py"), 0o644),
+        ("bridge/bridge-config.json",
+         json.dumps({"source": cfg.get("voice_music_source", "youtube")}).encode("utf-8"), 0o644),
+    ]
+    if include_keys:
+        for name in ("id_ed25519", "id_ed25519.pub"):
+            p = BASE / "keys" / name
+            if p.exists():
+                items.append((f"panel/keys/{name}", p, 0o600 if name == "id_ed25519" else 0o644))
+    for p in STATIC_DIR.rglob("*"):
+        if p.is_file():
+            items.append((f"panel/static/{p.relative_to(STATIC_DIR).as_posix()}", p, 0o644))
+    return items
+
+
+async def _vps_deploy_job(job_id: str, host: str, port: int, user: str,
+                          password: str, panel_port: int, include_keys: bool,
+                          setup_tunnel: bool) -> None:
+    """Залить поставку по SFTP (paramiko: wings-серверы нестабильны на asyncssh)
+    и, при желании, переподключить туннель колонки."""
+    job = VPS_JOBS[job_id]
+    job["status"] = "подключение"
+
+    def log(line: str) -> None:
+        job["lines"].append(line)
+
+    def sync_upload() -> None:
+        try:
+            import paramiko
+        except ImportError as exc:
+            raise RuntimeError("нет пакета paramiko: pip install paramiko") from exc
+
+        transport = paramiko.Transport((host, port))
+        transport.connect(username=user, password=password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        log(f"подключено: {host}:{port}")
+
+        package = _vps_package(include_keys)
+        made_dirs: set[str] = set()
+
+        def ensure_dir(rdir: str) -> None:
+            if not rdir or rdir in made_dirs:
+                return
+            parent = str(PurePosixPath(rdir).parent)
+            if parent not in (".", "/"):
+                ensure_dir(parent)
+            try:
+                sftp.mkdir(rdir)
+            except OSError:
+                pass
+            made_dirs.add(rdir)
+
+        for rpath, source, mode in package:
+            try:
+                sftp.remove(rpath)  # wings не даёт перезаписывать существующие файлы
+            except OSError:
+                pass
+            if isinstance(source, (bytes, bytearray)):
+                ensure_dir(str(PurePosixPath(rpath).parent))
+                with sftp.open(rpath, "wb") as f:
+                    f.write(bytes(source))
+            else:
+                p = Path(source)
+                if not p.exists():
+                    log(f"пропуск (нет файла): {rpath}")
+                    continue
+                ensure_dir(str(PurePosixPath(rpath).parent))
+                sftp.put(str(p), rpath)
+            sftp.chmod(rpath, mode)
+            log(f"✓ {rpath}")
+
+        job["status"] = "проверка"
+        for probe in ("/app.py", "/chisel", "/panel/server.py", "/panel/static/index.html"):
+            st = sftp.stat(probe)
+            if not st.st_size:
+                raise RuntimeError(f"файл пуст после загрузки: {probe}")
+        log("проверка: файлы на месте")
+        sftp.close()
+        transport.close()
+
+    try:
+        await asyncio.to_thread(sync_upload)
+
+        if setup_tunnel and panel_port:
+            ip = socket.gethostbyname(host)
+            url = f"http://{ip}:{panel_port}/chisel"
+            code, out, err = await ssh_run(
+                "sed -i 's|SERVER_URL=.*|SERVER_URL=" + shlex.quote(f'SERVER_URL="{url}"') +
+                "|' /data/opt/chisel/chisel.env && /etc/init.d/S97chisel restart", timeout=40)
+            log("колонка: туннель переподключён на " + url if code == 0
+                else f"колонка: не удалось обновить chisel.env ({err.strip()[:80] or out.strip()[:80]})")
+
+        job["ok"] = True
+        job["status"] = "готово"
+        log("Дальше: 1) запусти сервер в панели хостинга (если ещё не запущен);")
+        log("2) первый старт ставит зависимости ~1 мин;")
+        log("3) открой http://<IP>:<порт панели> — логин и пароль такие же, как здесь;")
+        log("4) HTTPS: добавь домен в Cloudflare (A-запись + Origin Rule на порт панели + SSL Flexible).")
+    except Exception as exc:
+        job["ok"] = False
+        job["status"] = "ошибка"
+        log(f"ошибка: {type(exc).__name__}: {str(exc)[:200]}")
+
+
+@app.post("/api/vps/deploy")
+async def api_vps_deploy(request: Request) -> JSONResponse:
+    """Запустить развёртывание панели на сервер по SFTP (фоновая задача)."""
+    require_auth(request)
+    data = await request.json()
+    host = str(data.get("host") or "").strip()
+    user = str(data.get("user") or "").strip()
+    password = str(data.get("password") or "")
+    port = int(data.get("port") or 22)
+    panel_port = int(data.get("panel_port") or 0)
+    include_keys = bool(data.get("include_keys", True))
+    setup_tunnel = bool(data.get("setup_tunnel", True))
+    if not host or not user or not password:
+        raise HTTPException(status_code=400, detail="заполни адрес, логин и пароль SFTP")
+    if not (BASE / "deploy" / "container" / "app.py").exists():
+        raise HTTPException(status_code=400, detail="в установке нет deploy/container/app.py — обнови панель")
+
+    now = time.time()
+    for jid in [j for j, jv in VPS_JOBS.items() if now - jv.get("ts", now) > 3600]:
+        VPS_JOBS.pop(jid, None)
+
+    job_id = secrets.token_hex(4)
+    job = {"status": "запуск", "lines": [], "ok": None, "ts": now}
+    VPS_JOBS[job_id] = job
+    task = asyncio.create_task(_vps_deploy_job(
+        job_id, host, port, user, password, panel_port, include_keys, setup_tunnel))
+    job["task"] = task
+    return JSONResponse({"ok": True, "job": job_id})
+
+
+@app.get("/api/vps/deploy/status")
+async def api_vps_deploy_status(request: Request, job: str = "") -> JSONResponse:
+    require_auth(request)
+    job_data = VPS_JOBS.get(job)
+    if not job_data:
+        raise HTTPException(status_code=404, detail="задача не найдена")
+    return JSONResponse({"status": job_data["status"], "lines": job_data["lines"],
+                         "ok": job_data["ok"]})
 
 
 @app.post("/api/setup/ssh-key")

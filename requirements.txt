@@ -9,3 +9,4 @@ edge-tts>=6.1
 zeroconf>=0.131
 pycaw>=20240210
 comtypes>=1.2
+paramiko>=3.4  # автоустановка панели на VPS по SFTP
