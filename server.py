@@ -75,6 +75,8 @@ DEFAULTS: dict[str, Any] = {
     "voice_music_source": "youtube",
     # --- локальный голосовой мост (voice-bridge встроен в панель) ---
     "bridge_enabled": False,
+    "ipc_media_listen": True,  # фразы «стоп/пауза/дальше» без «Алисы» -> мост
+    "ipc_media_dedupe_sec": 5,
     "bridge_path": "",  # путь к папке voice-bridge; пусто = ../voice-bridge рядом с панелью
     "llm_provider": "deepseek-web",  # deepseek-web | openrouter | none
     "deepseek_token": "",   # bearer userToken из localStorage chat.deepseek.com
@@ -140,12 +142,98 @@ app = FastAPI(title="Station Panel", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+# --------------------------------------------------------------------------- #
+# Медиа-фразы без слова активации («стоп», «пауза», «дальше»…): слушаем IPC
+# колонки (127.0.0.1:9875) и финальные результаты распознавания без «алисы»
+# переводим в команды моста. Вендорский споттер рисует значок, но штатным
+# плеером не управляет (играет soundya/spotiya) — здесь доводим до плеера.
+# --------------------------------------------------------------------------- #
+IPC_MEDIA_PHRASES = {
+    "стоп": "stop",
+    "пауза": "pause",
+    "паузу": "pause",
+    "дальше": "next",
+    "следующий": "next",
+    "следующий трек": "next",
+    "вперёд": "next",
+    "назад": "prev",
+    "предыдущий": "prev",
+    "предыдущий трек": "prev",
+    "продолжи": "play",
+    "продолжай": "play",
+    "играть": "play",
+}
+_media_listener_task: asyncio.Task | None = None
+
+
+async def _ipc_media_listener() -> None:
+    """Долгоживущий слушатель IPC: переподключается, шлёт совпавшие фразы мосту."""
+    last_sent: dict[str, float] = {}
+    while True:
+        bridge_base = str(cfg.get("voice_bridge_url") or "").split("/api/voice")[0].rstrip("/")
+        token = str(cfg.get("voice_bridge_token") or "")
+        if not (cfg.get("ipc_media_listen") and bridge_base and token):
+            await asyncio.sleep(5)
+            continue
+        conn = None
+        try:
+            conn = await ssh_connect()
+            reader, writer = await conn.open_connection("127.0.0.1", 9875)
+            writer.write(_ipc_frame(20, _ipc_byte_field(1, b"AliceCapability")))
+            print("[ipc-media] слушаю фразы без «Алисы»")
+            while True:
+                size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 30), "little")
+                if not 0 < size <= 512 * 1024:
+                    break
+                envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), 30))
+                if envelope.get(1) not in (1, 3) or not isinstance(envelope.get(2), bytes):
+                    continue  # интересуют события распознавания с текстом
+                text = envelope[2].decode("utf-8", "replace").strip().lower()
+                if not text or "алиса" in text:
+                    continue
+                cmd = IPC_MEDIA_PHRASES.get(text)
+                if not cmd:
+                    continue
+                now = time.time()
+                if now - last_sent.get(cmd, 0) < float(cfg.get("ipc_media_dedupe_sec", 5)):
+                    continue  # тот же финал может прийти повторно
+                last_sent[cmd] = now
+                timeout = aiohttp.ClientTimeout(total=12)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    await session.post(bridge_base + "/api/media",
+                                       json={"media": cmd},
+                                       headers={"authorization": f"Bearer {token}"})
+                print(f"[ipc-media] «{text}» -> {cmd}")
+        except Exception:
+            pass  # колонка офлайн/туннель рвался — переподключимся
+        finally:
+            if conn:
+                conn.close()
+        await asyncio.sleep(5)
+
+
+@app.get("/api/ipc_media_listen")
+async def api_ipc_media_listen_get(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse({"enabled": bool(cfg.get("ipc_media_listen"))})
+
+
+@app.put("/api/ipc_media_listen")
+async def api_ipc_media_listen_put(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    cfg["ipc_media_listen"] = bool(data.get("enabled"))
+    save_config(cfg)
+    return JSONResponse({"ok": True, "enabled": bool(cfg["ipc_media_listen"])})
+
+
 @app.on_event("startup")
 async def _start_background_loops() -> None:
     """Фоновые задачи: закрепление времени, ночной профиль, синхронизация громкости."""
     asyncio.create_task(_clock_pin_loop())
     asyncio.create_task(_night_clock_loop())
     asyncio.create_task(_volume_sync_loop())
+    asyncio.create_task(_ipc_media_listener())
 
 
 # --------------------------------------------------------------------------- #

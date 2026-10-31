@@ -168,7 +168,7 @@ function showTab(name) {
   document.querySelectorAll('.tab').forEach(tab => tab.classList.toggle('active', tab.id === 'tab-' + name));
   if (name === 'console') setTimeout(() => { state.fit && state.fit.fit(); state.term && state.term.focus(); }, 60);
   if (name === 'sensors') drawCharts();
-  if (name === 'wakeword') { wwRefresh(); if (!wwTimer) wwTimer = setInterval(wwRefresh, 700); }
+  if (name === 'wakeword') { wwRefresh(); if (!wwTimer) wwTimer = setInterval(wwRefresh, 700); loadIpcListen(); }
   if (name === 'alice') loadAliceAll();
   if (name === 'system') { loadMinidumps(); runSecurityAudit(); loadSounds(); }
   if (name === 'led') { ledAnimLoad(); loadNightClock(); }
@@ -1760,6 +1760,34 @@ function vpsPollJob(jobId, btn) {
     }
   }, 2000);
 }
+
+/* --------------- медиа-фразы без «Алисы» (IPC-слушатель) --------------- */
+async function loadIpcListen() {
+  try {
+    const r = await api('/api/ipc_media_listen');
+    $('ipcListen').checked = !!r.enabled;
+    $('ipcListenStatus').textContent = r.enabled
+      ? 'слушаю: «стоп», «пауза», «дальше», «назад», «продолжи» уходят мосту'
+      : 'выключено';
+  } catch (error) {
+    $('ipcListenStatus').textContent = 'ошибка: ' + error.message;
+  }
+}
+
+$('ipcListen').onchange = async () => {
+  try {
+    const r = await api('/api/ipc_media_listen', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled: $('ipcListen').checked }),
+    });
+    $('ipcListenStatus').textContent = r.enabled
+      ? 'слушаю: «стоп», «пауза», «дальше», «назад», «продолжи» уходят мосту'
+      : 'выключено';
+  } catch (error) {
+    $('ipcListenStatus').textContent = 'ошибка: ' + error.message;
+    loadIpcListen();
+  }
+};
 
 /* ------------------------- голосовые команды ------------------------- */
 async function loadVoiceConfig() {

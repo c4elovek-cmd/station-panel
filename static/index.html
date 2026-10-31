@@ -375,6 +375,15 @@ scp -P 2222 file.txt root@192.168.0.172:/tmp/</pre>
 
       <div class="panel">
         <div class="row between">
+          <h3 style="margin:0">Медиа-фразы без «Алисы»</h3>
+          <label class="check"><input type="checkbox" id="ipcListen"> слушать</label>
+        </div>
+        <p class="muted small" style="margin:8px 0 0">«Стоп», «пауза», «дальше», «назад», «продолжи» — без слова активации, для soundya/spotiya через мост. Вендор рисует значок, но штатный плеер не играет — эта галочка доводит команду до плеера. Работает, если настроен мост («Голосовые команды»). Включай на одной панели, не на двух сразу.</p>
+        <p class="muted small" id="ipcListenStatus" style="margin:4px 0 0">—</p>
+      </div>
+
+      <div class="panel">
+        <div class="row between">
           <h3 style="margin:0">Микрофон</h3>
           <span class="muted small" id="wwLevelText">—</span>
         </div>
