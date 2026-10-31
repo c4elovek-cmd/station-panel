@@ -179,7 +179,10 @@ async def _ipc_media_listener() -> None:
         try:
             conn = await ssh_connect()
             reader, writer = await conn.open_connection("127.0.0.1", 9875)
-            writer.write(_ipc_frame(20, _ipc_byte_field(1, b"AliceCapability")))
+            # ВАЖНО: без кадра «подписка на AliceCapability» — maind считает
+            # подписчика компонентом речи и уводит активации «Алисы» ему
+            # («не отвечает даже на слово алиса»). Текстовые события
+            # распознавания приходят широковещательно и без подписки.
             print("[ipc-media] слушаю фразы без «Алисы»")
             while True:
                 size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 30), "little")
