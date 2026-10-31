@@ -2299,7 +2299,7 @@ def _vps_requirements() -> bytes:
     return text.encode("utf-8")
 
 
-def _vps_config_payload() -> bytes:
+def _vps_config_payload(panel_version: str = "") -> bytes:
     """Конфиг для сервера: станция приходит через chisel-туннель (127.0.0.1),
     панель слушает только localhost, пароль панели наследуется."""
     payload = {
@@ -2319,6 +2319,7 @@ def _vps_config_payload() -> bytes:
         "bridge_enabled": False,
         "say_engine": "ipc",
         "yandex_x_token": cfg.get("yandex_x_token", ""),
+        "panel_version": panel_version,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
@@ -2348,7 +2349,7 @@ def _vps_package(include_keys: bool) -> list[tuple[str, Any, int]]:
 
 async def _vps_deploy_job(job_id: str, host: str, port: int, user: str,
                           password: str, panel_port: int, include_keys: bool,
-                          setup_tunnel: bool) -> None:
+                          setup_tunnel: bool, panel_version: str = "") -> None:
     """Залить поставку по SFTP (paramiko: wings-серверы нестабильны на asyncssh)
     и, при желании, переподключить туннель колонки."""
     job = VPS_JOBS[job_id]
@@ -2369,6 +2370,8 @@ async def _vps_deploy_job(job_id: str, host: str, port: int, user: str,
         log(f"подключено: {host}:{port}")
 
         package = _vps_package(include_keys)
+        package = [(r, s, m) if r != "panel/config.json"
+                   else (r, _vps_config_payload(panel_version), m) for r, s, m in package]
         made_dirs: set[str] = set()
 
         def ensure_dir(rdir: str) -> None:
@@ -2465,8 +2468,12 @@ async def api_vps_deploy(request: Request) -> JSONResponse:
     job_id = secrets.token_hex(4)
     job = {"status": "запуск", "lines": [], "ok": None, "ts": now}
     VPS_JOBS[job_id] = job
+    try:
+        panel_version = str(cfg.get("panel_version") or "") or _latest_release_tag(_update_repo_slug())
+    except Exception:
+        panel_version = str(cfg.get("panel_version") or "")
     task = asyncio.create_task(_vps_deploy_job(
-        job_id, host, port, user, password, panel_port, include_keys, setup_tunnel))
+        job_id, host, port, user, password, panel_port, include_keys, setup_tunnel, panel_version))
     job["task"] = task
     return JSONResponse({"ok": True, "job": job_id})
 
@@ -2683,11 +2690,55 @@ async def api_password(request: Request) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 # Самообновление панели из GitHub
 # --------------------------------------------------------------------------- #
+DEFAULT_UPDATE_REPO = "c4elovek-cmd/station-panel"
+
+
+def _update_repo_slug() -> str:
+    git = shutil.which("git")
+    if git and (BASE / ".git").exists():
+        try:
+            proc = subprocess.run(
+                [git, "remote", "get-url", "origin"], cwd=str(BASE), capture_output=True,
+                text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            if proc.returncode == 0:
+                slug = re.sub(r"^(?:https?://|git@)?[^:/]*[:/]+github\.com[:/]?", "", proc.stdout.strip())
+                slug = re.sub(r"\.git$", "", slug)
+                if slug:
+                    return slug
+        except Exception:
+            pass
+    return str(cfg.get("update_repo") or DEFAULT_UPDATE_REPO)
+
+
+def _latest_release_tag(slug: str) -> str:
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{slug}/releases/latest",
+        headers={"User-Agent": "station-panel", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8", "replace")).get("tag_name", "")
+
+
 @app.get("/api/panel/update")
 async def api_panel_update_check(request: Request) -> JSONResponse:
-    """Сравнить локальный коммит с последним в Git-репозитории на GitHub."""
+    """Сравнить локальную версию с последней в Git-репозитории на GitHub."""
     require_auth(request)
+    slug = _update_repo_slug()
     root_dir = Path(__file__).resolve().parent
+    if not (root_dir / ".git").exists():
+        # SFTP-развёртывание без git: версия берётся из config, обновление — tarball
+        try:
+            latest = _latest_release_tag(slug)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "detail": f"GitHub недоступен: {str(exc)[:140]}"}, status_code=500)
+        local = str(cfg.get("panel_version") or "")
+        return JSONResponse({
+            "ok": True, "git": False, "repo": slug, "local": local, "latest": latest,
+            "up_to_date": bool(local) and local == latest,
+        })
+
     git = shutil.which("git")
     if not git:
         return JSONResponse({"ok": False, "detail": "git не найден в PATH"}, status_code=500)
@@ -2721,11 +2772,77 @@ async def api_panel_update_check(request: Request) -> JSONResponse:
     })
 
 
+def _sync_tarball_update(slug: str) -> tuple[bool, str]:
+    """Обновление без git: скачать tarball ветки main и заменить файлы панели."""
+    import io
+    import tarfile
+    import urllib.request
+
+    url = f"https://codeload.github.com/{slug}/tar.gz/refs/heads/main"
+    req = urllib.request.Request(url, headers={"User-Agent": "station-panel"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        raw = r.read()
+    root_prefix = None
+    replaced: list[str] = []
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            rel = m.name
+            if "/" not in rel:
+                continue
+            prefix, rest = rel.split("/", 1)
+            if root_prefix is None:
+                root_prefix = prefix
+            if prefix != root_prefix:
+                continue
+            data = tf.extractfile(m).read()
+            if rest == "server.py":
+                (BASE / "server.py").write_bytes(data)
+                replaced.append("server.py")
+            elif rest.startswith("static/"):
+                dest = BASE / rest
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+                replaced.append(rest)
+            elif rest == "deploy/container/app.py" and (BASE.parent / "app.py").exists():
+                (BASE.parent / "app.py").write_bytes(data)
+                replaced.append("app.py (супервизор)")
+    if "server.py" not in replaced:
+        return False, "в архиве не найден server.py — странный релиз, обновление отменено"
+    try:
+        tag = _latest_release_tag(slug)
+    except Exception:
+        tag = ""
+    if tag:
+        cfg["panel_version"] = tag
+        save_config(cfg)
+    return True, "обновлено: " + ", ".join(replaced[:6]) + ("…" if len(replaced) > 6 else "")
+
+
+def _delayed_self_restart() -> None:
+    """Убить свой процесс: супервизор (VPS) перезапустит панель, на ПК — start.ps1/планировщик."""
+    async def _kill():
+        await asyncio.sleep(2)
+        os.kill(os.getpid(), 15)  # SIGTERM
+    asyncio.create_task(_kill())
+
+
 @app.post("/api/panel/update")
 async def api_panel_update(request: Request) -> JSONResponse:
-    """git pull → pip install → перезапуск панели. Панель после ответа рестартует."""
+    """git pull (или tarball без git) → перезапуск панели."""
     require_auth(request)
     root_dir = Path(__file__).resolve().parent
+    slug = _update_repo_slug()
+
+    if not (root_dir / ".git").exists():
+        ok, log = await asyncio.get_event_loop().run_in_executor(None, _sync_tarball_update, slug)
+        if not ok:
+            return JSONResponse({"detail": log}, status_code=500)
+        _delayed_self_restart()
+        return JSONResponse({"ok": True, "log": log,
+                             "note": "панель перезапустится сама; если менялись зависимости — рестартни контейнер в консоли хостинга"})
+
     git = shutil.which("git")
 
     def _sync_pull() -> tuple[bool, str]:

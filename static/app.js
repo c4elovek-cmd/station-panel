@@ -1655,8 +1655,14 @@ $('panelUpdAuto').onchange = event => {
 async function panelUpdateCheck(silent) {
   try {
     const info = await api('/api/panel/update');
-    const text = info.repo + ' · ' + info.commit + ' → ' + info.remote_commit + ': '
-      + (info.up_to_date ? 'панель актуальна' : 'доступно обновление');
+    let text;
+    if (info.git === false) {
+      text = info.repo + ' · версия: ' + (info.local || 'неизвестна') + ' · последняя: ' + info.latest
+        + ': ' + (info.up_to_date ? 'панель актуальна' : 'доступно обновление');
+    } else {
+      text = info.repo + ' · ' + info.commit + ' → ' + info.remote_commit + ': '
+        + (info.up_to_date ? 'панель актуальна' : 'доступно обновление');
+    }
     $('panelUpdInfo').textContent = text;
     if (!silent) notify($('panelUpdStatus'), text, info.up_to_date ? 'ok' : '');
     return info;
