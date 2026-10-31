@@ -3373,19 +3373,138 @@ async def api_say_quota(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "detail": str(exc)[:120]})
 
 
+# --- нативная озвучка через локальный IPC (без куки и токенов) ---
+def _ipc_varint(value: int) -> bytes:
+    out = bytearray()
+    while value >= 128:
+        out.append((value & 127) | 128)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _ipc_integer(field: int, value: int) -> bytes:
+    return _ipc_varint(field * 8) + _ipc_varint(value)
+
+
+def _ipc_byte_field(field: int, value: bytes) -> bytes:
+    return _ipc_varint(field * 8 + 2) + _ipc_varint(len(value)) + value
+
+
+def _ipc_parse(data: bytes) -> dict[int, Any]:
+    offset, result = 0, {}
+
+    def number() -> int:
+        nonlocal offset
+        value, shift = 0, 0
+        while shift < 70:
+            if offset >= len(data):
+                raise ValueError("обрезанный protobuf")
+            byte = data[offset]
+            offset += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value
+            shift += 7
+        raise ValueError("неверный protobuf-varint")
+
+    while offset < len(data):
+        key = number()
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            result[field] = number()
+        elif wire == 2:
+            size = number()
+            result[field] = data[offset:offset + size]
+            offset += size
+        elif wire == 1:
+            result[field] = data[offset:offset + 8]
+            offset += 8
+        elif wire == 5:
+            result[field] = data[offset:offset + 4]
+            offset += 4
+        else:
+            raise ValueError(f"неизвестный protobuf-wire {wire}")
+    return result
+
+
+def _ipc_frame(field: int, payload: bytes) -> bytes:
+    remote = _ipc_byte_field(7, b"AliceCapability") + _ipc_byte_field(field, payload)
+    envelope = _ipc_byte_field(252, remote) + _ipc_integer(253, 210)
+    return len(envelope).to_bytes(4, "little") + envelope
+
+
+def _ipc_vocalize_frame(text: str) -> bytes:
+    # START_VOCALIZE=18, events=true, TVocalizeDirective(text, Append=1)
+    directive = _ipc_byte_field(1, text.encode("utf-8")) + _ipc_integer(2, 1)
+    return _ipc_frame(8, _ipc_integer(1, 18) + _ipc_integer(3, 1) + _ipc_byte_field(13, directive))
+
+
+async def _ipc_say(text: str, timeout: float = 30.0) -> None:
+    """Нативная озвучка голосом Алисы через локальный IPC колонки (127.0.0.1:9875,
+    AliceCapability START_VOCALIZE). Куки и токены Яндекса не нужны — работает
+    авторизация самой колонки. Формат кадров повторяет contrib/alice-say.py из вики
+    hackalice.me; на Мини 2 события приходят с эхом rpc-id 210 (253=210), поэтому
+    принимаются оба значения. Озвучка идёт через SSH-порт-форвард — socat не нужен."""
+    conn = await ssh_connect()
+    try:
+        reader, writer = await conn.open_connection("127.0.0.1", 9875)
+        writer.write(_ipc_frame(20, _ipc_byte_field(1, b"AliceCapability")) + _ipc_vocalize_frame(text))
+        started = False
+        try:
+            while True:
+                size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), timeout), "little")
+                if not 0 < size <= 512 * 1024:
+                    raise HTTPException(status_code=502, detail="IPC: битый размер кадра")
+                envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), timeout))
+                if envelope.get(253) not in (3, 210):
+                    continue
+                remote = _ipc_parse(envelope.get(252, b""))
+                if 18 not in remote:
+                    continue
+                event = _ipc_parse(remote[18]).get(1)
+                if event == 6:
+                    started = True
+                elif event == 1 and started:
+                    return
+                elif event == 4:
+                    raise HTTPException(status_code=502, detail="колонка сообщила об ошибке озвучки")
+        except asyncio.TimeoutError:
+            if started:
+                return  # озвучка идёт дольше лимита — не считаем ошибкой
+            raise HTTPException(status_code=502, detail="IPC: колонка не подтвердила озвучку")
+        except asyncssh.Error as exc:
+            raise HTTPException(status_code=502, detail=f"IPC-канал: {str(exc)[:120]}")
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"IPC: {exc}")
+        finally:
+            writer.close()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"IPC-озвучка не удалась: {str(exc)[:140]}")
+    finally:
+        conn.close()
+
+
 @app.post("/api/speaker/say")
 async def api_speaker_say(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
     text = str(data.get("text", "")).strip()
-    if not text or len(text) > 500:
-        raise HTTPException(status_code=400, detail="текст от 1 до 500 символов")
-
     engine = str(data.get("engine") or cfg.get("say_engine", "edge"))
-    if engine not in ("edge", "elevenlabs", "alice"):
+    if engine not in ("edge", "elevenlabs", "alice", "ipc"):
         engine = "edge"
+    limit = 2000 if engine == "ipc" else 500
+    if not text or len(text) > limit:
+        raise HTTPException(status_code=400, detail=f"текст от 1 до {limit} символов")
 
     import tempfile
+
+    # Нативная озвучка через локальный IPC: без кук и токенов, голос Алисы.
+    if engine == "ipc":
+        await _ipc_say(text)
+        return JSONResponse({"ok": True, "voice": "alice", "mood": "normal", "engine": "ipc"})
 
     # Родной голос Алисы: текст уходит в облако, колонка произносит сама.
     # Интонации (mood) недоступны — Яндекс не даёт менять темп/высоту фразы.

@@ -22,7 +22,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Nunito:wght@400;600;700&family=JetBrains+Mono:wght@400;500&family=Playfair+Display:wght@500;600&display=swap">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
-<link rel="stylesheet" href="/static/style.css?v=20261030">
+<link rel="stylesheet" href="/static/style.css?v=20261031">
 </head>
 <body>
 <!-- SVG-спрайт иконок: <svg class="ic"><use href="#i-имя"/></svg>. Стиль — как у навигации -->
@@ -225,6 +225,7 @@
         <div class="row wrap" style="margin-bottom:8px">
           <label class="row" style="gap:6px; font-size:12.5px; color:var(--muted)">Голос:
             <select class="input" id="sayEngine" style="width:auto">
+              <option value="ipc">Алиса (локально, без облака)</option>
               <option value="alice">Алиса (родной голос)</option>
               <option value="edge">Эдж (бесплатный)</option>
               <option value="elevenlabs">ElevenLabs (качество выше)</option>
@@ -1099,7 +1100,7 @@ scp -P 2222 file.txt root@192.168.0.172:/tmp/</pre>
 
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/addon-fit.js"></script>
-<script src="/static/app.js?v=20261030"></script>
+<script src="/static/app.js?v=20261031"></script>
 <script>
 /* liquid-glass кружок за курсором — декоративный, pointer-events:none в CSS */
 (function () {

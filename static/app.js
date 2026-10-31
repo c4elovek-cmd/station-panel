@@ -1744,11 +1744,14 @@ async function sayLoadEngine() {
 function sayApplyVisibility(engine, data) {
   const eleven = engine === 'elevenlabs';
   const alice = engine === 'alice';
+  const ipc = engine === 'ipc';
   $('sayElevenBox').style.display = eleven ? '' : 'none';
-  $('sayVoice').style.display = eleven || alice ? 'none' : '';
+  $('sayVoice').style.display = eleven || alice || ipc ? 'none' : '';
   // интонации работают только в синтезе (Эдж/ElevenLabs) — у Алисы фраза играется её движком
-  $('sayMood').style.display = alice ? 'none' : '';
-  $('sayEngineHint').textContent = alice
+  $('sayMood').style.display = alice || ipc ? 'none' : '';
+  $('sayEngineHint').textContent = ipc
+    ? 'нативная озвучка через колонку: без куки и токенов, до 2000 символов'
+    : alice
     ? 'родной голос Алисы из облака; нужен вход в Яндекс (вкладка «Алиса»)'
     : eleven
     ? (data && data.has_key ? 'ключ задан' : 'ключ не задан')
