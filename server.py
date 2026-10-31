@@ -892,7 +892,8 @@ async def api_status(request: Request) -> JSONResponse:
         "echo '#KERNEL'; uname -sr; "
         "echo '#YAMD'; pidof yamd; "
         "echo '#SSH'; pidof dropbear; "
-        "echo '#ADB'; pidof adbd"
+        "echo '#ADB'; pidof adbd; "
+        "echo '#LAN'; ip -4 addr show wlan0 2>/dev/null || ifconfig wlan0 2>/dev/null"
     )
     code, out, err = await ssh_run(cmd, timeout=15)
 
@@ -936,8 +937,14 @@ async def api_status(request: Request) -> JSONResponse:
                     data["uptime_sec"] = int(float(line))
                 except ValueError:
                     pass
+            elif section == "LAN":
+                data.setdefault("lan_raw", []).append(line)
             elif section and section not in ("MEM", "DISK", "TEMP", "UP"):
                 data[section.lower()] = line
+
+    lan_match = re.search(
+        r"inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)", " ".join(data.pop("lan_raw", [])))
+    data["lan_ip"] = lan_match.group(1) if lan_match else ""
 
     # данные демона YAM
     timeout = aiohttp.ClientTimeout(total=6)

@@ -283,7 +283,17 @@ async function refreshStatus() {
     $('cPlugins').textContent = data.plugins === null ? '—' : data.plugins;
     $('cPluginsSub').textContent = data.plugins_running ? `${data.plugins_running} запущено` : 'нет запущенных';
 
-    $('svcAdb').textContent = data.adb ? 'работает (PID ' + data.adb + ')' : 'остановлен';
+    const adbCmd = data.lan_ip && data.adb ? `adb connect ${data.lan_ip}:5555` : '';
+    $('svcAdb').innerHTML = data.adb
+      ? 'работает (PID ' + esc(String(data.adb)) + ')'
+        + (adbCmd ? ' · <code class="chip" id="adbCmd" title="нажми — скопируется" style="cursor:pointer">' + esc(adbCmd) + '</code>' : '')
+      : 'остановлен';
+    const adbChip = $('adbCmd');
+    if (adbChip) adbChip.onclick = () => {
+      navigator.clipboard.writeText(adbChip.textContent).then(
+        () => { adbChip.textContent = 'скопировано'; setTimeout(() => { adbChip.textContent = adbCmd; }, 1500); },
+        () => {});
+    };
     $('svcSsh').textContent = data.ssh ? 'работает (PID ' + data.ssh + ')' : 'остановлен';
     $('svcYam').textContent = data.yamd ? 'работает (PID ' + data.yamd + ')' : 'остановлен';
     $('svcKernel').textContent = data.kernel || '—';
