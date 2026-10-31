@@ -2417,11 +2417,17 @@ async def _vps_deploy_job(job_id: str, host: str, port: int, user: str,
         if setup_tunnel and panel_port:
             ip = socket.gethostbyname(host)
             url = f"http://{ip}:{panel_port}/chisel"
-            code, out, err = await ssh_run(
-                "sed -i 's|SERVER_URL=.*|SERVER_URL=" + shlex.quote(f'SERVER_URL="{url}"') +
-                "|' /data/opt/chisel/chisel.env && /etc/init.d/S97chisel restart", timeout=40)
-            log("колонка: туннель переподключён на " + url if code == 0
-                else f"колонка: не удалось обновить chisel.env ({err.strip()[:80] or out.strip()[:80]})")
+            # chisel.env правится перезаписью целиком: sed с вложенными кавычками
+            # на busybox рвёт файл (был случай SERVER_URL=http::80)
+            code, out, _ = await ssh_run("cat /data/opt/chisel/chisel.env 2>/dev/null", timeout=15)
+            lines = [l for l in out.splitlines() if l.strip() and not l.startswith("SERVER_URL=")]
+            env_text = f'SERVER_URL="{url}"\n' + "\n".join(lines) + "\n"
+            code, _, err = await ssh_run_bytes(
+                "cat > /data/opt/chisel/chisel.env", input_data=env_text.encode("utf-8"), timeout=20)
+            if code != 0:
+                raise RuntimeError("не удалось записать chisel.env: " + err.decode("utf-8", "replace")[:100])
+            await ssh_run("/etc/init.d/S97chisel restart", timeout=30)
+            log("колонка: туннель переподключён на " + url)
 
         job["ok"] = True
         job["status"] = "готово"
