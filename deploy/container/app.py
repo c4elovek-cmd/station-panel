@@ -201,11 +201,43 @@ async def entry(request: web.Request) -> web.StreamResponse:
     return await proxy_http(request)
 
 
+async def _stdin_command_loop() -> None:
+    """Консоль хостинга (wings /command) шлёт строки в stdin: «exec <cmd>» выполняется
+    в контейнере — единственный способ диагностики/установки без root-shell."""
+    import shlex
+
+    loop = asyncio.get_event_loop()
+
+    def _readline():
+        return sys.stdin.readline()
+
+    while True:
+        line = await loop.run_in_executor(None, _readline)
+        if not line:
+            await asyncio.sleep(0.2)
+            continue
+        line = line.strip()
+        if not line:
+            continue
+        print(f"[stdin] {line[:120]}", flush=True)
+        if line.startswith("exec "):
+            cmd = line[5:].strip()
+            try:
+                args = shlex.split(cmd)
+                proc = await asyncio.create_subprocess_exec(
+                    *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                out, _ = await asyncio.wait_for(proc.communicate(), 300)
+                print("[stdin-вывод]\n" + out.decode("utf-8", "replace")[:4000], flush=True)
+            except Exception as exc:
+                print(f"[stdin-вывод] ошибка: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
+
+
 async def on_startup(app: web.Application) -> None:
     global SESSION
     SESSION = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
     spawn_all()
     app["watchdog"] = asyncio.create_task(watchdog())
+    app["stdin_loop"] = asyncio.create_task(_stdin_command_loop())
 
 
 async def on_cleanup(app: web.Application) -> None:

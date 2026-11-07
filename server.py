@@ -75,8 +75,9 @@ DEFAULTS: dict[str, Any] = {
     "voice_music_source": "youtube",
     # --- локальный голосовой мост (voice-bridge встроен в панель) ---
     "bridge_enabled": False,
-    "ipc_media_listen": True,  # фразы «стоп/пауза/дальше» без «Алисы» -> мост
+    "ipc_media_listen": False,  # ЭКСПЕРИМЕНТ: держать выключенным — см. todo (компоненты maind утекают)
     "ipc_media_dedupe_sec": 5,
+    "soundya_auto_firefox": True,  # автоматически брать токен SoundCloud из Firefox
     "bridge_path": "",  # путь к папке voice-bridge; пусто = ../voice-bridge рядом с панелью
     "llm_provider": "deepseek-web",  # deepseek-web | openrouter | none
     "deepseek_token": "",   # bearer userToken из localStorage chat.deepseek.com
@@ -2415,6 +2416,7 @@ def _vps_config_payload(panel_version: str = "") -> bytes:
         "voice_bridge_token": cfg.get("voice_bridge_token", ""),
         "voice_music_source": cfg.get("voice_music_source", "youtube"),
         "bridge_enabled": False,
+        "ipc_media_listen": False,  # экспериментальная фича — на сервер не включать
         "say_engine": "ipc",
         "yandex_x_token": cfg.get("yandex_x_token", ""),
         "panel_version": panel_version,
@@ -4583,18 +4585,58 @@ async def api_music_soloist_apikey(request: Request) -> JSONResponse:
     return JSONResponse({"ok": code == 0, "output": out.decode("utf-8", "replace")[:300]})
 
 
-@app.post("/api/music/soundya/token")
-async def api_music_soundya_token(request: Request) -> JSONResponse:
-    """Обновить oauth_token SoundCloud в /data/opt/soundya/config.json."""
-    require_auth(request)
-    data = await request.json()
-    token = str(data.get("token", "")).strip()
-    # формат куки oauth_token у SoundCloud: <версия>-<uid>-<время>-<секрет>
-    # (например 2-332675-1600559952-phiBI8CyfxpF4); на случай смены формата
-    # допускаем и просто длинную строку без пробелов
+def _firefox_profile_dirs() -> list[Path]:
+    base = Path(os.environ.get("APPDATA", "")) / "Mozilla" / "Firefox" / "Profiles"
+    if not base.exists():
+        return []
+    return [p for p in base.iterdir() if p.is_dir() and (p / "cookies.sqlite").exists()]
+
+
+def _firefox_soundcloud_token() -> str | None:
+    """Свежий oauth_token SoundCloud из куки-базы Firefox (значения там открытым текстом).
+    База копируется во временную папку — Firefox держит её открытой."""
+    import shutil
+    import sqlite3
+    import tempfile
+
+    for prof in _firefox_profile_dirs():
+        tmp = Path(tempfile.gettempdir()) / f"ff-cookies-{secrets.token_hex(3)}"
+        tmp.mkdir(exist_ok=True)
+        try:
+            copied_db = None
+            for name in ("cookies.sqlite", "cookies.sqlite-wal", "cookies.sqlite-shm"):
+                src = prof / name
+                if src.exists():
+                    shutil.copy2(src, tmp / name)
+                    if name == "cookies.sqlite":
+                        copied_db = tmp / name
+            if not copied_db:
+                continue
+            con = sqlite3.connect(copied_db)
+            try:
+                rows = con.execute(
+                    "SELECT value FROM moz_cookies WHERE name='oauth_token' "
+                    "AND host LIKE '%soundcloud.com' ORDER BY expiry DESC LIMIT 1"
+                ).fetchall()
+            finally:
+                con.close()
+            if rows and rows[0][0]:
+                return rows[0][0]
+        except Exception:
+            continue
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return None
+
+
+async def _soundya_apply_token(token: str) -> tuple[bool, str]:
+    """Записать токен в soundya и перезапустить плеер. (ok, подробность)."""
+    # формат куки oauth_token у SoundCloud: старый <версия>-<uid>-<время>-<секрет>
+    # (например 2-332675-1600559952-phiBI8CyfxpF4) или новый JWT (eyJ…, сутки)
     if not (re.fullmatch(r"[0-9]{1,3}-[0-9]{2,15}-[0-9]{8,14}-[A-Za-z0-9_\-]{6,64}", token)
-            or (20 <= len(token) <= 300 and not re.search(r"\s", token))):
-        raise HTTPException(status_code=400, detail="не похоже на oauth_token: это значение куки oauth_token с soundcloud.com, вида 2-332675-1600559952-…")
+            or token.startswith("eyJ")
+            or (20 <= len(token) <= 1600 and not re.search(r"\s", token))):
+        return False, "не похоже на oauth_token: это значение куки oauth_token с soundcloud.com (eyJ… или 2-332675-…)"
     code, current, _ = await ssh_run_bytes("cat /data/opt/soundya/config.json 2>/dev/null", timeout=15)
     try:
         config = json.loads(current.decode("utf-8", "replace") or "{}")
@@ -4609,9 +4651,44 @@ async def api_music_soundya_token(request: Request) -> JSONResponse:
         input_data=json.dumps(config, ensure_ascii=False).encode(), timeout=15,
     )
     if code != 0:
-        raise HTTPException(status_code=502, detail="не удалось записать конфиг: " + err.decode("utf-8", "replace")[:150])
-    code, out, _ = await ssh_run_bytes("/etc/init.d/S99soundya restart 2>&1; sleep 2; soundya likes 2>&1 | head -2", timeout=60)
-    return JSONResponse({"ok": True, "output": out.decode("utf-8", "replace")[:300]})
+        return False, "не удалось записать конфиг: " + err.decode("utf-8", "replace")[:150]
+    code, out, _ = await ssh_run_bytes(
+        "/etc/init.d/S99soundya restart 2>&1 >/dev/null; sleep 2; soundya likes 2>&1 | head -2", timeout=60)
+    return True, out.decode("utf-8", "replace")[:300]
+
+
+async def _soundya_token_loop() -> None:
+    """Каждые 30 минут: свежий oauth_token из Firefox -> soundya (если изменился)."""
+    while True:
+        try:
+            if cfg.get("soundya_auto_firefox"):
+                token = await asyncio.to_thread(_firefox_soundcloud_token)
+                if token:
+                    code, cur, _ = await ssh_run_bytes(
+                        "cat /data/opt/soundya/config.json 2>/dev/null", timeout=15)
+                    try:
+                        current = json.loads(cur.decode("utf-8", "replace") or "{}").get("token", "")
+                    except Exception:
+                        current = ""
+                    if token != current:
+                        ok, detail = await _soundya_apply_token(token)
+                        print(f"[soundya] токен обновлён из Firefox: {detail[:120]!r}" if ok
+                              else f"[soundya] не применился: {detail[:120]!r}")
+        except Exception as exc:
+            print(f"[soundya] цикл Firefox: {type(exc).__name__}: {str(exc)[:120]}")
+        await asyncio.sleep(1800)
+
+
+@app.post("/api/music/soundya/token")
+async def api_music_soundya_token(request: Request) -> JSONResponse:
+    """Обновить oauth_token SoundCloud в /data/opt/soundya/config.json."""
+    require_auth(request)
+    data = await request.json()
+    token = str(data.get("token", "")).strip()
+    ok, detail = await _soundya_apply_token(token)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return JSONResponse({"ok": True, "output": detail})
 
 
 # --------------------------------------------------------------------------- #
