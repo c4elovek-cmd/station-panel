@@ -59,6 +59,9 @@
 - **Рефреш-флоу SoundCloud не автоматизируется**: oauth_refresh_token ротируется при каждом использовании (попытка refresh дал invalid_grant на старом / выдаст ротацию на свежем) — автоматический рефреш сломает браузерную сессию. Не использовать refresh из экспорта.
 - **Прочее**: refresh_token браузера хранится до мая 2027, access до суток. soundya: /data/opt/soundya/ (config.json, run.sh, guard.sh), веб-страница токена выключена (SOUNDYA_WEB_PORT=0), прокси socks5 в config.json.
 
+## 2026-11-07
+- **Ресёрч рефреша SoundCloud (07.11)**: бандл веб-плеера показывает механику — POST на прокси-эндпоинт (tokenRefreshProxy: service v2, path /-/refresh-token, includeCredentials), client_id веб-плеера 39AVoiZVrdvJEMFLH8T0c5WGshQaAPRJ (сменился с QhVEWrrJ). Все известные хосты (soundcloud.com, api-v2, api-auth, webi api/refresh-token) дают 404/405: эндпоинт недоступен вне браузерного контекста. Следующий шаг при желании: F12 → Network в Firefox в момент автообновления токена (~раз в сутки) — снять точный запрос. Пока: суточный экспорт oauth_token в «Музыку».
+
 ## 2026-10-31
 
 - **Грабли IPC 9875 (критично)**: любое TCP-соединение к IPC maind регистрируется в maind как «component» НАВСЕГДА — отключившийся клиент остаётся «attached but stopped», и активации «Алиса» маршрутизируются в мёртвый компонент («Activation ignored: component 24 is attached but stopped»). Чистого detach в протоколе не найдено. Лечение: рестарт maind --platformd (kill PID — лаунчер quasar_launcher2 поднимает сам за ~10 с, споттер-модель пересоздаётся). Поэтому IPC-слушатель медиа-фраз ВЫКЛЮЧЕН (галочка в «Словах») до чистого решения (detach-RPC или компонент на колонке).
