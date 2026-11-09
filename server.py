@@ -2466,6 +2466,20 @@ def _vps_package(include_keys: bool) -> list[tuple[str, Any, int]]:
     return items
 
 
+async def _probe_host(ip: str, port: int, timeout: float = 3.0) -> bool:
+    """Открыт ли TCP-порт на сервере (быстрый ответ после деплоя)."""
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 async def _vps_deploy_job(job_id: str, host: str, port: int, user: str,
                           password: str, panel_port: int, include_keys: bool,
                           setup_tunnel: bool, panel_version: str = "") -> None:
@@ -2554,6 +2568,14 @@ async def _vps_deploy_job(job_id: str, host: str, port: int, user: str,
         job["ok"] = True
         job["status"] = "готово"
         log("Дальше: 1) запусти сервер в панели хостинга (если ещё не запущен);")
+        ip = socket.gethostbyname(host)
+        if panel_port:
+            alive = await _probe_host(ip, panel_port)
+            log(("порт панели " + str(panel_port) + " отвечает — сервер запущен: "
+                 "http://" + ip + ":" + str(panel_port))
+                if alive else
+                "порт панели " + str(panel_port) + " пока закрыт — сервер в панели хостинга не запущен "
+                "(кнопка Start в консоли); после старта панель появится на http://" + ip + ":" + str(panel_port))
         log("2) первый старт ставит зависимости ~1 мин;")
         log("3) открой http://<IP>:<порт панели> — логин и пароль такие же, как здесь;")
         log("4) HTTPS: добавь домен в Cloudflare (A-запись + Origin Rule на порт панели + SSL Flexible).")
