@@ -1972,6 +1972,36 @@ $('askText').addEventListener('keydown', (event) => {
   if (event.key === 'Enter') $('askBtn').click();
 });
 
+async function askIpcRefresh() {
+  try {
+    const data = await api('/api/alice/ask/ipc');
+    $('askIpcStatus').textContent = data.status || '—';
+  } catch (error) {
+    $('askIpcStatus').textContent = 'ошибка: ' + error.message;
+  }
+}
+
+$('askIpcConnect').onclick = async () => {
+  try {
+    const data = await api('/api/alice/ask/ipc', { method: 'POST', body: JSON.stringify({}) });
+    $('askIpcStatus').textContent = data.status || '—';
+    notify($('askStatus'), 'канал к колонке открыт', 'ok');
+  } catch (error) {
+    notify($('askStatus'), 'ошибка: ' + error.message, 'error');
+  }
+};
+
+$('askIpcDisconnect').onclick = async () => {
+  try {
+    const data = await api('/api/alice/ask/ipc', { method: 'POST', body: JSON.stringify({ disconnect: true }) });
+    $('askIpcStatus').textContent = data.status || '—';
+    notify($('askStatus'), 'канал к колонке закрыт', 'ok');
+  } catch (error) {
+    notify($('askStatus'), 'ошибка: ' + error.message, 'error');
+  }
+};
+askIpcRefresh();
+
 /* ------------------------- файловый менеджер ------------------------- */
 let filesCurrent = '/data';
 

@@ -281,6 +281,11 @@
           <div class="panel" style="margin-top:4px" id="askAnswer"></div>
         </div>
         <p class="muted small" style="margin:8px 0 0">Колонка «слышит» вопрос так же, как если бы вы его продиктовали: ответ она проговаривает вслух своим голосом. Текст ответа в канал колонки обычно не приходит — если он появился, он будет ниже. Вопрос занимает около 15–25 секунд.</p>
+        <div class="row wrap" id="askIpcBox" style="margin-top:6px">
+          <span class="muted small">Канал колонки: <b id="askIpcStatus">—</b></span>
+          <button class="btn sm" id="askIpcConnect">Подключить</button>
+          <button class="btn sm" id="askIpcDisconnect">Отключить</button>
+        </div>
       </div>
       <div class="row wrap" style="margin-bottom:10px">
         <button class="btn sm" data-cmd="wget -qO- http://127.0.0.1:8099/api/device">устройство</button>
