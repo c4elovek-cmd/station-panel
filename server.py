@@ -165,17 +165,26 @@ IPC_MEDIA_PHRASES = {
     "играть": "play",
 }
 _media_listener_task: asyncio.Task | None = None
+# Вопрос из панели, ответ на который ждёт слушатель IPC: {"text": …, "phrases": […]}.
+# None — никто не ждёт; ответы Алисы в это время просто отбрасываются.
+_ask_pending: dict | None = None
+
+
+def _ipc_alice_question() -> str | None:
+    """Забираем вопрос, заданный из панели и ожидающий ответа Алисы."""
+    question = _ask_pending
+    return question.get("text") if question else None
 
 
 async def _ipc_media_listener() -> None:
-    """Долгоживущий слушатель IPC: переподключается, шлёт совпавшие фразы мосту."""
+    """Долгоживущий слушатель IPC: переподключается, шлёт совпавшие фразы мосту
+    и передаёт ответы Алисы (фокус — вопросы, заданные из панели).
+
+    Работает независимо от ipc_media_listen: ответы нужны «Спросить Алису»."""
     last_sent: dict[str, float] = {}
     while True:
         bridge_base = str(cfg.get("voice_bridge_url") or "").split("/api/voice")[0].rstrip("/")
         token = str(cfg.get("voice_bridge_token") or "")
-        if not (cfg.get("ipc_media_listen") and bridge_base and token):
-            await asyncio.sleep(5)
-            continue
         conn = None
         try:
             conn = await ssh_connect()
@@ -193,7 +202,11 @@ async def _ipc_media_listener() -> None:
                 if envelope.get(1) not in (1, 3) or not isinstance(envelope.get(2), bytes):
                     continue  # интересуют события распознавания с текстом
                 text = envelope[2].decode("utf-8", "replace").strip().lower()
-                if not text or "алиса" in text:
+                # ответ Алисы на вопрос из панели — забирает тот, кто ждёт
+                if text and _ask_pending is not None:
+                    _ask_pending["phrases"].append(text)
+                    continue
+                if not (cfg.get("ipc_media_listen") and bridge_base and token):
                     continue
                 cmd = IPC_MEDIA_PHRASES.get(text)
                 if not cmd:
@@ -237,7 +250,13 @@ async def _start_background_loops() -> None:
     asyncio.create_task(_clock_pin_loop())
     asyncio.create_task(_night_clock_loop())
     asyncio.create_task(_volume_sync_loop())
-    asyncio.create_task(_ipc_media_listener())
+    _media_listener_task = asyncio.create_task(_ipc_media_listener())
+
+
+@app.on_event("shutdown")
+async def _stop_background_loops() -> None:
+    """Закрыть постоянное IPC-соединение с колонкой, чтобы maind видел отключение."""
+    await _ipc_close()
 
 
 # --------------------------------------------------------------------------- #
@@ -3787,6 +3806,27 @@ async def api_say_quota(request: Request) -> JSONResponse:
 
 
 # --- нативная озвучка через локальный IPC (без куки и токенов) ---
+# ВАЖНО (см. todo.md): любое подключение к 9875 оставляет в maind «component … attached
+# but stopped», и «Алиса» перестаёт слышать активации. Поэтому слушатель фраз
+# (ipc_media_listen) выключен, а озвучка включается только если пользователь сам
+# разрешил её в «Терминале» (connect_ipc: чип «Подключить IPC»).
+_ipc_conn: Any = None  # живое соединение с maind колонки (общее для всех озвучек)
+_ipc_lock: asyncio.Lock | None = None
+
+
+def _ipc_get_lock() -> asyncio.Lock:
+    global _ipc_lock
+    if _ipc_lock is None:
+        _ipc_lock = asyncio.Lock()
+    return _ipc_lock
+
+
+def _ipc_status_text() -> str:
+    if _ipc_conn is not None and not getattr(_ipc_conn, "_closed", False):
+        return "подключён"
+    return "не подключён"
+
+
 def _ipc_varint(value: int) -> bytes:
     out = bytearray()
     while value >= 128:
@@ -3847,29 +3887,106 @@ def _ipc_frame(field: int, payload: bytes) -> bytes:
     return len(envelope).to_bytes(4, "little") + envelope
 
 
+def _ipc_directive(field: int, dtype: int, payload: bytes = b"") -> bytes:
+    """Директива Алисы: {1: номер директивы, 3: 1, <аргументы>} в канал AliceCapability."""
+    inner = _ipc_byte_field(1, b"AliceCapability") + _ipc_integer(1, dtype) + _ipc_integer(3, 1) + payload
+    return _ipc_frame(field, inner)
+
+
 def _ipc_vocalize_frame(text: str) -> bytes:
     # START_VOCALIZE=18, events=true, TVocalizeDirective(text, Append=1)
     directive = _ipc_byte_field(1, text.encode("utf-8")) + _ipc_integer(2, 1)
     return _ipc_frame(8, _ipc_integer(1, 18) + _ipc_integer(3, 1) + _ipc_byte_field(13, directive))
 
 
-async def _ipc_say(text: str, timeout: float = 30.0) -> None:
-    """Нативная озвучка голосом Алисы через локальный IPC колонки (127.0.0.1:9875,
-    AliceCapability START_VOCALIZE). Куки и токены Яндекса не нужны — работает
-    авторизация самой колонки. Формат кадров повторяет contrib/alice-say.py из вики
-    hackalice.me; на Мини 2 события приходят с эхом rpc-id 210 (253=210), поэтому
-    принимаются оба значения. Озвучка идёт через SSH-порт-форвард — socat не нужен."""
-    conn = await ssh_connect()
+def _ipc_text_input_frame(text: str) -> bytes:
+    """START_TEXT_INPUT (директива 1181) — колонка сама отправляет фразу в облако.
+
+    Раскладка поля 9 ({1 → 13 → 1 = текст}) подобрана перебором по логу maind:
+    только она даёт `onStartVinsRequest header = Vins.TextInput`. Остальные
+    раскладки maind молча проглатывает."""
+    payload = _ipc_byte_field(9, _ipc_byte_field(1, _ipc_byte_field(13, _ipc_byte_field(1, text.encode("utf-8")))))
+    return _ipc_directive(210, 1181, payload)
+
+
+async def _ipc_close() -> None:
+    """Закрыть общее IPC-соединение (maind сам заметит отключение)."""
+    global _ipc_conn
+    conn = _ipc_conn
+    _ipc_conn = None
+    if conn is None:
+        return
     try:
+        conn.close()
+        await conn.wait_closed()
+    except Exception:
+        pass
+
+
+async def _ipc_open() -> Any:
+    """Открыть (или вернуть живое) SSH-соединение до колонки (для IPC 9875).
+
+    Важно: утёкшие «компоненты» в maind остаются навсегда, сколько бы соединений
+    мы ни открывали, поэтому держим одно долгоживущее, а не новое на каждую фразу."""
+    global _ipc_conn
+    if _ipc_conn is not None and not _ipc_conn.is_closed():
+        return _ipc_conn
+    _ipc_conn = None
+    conn = await ssh_connect()
+    _ipc_conn = conn
+    return conn
+
+
+async def _ipc_say(text: str, timeout: float = 60.0, with_events: bool = False,
+                   speak_timeout: float = 10.0) -> list[dict]:
+    """Озвучка голосом Алисы через локальный IPC (127.0.0.1:9875, AliceCapability
+    START_VOCALIZE) — без куки и токенов, работает авторизация самой колонки.
+
+    Соединение постоянное (одно на панель): каждое новое подключение к maind
+    плодит «компоненты», после которых «Алиса» может перестать слышать
+    активации. Кадры повторяют contrib/alice-say.py вики hackalice.me; на Мини 2
+    эхо rpc-id 210 (253=210), принимаются оба.
+
+    text = "" — только открыть канал. with_events=True — дождаться голосовых
+    событий Алисы (ответов) и вернуть их списком [{"event": n, "text": "…"}]."""
+    async with _ipc_get_lock():
+        conn = await _ipc_open()
         reader, writer = await conn.open_connection("127.0.0.1", 9875)
-        writer.write(_ipc_frame(20, _ipc_byte_field(1, b"AliceCapability")) + _ipc_vocalize_frame(text))
-        started = False
+        events: list[dict] = []
         try:
+            writer.write(_ipc_frame(20, _ipc_byte_field(1, b"AliceCapability")))
+            if text:
+                writer.write(_ipc_vocalize_frame(text))
+            started = False
+            heard: list[str] = []
+            deadline = asyncio.get_event_loop().time() + timeout
+            # с распознаванием голоса ждём ответ Алисы дольше: она сначала
+            # проигрывает «Хорошо» + сам ответ, звук распознавания приходит позже
+            speak_deadline = deadline + (speak_timeout if with_events else 0)
             while True:
-                size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), timeout), "little")
-                if not 0 < size <= 512 * 1024:
-                    raise HTTPException(status_code=502, detail="IPC: битый размер кадра")
-                envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), timeout))
+                now = asyncio.get_event_loop().time()
+                limit = speak_deadline if with_events else deadline
+                left = limit - now
+                if left <= 0:
+                    break
+                try:
+                    size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), left), "little")
+                    if not 0 < size <= 512 * 1024:
+                        raise HTTPException(status_code=502, detail="IPC: битый размер кадра")
+                    envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), left))
+                except asyncio.TimeoutError:
+                    break
+                # голосовые события Алисы идут кадрами верхнего уровня (поле 1 =
+                # номер события, поле 2 = текст) — 3 и есть распознанная речь;
+                # нативные фразы («стоп», «дальше») приходят сюда же.
+                if isinstance(envelope.get(2), bytes) and envelope.get(1) in (1, 3, 5, 7, 9):
+                    line = envelope[2].decode("utf-8", "replace").strip()
+                    if line and line not in heard:
+                        heard.append(line)
+                        events.append({"event": int(envelope.get(1) or 0), "text": line})
+                        if with_events and started:
+                            # подтверждение озвучки уже было — текст речи = ответ
+                            break
                 if envelope.get(253) not in (3, 210):
                     continue
                 remote = _ipc_parse(envelope.get(252, b""))
@@ -3878,26 +3995,183 @@ async def _ipc_say(text: str, timeout: float = 30.0) -> None:
                 event = _ipc_parse(remote[18]).get(1)
                 if event == 6:
                     started = True
-                elif event == 1 and started:
-                    return
+                    if with_events:
+                        speak_deadline = asyncio.get_event_loop().time() + speak_timeout
+                elif event == 1 and started and not with_events:
+                    break
                 elif event == 4:
                     raise HTTPException(status_code=502, detail="колонка сообщила об ошибке озвучки")
-        except asyncio.TimeoutError:
-            if started:
-                return  # озвучка идёт дольше лимита — не считаем ошибкой
-            raise HTTPException(status_code=502, detail="IPC: колонка не подтвердила озвучку")
-        except asyncssh.Error as exc:
-            raise HTTPException(status_code=502, detail=f"IPC-канал: {str(exc)[:120]}")
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail=f"IPC: {exc}")
+            return events
+        except HTTPException:
+            raise
+        except HTTPException:
+            raise
+        except (asyncssh.Error, OSError, ValueError) as exc:
+            await _ipc_close()
+            raise HTTPException(status_code=502, detail=f"IPC-канал: {str(exc)[:140]}")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # разметка кадра не сошлась и т.п. — канал мог развалиться
+            await _ipc_close()
+            raise HTTPException(status_code=502, detail=f"IPC: {str(exc)[:140]}")
         finally:
-            writer.close()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"IPC-озвучка не удалась: {str(exc)[:140]}")
-    finally:
-        conn.close()
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+
+async def _ipc_ask(question: str, timeout: float = 25.0) -> dict:
+    """Задать вопрос Алисе из панели и дождаться её ответа.
+
+    Вопрос уходит директивой START_TEXT_INPUT: колонка сама делает запрос
+    в облако и проговаривает ответ голосом. Сам ответ забирает постоянный
+    слушатель IPC (`_ipc_media_listener`) — он видит событие распознавания
+    готовой фразы; здесь только ждём, пока он положит фразы в _ask_pending."""
+    global _ask_pending
+    lock = _ipc_get_lock()
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="IPC занят: попробуй через несколько секунд")
+    async with lock:
+        if _ask_pending is not None:
+            raise HTTPException(status_code=409, detail="панель уже ждёт ответ на другой вопрос")
+        _ask_pending = {"text": question, "phrases": []}
+        writer = None
+        try:
+            conn = await _ipc_open()
+            reader, writer = await conn.open_connection("127.0.0.1", 9875)
+            # подписка на события распознавания: собираем кадры с полем 1 (номер
+            # события) и полем 2 (текст) — теми же, что ловит слушатель фраз
+            writer.write(_ipc_frame(20, _ipc_byte_field(1, b"AliceCapability")))
+            writer.write(_ipc_text_input_frame(question))
+            return await _ipc_wait_answer(reader, timeout)
+        except HTTPException:
+            raise
+        except (asyncssh.Error, OSError, ValueError) as exc:
+            await _ipc_close()
+            raise HTTPException(status_code=502, detail=f"IPC-канал: {str(exc)[:140]}")
+        except Exception as exc:
+            await _ipc_close()
+            raise HTTPException(status_code=502, detail=f"IPC: {str(exc)[:140]}")
+        finally:
+            _ask_pending = None
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+
+async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
+    """Ждём ответ Алисы: фразу из события распознавания или завершение TTS."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    heard: list[str] = []
+    events: list[dict] = []
+    started = False
+    said = False  # колонка подтвердила, что начала говорить (TTS начался)
+    while True:
+        # фразы, пойманные слушателем (другой сокет), тоже засчитываем
+        if _ask_pending is not None and _ask_pending.get("phrases"):
+            for line in list(_ask_pending["phrases"]):
+                if line not in heard:
+                    heard.append(line)
+                    events.append({"event": 3, "text": line})
+            if heard and (started or said):
+                return {"answered": heard, "events": events, "audio": True}
+        left = deadline - asyncio.get_event_loop().time()
+        if left <= 0:
+            break
+        try:
+            size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), min(left, 1.0)), "little")
+            if not 0 < size <= 512 * 1024:
+                raise HTTPException(status_code=502, detail="IPC: битый размер кадра")
+            envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), left))
+        except asyncio.TimeoutError:
+            continue
+        except (asyncssh.Error, OSError, ValueError):
+            break
+        if isinstance(envelope.get(2), bytes) and envelope.get(1) in (1, 3, 5, 7, 9):
+            line = envelope[2].decode("utf-8", "replace").strip()
+            if line and line not in heard:
+                heard.append(line)
+                events.append({"event": int(envelope.get(1) or 0), "text": line})
+                if started:
+                    # подтверждение озвучки уже было — текст речи = ответ
+                    return {"answered": heard, "events": events, "audio": True}
+        if envelope.get(253) not in (3, 210):
+            continue
+        remote = _ipc_parse(envelope.get(252, b""))
+        if envelope.get(253) == 3 and isinstance(remote.get(1), int):
+            # состояние Алисы: 2 = думает, 3 = говорит — значит ответ есть
+            if remote.get(1) >= 2:
+                said = True
+        if 18 not in remote:
+            continue
+        event = _ipc_parse(remote[18]).get(1)
+        if event == 6:
+            started = True
+            said = True
+        elif event == 1 and (started or said) and not heard:
+            # озвучка закончилась, текста в канале нет — значит колонка
+            # действительно ответила голосом; текст ответа недоступен
+            return {"answered": [], "events": events, "audio": True,
+                    "note": "Алиса ответила голосом, но текст ответа в канале не пришёл"}
+        elif event == 4:
+            raise HTTPException(status_code=502, detail="колонка сообщила об ошибке ответа")
+    return {"answered": heard, "events": events, "audio": bool(started or said) or bool(heard),
+            "note": "" if heard or started or said else "ответа не дождались: колонка не ответила или "
+                    "нет связи с облаком Яндекса"}
+
+
+@app.post("/api/alice/ask")
+async def api_alice_ask(request: Request) -> JSONResponse:
+    """Спросить Алису прямо из панели.
+
+    Вариант «Текст» — панель подключается к IPC колонки (разовое согласие
+    пользователя), шлёт распознанный текст в нативный канал озвучки и ждёт
+    ответ Алисы из того же канала. Терминалом это не считается: колонка просто
+    «услышала» фразу. На каждое подключение к 9875 в maind остаётся компонент,
+    поэтому отказываться от подключения не стоит — см. todo.md.
+
+    Вариант «Сценарий» — без норы в прошивке: текст уходит в облако Яндекса
+    через сценарий tts, колонка произносит его сама (нужна кука аккаунта)."""
+    require_auth(request)
+    data = await request.json()
+    text = str(data.get("text", "")).strip()
+    mode = str(data.get("mode") or "ipc")
+    if not text or len(text) > 500:
+        raise HTTPException(status_code=400, detail="вопрос от 1 до 500 символов")
+    if mode == "cloud":
+        if not cfg.get("yandex_x_token"):
+            raise HTTPException(status_code=400, detail="нет входа в Яндекс: вкладка «Алиса» → облачные тумблеры → войти")
+        await _alice_say(text)
+        return JSONResponse({"ok": True, "mode": "cloud", "answered": [],
+                             "note": "колонка озвучит текст голосом Алисы; ответ на вопрос недоступен"})
+    listen = float(data.get("listen_sec") or 25)
+    listen = max(5.0, min(listen, 90.0))
+    answer = await _ipc_ask(text, timeout=listen)
+    return JSONResponse({"ok": True, "mode": "ipc", "ipc": _ipc_status_text(), **answer})
+
+
+@app.get("/api/alice/ask/ipc")
+async def api_alice_ask_ipc(request: Request) -> JSONResponse:
+    """Состояние IPC-канала (подключён / нет) — для индикатора в «Терминале»."""
+    require_auth(request)
+    return JSONResponse({"ok": True, "status": _ipc_status_text()})
+
+
+@app.post("/api/alice/ask/ipc")
+async def api_alice_ask_ipc_open(request: Request) -> JSONResponse:
+    """Подключить IPC заранее или отключить его (дешевле, чем разовое согласие)."""
+    require_auth(request)
+    data = await request.json()
+    if data.get("disconnect"):
+        await _ipc_close()
+        return JSONResponse({"ok": True, "status": _ipc_status_text()})
+    async with _ipc_get_lock():
+        await _ipc_open()
+    return JSONResponse({"ok": True, "status": _ipc_status_text()})
 
 
 @app.post("/api/speaker/say")
@@ -3915,9 +4189,14 @@ async def api_speaker_say(request: Request) -> JSONResponse:
     import tempfile
 
     # Нативная озвучка через локальный IPC: без кук и токенов, голос Алисы.
+    # with_events — дождаться ответов Алисы (для «Спросить Алису»); иначе
+    # возвращаемся по факту начала озвучки.
     if engine == "ipc":
-        await _ipc_say(text)
-        return JSONResponse({"ok": True, "voice": "alice", "mood": "normal", "engine": "ipc"})
+        with_events = bool(data.get("with_events"))
+        events = await _ipc_say(text, timeout=float(data.get("listen_sec") or 20) if with_events else 60.0,
+                               with_events=with_events)
+        return JSONResponse({"ok": True, "voice": "alice", "mood": "normal", "engine": "ipc",
+                             "events": events})
 
     # Родной голос Алисы: текст уходит в облако, колонка произносит сама.
     # Интонации (mood) недоступны — Яндекс не даёт менять темп/высоту фразы.

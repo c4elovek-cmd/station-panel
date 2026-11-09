@@ -1929,6 +1929,49 @@ $('sayBtn').onclick = async () => {
 };
 sayLoadEngine();
 
+/* ------------------------- спросить Алису -------------------------
+   Вопрос уходит в колонку директивой START_TEXT_INPUT — она сама делает
+   запрос в облако и отвечает голосом. Текст ответа панель получает, только
+   если колонка продублировала его в IPC. */
+$('askBtn').onclick = async () => {
+  const text = $('askText').value.trim();
+  if (!text) {
+    notify($('askStatus'), 'введи вопрос', 'error');
+    return;
+  }
+  const mode = $('askMode').value;
+  $('askBtn').disabled = true;
+  $('askAnswerBox').style.display = 'none';
+  notify($('askStatus'), mode === 'ipc'
+    ? 'колонка думает: жду ответа до 25 секунд…'
+    : 'отправляю текст в облако…');
+  try {
+    const data = await api('/api/alice/ask', {
+      method: 'POST',
+      body: JSON.stringify({ text, mode, listen_sec: 25 })
+    });
+    const answered = (data.answered || []).filter(Boolean);
+    if (answered.length) {
+      $('askAnswer').textContent = answered.join(' ');
+      $('askAnswerBox').style.display = '';
+      notify($('askStatus'), 'готово — ответ выше, колонка проговорила его вслух', 'ok');
+    } else if (data.audio) {
+      notify($('askStatus'), 'Алиса ответила голосом на колонке (текст ответа в панель не пришёл)', 'ok');
+    } else if (data.note) {
+      notify($('askStatus'), data.note, 'error');
+    } else {
+      notify($('askStatus'), 'ответа нет — колонка молчит или нет связи с облаком', 'error');
+    }
+  } catch (error) {
+    notify($('askStatus'), 'ошибка: ' + error.message, 'error');
+  } finally {
+    $('askBtn').disabled = false;
+  }
+};
+$('askText').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') $('askBtn').click();
+});
+
 /* ------------------------- файловый менеджер ------------------------- */
 let filesCurrent = '/data';
 
