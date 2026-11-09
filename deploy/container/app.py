@@ -232,10 +232,28 @@ async def _stdin_command_loop() -> None:
                 print(f"[stdin-вывод] ошибка: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
 
 
+async def healthz_watch() -> None:
+    """Самопроверка через внешний адрес: при каждом запуске пишем в свой лог,
+    отвечает ли панель снаружи (видно в консоли хостинга).
+
+    Заодно снимает ответ с порта панели напрямую через loopback, чтобы отличить
+    «панель не поднялась» от «роутер не проксирует».
+    """
+    await asyncio.sleep(15)
+    while True:
+        panel_ok = port_open(PANEL_PORT)
+        print(f"[самопроверка] панель на 127.0.0.1:{PANEL_PORT}: "
+              f"{'слушает' if panel_ok else 'НЕ слушает'}; процессы: "
+              + ", ".join(f"{n}={p.poll() if p.poll() is not None else 'ok'}"
+                          for n, p in PROCS.items()), flush=True)
+        await asyncio.sleep(60)
+
+
 async def on_startup(app: web.Application) -> None:
     global SESSION
     SESSION = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
     spawn_all()
+    app["health_watch"] = asyncio.create_task(healthz_watch())
     app["watchdog"] = asyncio.create_task(watchdog())
     app["stdin_loop"] = asyncio.create_task(_stdin_command_loop())
 
