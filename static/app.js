@@ -2002,6 +2002,71 @@ $('askIpcDisconnect').onclick = async () => {
 };
 askIpcRefresh();
 
+/* ------------------------- позвонить на колонку -------------------------
+   Звонок идёт телефонной учёткой колонки (ATS Яндекса). Директива MakeCall
+   требует знания proto-схемы прошивки, поэтому основной режим — фраза
+   «позвони <номер>» в тот же канал, что и вопросы Алисе. */
+async function callRefresh() {
+  try {
+    const data = await api('/api/calls');
+    const parts = [];
+    parts.push(data.calls_enabled ? 'звонки включены' : 'звонки выключены');
+    parts.push(data.answer_phrase ? 'ответ на входящий — по фразе' : 'автоответ выключен');
+    if (data.dnd_enabled) parts.push(data.allow_incoming ? '«не беспокоить», входящие разрешены' : '«не беспокоить» глушит входящие');
+    $('callState').textContent = 'состояние: ' + parts.join('; ');
+    $('callReadyBtn').disabled = !!data.ready;
+  } catch (error) {
+    $('callState').textContent = 'состояние: ошибка — ' + error.message;
+  }
+}
+
+$('callReadyBtn').onclick = async () => {
+  $('callReadyBtn').disabled = true;
+  notify($('callStatus'), 'записываю настройки в колонку…');
+  try {
+    const data = await api('/api/calls/ready', { method: 'POST', body: JSON.stringify({}) });
+    notify($('callStatus'), data.note || 'настройки записаны', 'ok');
+    await callRefresh();
+  } catch (error) {
+    notify($('callStatus'), 'ошибка: ' + error.message, 'error');
+    $('callReadyBtn').disabled = false;
+  }
+};
+
+$('callBtn').onclick = async () => {
+  const number = $('callNumber').value.trim();
+  if (!number) {
+    notify($('callStatus'), 'введи номер', 'error');
+    return;
+  }
+  const mode = $('callMode').value;
+  $('callBtn').disabled = true;
+  notify($('callStatus'), mode === 'directive'
+    ? 'отправляю директиву звонка…'
+    : 'колонка набирает номер: жду до 25 секунд…');
+  try {
+    const data = await api('/api/calls/dial', {
+      method: 'POST',
+      body: JSON.stringify({ number, mode, listen_sec: 25 })
+    });
+    if (data.audio) {
+      notify($('callStatus'), 'Алиса приняла команду звонка на ' + data.number, 'ok');
+    } else if (data.note) {
+      notify($('callStatus'), data.number + ': ' + data.note, data.mode === 'directive' ? 'ok' : 'error');
+    } else {
+      notify($('callStatus'), 'команда ушла на ' + data.number + ', подтверждения в канале нет', 'error');
+    }
+  } catch (error) {
+    notify($('callStatus'), 'ошибка: ' + error.message, 'error');
+  } finally {
+    $('callBtn').disabled = false;
+  }
+};
+$('callNumber').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') $('callBtn').click();
+});
+callRefresh();
+
 /* ------------------------- файловый менеджер ------------------------- */
 let filesCurrent = '/data';
 

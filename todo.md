@@ -53,6 +53,12 @@
 - Расширенный API колонки: https://github.com/Marker284/yandex-station-extended (YAM, :8099)
 - Терминал в панели: xterm.js (https://xtermjs.org/)
 
+## 2026-11-11
+
+- **Звонок на колонку**: телефонная учётка Яндекса уже привязана (`2338370722`, `alice-ats.yandex.net`). Флаги в `user_config.dat`: `system_config.phone_calls.enabled` (было true), `account_config.enabledCommandSpotters.call.answer` (было false → включили), `device_config.dndMode.features.allowIncomingCalls` (было false → включили). Колонка подхватывает их после `kill maind --platformd`.
+- **Набор номера идёт фразой, не директивой**: `PhoneCalls.MakeCall` требует protobuf-схему прошивки, поэтому панель шлёт в тот же канал, что и вопросы, фразу «позвони <номер>». Режим «директивой» (`_ipc_call_frame`, поле 210, номер 1212) оставлен на пробу, по умолчанию выключен.
+- **yamd управляется `/etc/init.d/S99yam`**; после `kill` сам не поднимается — запускать вручную тем же бинарником с `--data-dir /data/quazar/yam/data`.
+
 ## 2026-11-07
 
 - **SoundCloud-токен стал суточным (31.10/07.11)**: SoundCloud выдаёт oauth_token в формате JWT на 24 ч (вместо вечного «2-uid-ts-secret»). Симптом протухания: «Алиса, включи X» молчит, `soundya likes/play` → «SoundCloud не принял токен входа». Обновление: на soundcloud.com обновить страницу (браузер сам рефрешит токен) → экспорт кук → oauth_token вставить в панель «Музыка» (валидатор принимает JWT, поле до 1600 симв.) — или прислать в чат. Звено «Алиса→мост→soundya» при живом токене работает.

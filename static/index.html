@@ -287,6 +287,23 @@
           <button class="btn sm" id="askIpcDisconnect">Отключить</button>
         </div>
       </div>
+      <div class="panel" style="margin-bottom:12px">
+        <h3>Позвонить на колонку</h3>
+        <div class="row wrap">
+          <span class="muted small" id="callState">состояние: загружаю…</span>
+          <button class="btn sm" id="callReadyBtn">Разрешить входящие</button>
+        </div>
+        <div class="row wrap" style="margin-top:8px">
+          <input class="input" id="callNumber" inputmode="tel" placeholder="+7 999 123-45-67" style="flex:1; min-width:220px">
+          <select class="input" id="callMode" style="width:auto">
+            <option value="phrase">фразой Алисе</option>
+            <option value="directive">директивой MakeCall</option>
+          </select>
+          <button class="btn primary" id="callBtn">Позвонить</button>
+        </div>
+        <p class="muted small" id="callStatus" style="margin-top:8px"></p>
+        <p class="muted small" style="margin:8px 0 0">Звонок идёт через телефонную учётку, привязанную к колонке: Алиса сама набирает номер и говорит через динамики, микрофон станции работает как гарнитура. «Не беспокоить» может глушить входящие — кнопка выше разрешает их.</p>
+      </div>
       <div class="row wrap" style="margin-bottom:10px">
         <button class="btn sm" data-cmd="wget -qO- http://127.0.0.1:8099/api/device">устройство</button>
         <button class="btn sm" data-cmd="wget -qO- http://127.0.0.1:8099/api/plugins">плагины</button>
@@ -1150,7 +1167,7 @@ scp -P 2222 file.txt root@192.168.0.172:/tmp/</pre>
 
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/addon-fit.js"></script>
-<script src="/static/app.js?v=20261109"></script>
+<script src="/static/app.js?v=20261111"></script>
 <script>
 /* liquid-glass кружок за курсором — декоративный, pointer-events:none в CSS */
 (function () {

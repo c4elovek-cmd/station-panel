@@ -1283,6 +1283,22 @@ async def api_telemetry_put(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "enabled": enable, **state})
 
 
+@app.post("/api/system/restart")
+async def api_system_restart(request: Request) -> JSONResponse:
+    """Перезапустить панель: выйти с кодом 1, супервизор app.py поднимет заново.
+
+    Нужно после замены server.py на сервере — без shell-доступа иначе никак."""
+    require_auth(request)
+    import os as _os
+
+    async def _die() -> None:
+        await asyncio.sleep(0.5)
+        _os._exit(1)
+
+    asyncio.create_task(_die())
+    return JSONResponse({"ok": True, "note": "панель перезапускается, через 3–5 с вернись на страницу"})
+
+
 @app.get("/api/system/minidumps")
 async def api_system_minidumps(request: Request) -> JSONResponse:
     """Список минидампов падений демонов (/data/quasar/minidump) — для диагностики."""
@@ -1567,6 +1583,12 @@ async def api_alice_settings_put(request: Request) -> JSONResponse:
     sets = body.get("sets") or ([{"path": body["path"], "value": body["value"]}] if "path" in body else [])
     if not sets:
         raise HTTPException(status_code=400, detail="пустой набор изменений")
+    applied = await _apply_alice_settings(sets)
+    return JSONResponse({"ok": True, "applied": applied})
+
+
+async def _apply_alice_settings(sets: list[dict]) -> list[str]:
+    """Записать правки в user_config.dat с бэкапом .bak-panel (без проверки сессии)."""
     code, out, err = await ssh_run_bytes(f"cat {USER_CONFIG_PATH}")
     if code != 0:
         raise HTTPException(status_code=502, detail="SSH: " + err.decode(errors="replace")[:160])
@@ -1613,7 +1635,7 @@ async def api_alice_settings_put(request: Request) -> JSONResponse:
         raise HTTPException(status_code=502, detail=str(exc)[:180])
     finally:
         conn.close()
-    return JSONResponse({"ok": True, "applied": applied})
+    return applied
 
 
 @app.get("/api/alice/wifi")
@@ -2570,12 +2592,16 @@ async def _vps_deploy_job(job_id: str, host: str, port: int, user: str,
         log("Дальше: 1) запусти сервер в панели хостинга (если ещё не запущен);")
         ip = socket.gethostbyname(host)
         if panel_port:
+            # wings даёт приложению свой порт:$SERVER_PORT — он должен совпадать
+            # с полем «порт панели» и с портом в chisel.env, иначе снаружи пусто
             alive = await _probe_host(ip, panel_port)
             log(("порт панели " + str(panel_port) + " отвечает — сервер запущен: "
                  "http://" + ip + ":" + str(panel_port))
                 if alive else
-                "порт панели " + str(panel_port) + " пока закрыт — сервер в панели хостинга не запущен "
-                "(кнопка Start в консоли); после старта панель появится на http://" + ip + ":" + str(panel_port))
+                "порт панели " + str(panel_port) + " пока закрыт: проверь, что в панели хостинга "
+                "в поле порта указан именно " + str(panel_port)
+                + " (строка «роутер на 0.0.0.0:<порт>» в консоли должна показывать то же число) "
+                "и что сервер запущен")
         log("2) первый старт ставит зависимости ~1 мин;")
         log("3) открой http://<IP>:<порт панели> — логин и пароль такие же, как здесь;")
         log("4) HTTPS: добавь домен в Cloudflare (A-запись + Origin Rule на порт панели + SSL Flexible).")
@@ -3833,7 +3859,57 @@ async def api_say_quota(request: Request) -> JSONResponse:
 # (ipc_media_listen) выключен, а озвучка включается только если пользователь сам
 # разрешил её в «Терминале» (connect_ipc: чип «Подключить IPC»).
 _ipc_conn: Any = None  # живое соединение с maind колонки (общее для всех озвучек)
+_ipc_stream: Any = None  # постоянный канал к 127.0.0.1:9875 (вопросы и озвучка)
+_ipc_reader: Any = None
+_ipc_opened_at: float = 0.0
 _ipc_lock: asyncio.Lock | None = None
+
+
+async def _ipc_stream_open() -> tuple[Any, Any]:
+    """Канал к maind (9875) для вопросов и звонков.
+
+    Опыт Мини 2: первое подключение после рестарта maind работает, второе
+    же проглатывает директивы, а старый канал допихивает застрявшие события
+    от прошлых запросов — из-за этого «ответы» приходят за 0.0 с. Поэтому
+    панель использует один сокет (переоткрывая его только после рестарта
+    maind), но ждёт события только в течение секунды после отправки: у maind
+    на той же сессии случается задержка ~14 с, а старые события от прошлых
+    запросов ждать нельзя."""
+    global _ipc_stream, _ipc_reader, _ipc_opened_at
+    if _ipc_stream is not None and not getattr(_ipc_stream, "is_closing", lambda: False)():
+        # Панель живёт долго, а maind на колонке перезапускается (и при
+        # обновлении прошивки) — после этого старый сокет «немой». Держим
+        # канал не дольше 3 минут: следующая команда откроет свежий.
+        if time.time() - _ipc_opened_at < 180:
+            return _ipc_reader, _ipc_stream
+        _ipc_stream_reset()
+    conn = await _ipc_open()
+    reader, writer = await conn.open_connection("127.0.0.1", 9875)
+    first = True
+    try:
+        while True:  # съесть приветственные кадры, чтобы не мешали ответу
+            size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 0.4 if first else 0.15), "little")
+            first = False
+            if not 0 < size <= 512 * 1024:
+                break
+            await asyncio.wait_for(reader.readexactly(size), 0.15)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
+        pass
+    _ipc_reader, _ipc_stream = reader, writer
+    _ipc_opened_at = time.time()
+    return reader, writer
+
+
+def _ipc_stream_reset() -> None:
+    """Сбросить постоянный канал (после ошибки) — следующий вопрос откроет новый."""
+    global _ipc_stream, _ipc_reader
+    writer = _ipc_stream
+    _ipc_stream = _ipc_reader = None
+    if writer is not None:
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 
 def _ipc_get_lock() -> asyncio.Lock:
@@ -3921,6 +3997,31 @@ def _ipc_vocalize_frame(text: str) -> bytes:
     return _ipc_frame(8, _ipc_integer(1, 18) + _ipc_integer(3, 1) + _ipc_byte_field(13, directive))
 
 
+def _ipc_call_frame(phone: str) -> bytes:
+    """PhoneCalls.MakeCall — звонок через телефонную учётку колонки (ATS Яндекса).
+
+    Важно: точный номер директивы и раскладка аргументов здесь неизвестны —
+    прошивка держит их в protobuf-схеме, которой на колонке нет. Поэтому
+    звонок по умолчанию идёт короткой фразой Алисе (`позвони <номер>`), а
+    этот кадр уходит только если пользователь сам выбрал «директивой»."""
+    payload = _ipc_byte_field(1, _ipc_byte_field(1, phone.encode("utf-8")))
+    return _ipc_directive(210, 1212, payload)
+
+
+def _normalize_phone(raw: str) -> str:
+    """Привести номер к виду +7XXXXXXXXXX (Россия) либо оставить как есть."""
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 11 and digits.startswith("8"):
+        return "+7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return "+" + digits
+    if len(digits) == 10:
+        return "+7" + digits
+    if 6 <= len(digits) <= 15:
+        return "+" + digits
+    return ""
+
+
 def _ipc_text_input_frame(text: str) -> bytes:
     """START_TEXT_INPUT (директива 1181) — колонка сама отправляет фразу в облако.
 
@@ -3932,8 +4033,9 @@ def _ipc_text_input_frame(text: str) -> bytes:
 
 
 async def _ipc_close() -> None:
-    """Закрыть общее IPC-соединение (maind сам заметит отключение)."""
-    global _ipc_conn
+    """Закрыть общее IPC-соединение и постоянный канал (maind заметит отключение)."""
+    global _ipc_conn, _ipc_stream, _ipc_reader
+    _ipc_stream = _ipc_reader = None
     conn = _ipc_conn
     _ipc_conn = None
     if conn is None:
@@ -4050,7 +4152,10 @@ async def _ipc_ask(question: str, timeout: float = 25.0) -> dict:
     Вопрос уходит директивой START_TEXT_INPUT: колонка сама делает запрос
     в облако и проговаривает ответ голосом. Сам ответ забирает постоянный
     слушатель IPC (`_ipc_media_listener`) — он видит событие распознавания
-    готовой фразы; здесь только ждём, пока он положит фразы в _ask_pending."""
+    готовой фразы; здесь только ждём, пока он положит фразы в _ask_pending.
+
+    На Мини 2 maind доносит TextInput до облака спустя 10–15 с после отправки
+    (проверено прямым подключением 11.11.2026), поэтому ждём не меньше 20 с."""
     global _ask_pending
     lock = _ipc_get_lock()
     if lock.locked():
@@ -4059,30 +4164,42 @@ async def _ipc_ask(question: str, timeout: float = 25.0) -> dict:
         if _ask_pending is not None:
             raise HTTPException(status_code=409, detail="панель уже ждёт ответ на другой вопрос")
         _ask_pending = {"text": question, "phrases": []}
-        writer = None
+        started = time.time()
         try:
-            conn = await _ipc_open()
-            reader, writer = await conn.open_connection("127.0.0.1", 9875)
-            # подписка на события распознавания: собираем кадры с полем 1 (номер
-            # события) и полем 2 (текст) — теми же, что ловит слушатель фраз
-            writer.write(_ipc_frame(20, _ipc_byte_field(1, b"AliceCapability")))
+            # один постоянный канал к maind: новое соединение на каждый вопрос
+            # оставляет в колонке компонент, после которого следующий TextInput
+            # уже не обрабатывается (проверено на Мини 2, ноябрь 2026)
+            reader, writer = await _ipc_stream_open()
             writer.write(_ipc_text_input_frame(question))
-            return await _ipc_wait_answer(reader, timeout)
+            result = await _ipc_wait_answer(reader, max(timeout, 20.0))
+            elapsed = time.time() - started
+            if not result.get("audio") and not result.get("answered") and elapsed < 1.0:
+                # канал «залип»: maind уже отдал что-то из буфера и молчит —
+                # переоткрываем его, чтобы следующий вопрос ушёл в чистый сокет
+                _ipc_stream_reset()
+                result["note"] = ("канал колонки залип (ответ пришёл мгновенно): канал переоткрыт, "
+                                  "повтори команду")
+            return result
         except HTTPException:
             raise
         except (asyncssh.Error, OSError, ValueError) as exc:
+            _ipc_stream_reset()
             await _ipc_close()
             raise HTTPException(status_code=502, detail=f"IPC-канал: {str(exc)[:140]}")
         except Exception as exc:
+            _ipc_stream_reset()
             await _ipc_close()
             raise HTTPException(status_code=502, detail=f"IPC: {str(exc)[:140]}")
         finally:
             _ask_pending = None
-            if writer is not None:
-                try:
-                    writer.close()
-                except Exception:
-                    pass
+
+
+async def _ipc_say_frame(text: str) -> str:
+    """Отправить одну фразу в постоянный канал (без ожидания ответа)."""
+    async with _ipc_get_lock():
+        _reader, writer = await _ipc_stream_open()
+        writer.write(_ipc_vocalize_frame(text))
+    return _ipc_status_text()
 
 
 async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
@@ -4092,6 +4209,7 @@ async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
     events: list[dict] = []
     started = False
     said = False  # колонка подтвердила, что начала говорить (TTS начался)
+    eof = False   # maind закрыл наш сокет — следующий кадр придёт только по новому
     while True:
         # фразы, пойманные слушателем (другой сокет), тоже засчитываем
         if _ask_pending is not None and _ask_pending.get("phrases"):
@@ -4101,6 +4219,16 @@ async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
                     events.append({"event": 3, "text": line})
             if heard and (started or said):
                 return {"answered": heard, "events": events, "audio": True}
+        if eof:
+            # канал закрыт со стороны maind: пробуем открыть новый и отдыхаем
+            _ipc_stream_reset()
+            await asyncio.sleep(0.5)
+            try:
+                reader, _w = await _ipc_stream_open()
+                eof = False
+            except Exception:
+                pass
+            continue
         left = deadline - asyncio.get_event_loop().time()
         if left <= 0:
             break
@@ -4111,8 +4239,14 @@ async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
             envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), left))
         except asyncio.TimeoutError:
             continue
+        except HTTPException:
+            raise
+        except (asyncio.IncompleteReadError, EOFError):
+            eof = True
+            continue
         except (asyncssh.Error, OSError, ValueError):
-            break
+            eof = True
+            continue
         if isinstance(envelope.get(2), bytes) and envelope.get(1) in (1, 3, 5, 7, 9):
             line = envelope[2].decode("utf-8", "replace").strip()
             if line and line not in heard:
@@ -4146,6 +4280,99 @@ async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
                     "нет связи с облаком Яндекса"}
 
 
+async def _ipc_place_call(phone: str, timeout: float = 25.0) -> dict:
+    """Позвонить на номер с колонки.
+
+    Прошивка не даёт подставить номер в MakeCall без знания её protobuf-схемы,
+    поэтому звонок идёт так же, как если сказать вслух: в канал уходит фраза
+    «позвони <номер>», Алиса понимает её сценарием телефонии и сама набирает
+    через ATS Яндекса (учётка 2338370722 уже привязана к колонке).
+
+    Главное — время: maind на Мини 2 доносит Vins.TextInput спустя 10–15 с
+    после нашей отправки (проверено прямым подключением 11.11.2026), поэтому
+    ждём не меньше 20 с, даже если в панели указали меньше."""
+    phrase = f"позвони {phone}"
+    lock = _ipc_get_lock()
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="IPC занят: попробуй через несколько секунд")
+    async with lock:
+        _reader, writer = await _ipc_stream_open()
+        started = time.time()
+        writer.write(_ipc_text_input_frame(phrase))
+        result = await _ipc_wait_answer(_reader, max(timeout, 20.0))
+        if not result.get("audio") and not result.get("answered") and time.time() - started < 1.0:
+            _ipc_stream_reset()
+            result["note"] = ("канал колонки залип (ответ пришёл мгновенно): канал переоткрыт, "
+                              "нажми «Позвонить» ещё раз")
+        return result
+
+
+@app.get("/api/calls")
+async def api_calls_status(request: Request) -> JSONResponse:
+    """Состояние телефонии: учётка, режим «не беспокоить», приём звонков."""
+    require_auth(request)
+    code, out, err = await ssh_run_bytes(f"cat {USER_CONFIG_PATH}")
+    if code != 0:
+        raise HTTPException(status_code=502, detail="SSH: " + err.decode(errors="replace")[:160])
+    config, _ = _extract_user_config(out)
+    system_cfg = config.get("system_config") or {}
+    account_cfg = config.get("account_config") or {}
+    device_cfg = config.get("device_config") or {}
+    dnd = device_cfg.get("dndMode") or {}
+    calls_enabled = bool((system_cfg.get("phone_calls") or {}).get("enabled"))
+    answer_phrase = bool(((account_cfg.get("enabledCommandSpotters") or {}).get("call") or {}).get("answer"))
+    dnd_on = bool(dnd.get("enabled"))
+    allow_incoming = bool((dnd.get("features") or {}).get("allowIncomingCalls"))
+    return JSONResponse({
+        "ok": True,
+        "calls_enabled": calls_enabled,
+        "answer_phrase": answer_phrase,
+        "dnd_enabled": dnd_on,
+        "allow_incoming": allow_incoming,
+        "incoming_blocked": dnd_on and not allow_incoming,
+        "ready": calls_enabled and answer_phrase and not (dnd_on and not allow_incoming),
+    })
+
+
+@app.post("/api/calls/ready")
+async def api_calls_ready(request: Request) -> JSONResponse:
+    """Включить всё, что нужно для звонков на колонку: звонки, ответ «прими
+    вызов» и входящие в режиме «не беспокоить»."""
+    require_auth(request)
+    sets = [
+        {"path": "system_config.phone_calls.enabled", "value": True},
+        {"path": "account_config.enabledCommandSpotters.call.answer", "value": True},
+        {"path": "device_config.dndMode.features.allowIncomingCalls", "value": True},
+    ]
+    applied = await _apply_alice_settings(sets)
+    return JSONResponse({"ok": True, "applied": applied,
+                         "note": "настройки записаны; звонок на колонку заработает после перезагрузки колонки"})
+
+
+@app.post("/api/calls/dial")
+async def api_calls_dial(request: Request) -> JSONResponse:
+    """Позвонить на указанный номер с колонки."""
+    require_auth(request)
+    data = await request.json()
+    raw = str(data.get("number") or "").strip()
+    phone = _normalize_phone(raw)
+    if not phone:
+        raise HTTPException(status_code=400, detail="номер не похож на телефонный")
+    listen = float(data.get("listen_sec") or 25)
+    listen = max(5.0, min(listen, 90.0))
+    mode = str(data.get("mode") or "phrase")
+    if mode == "directive":
+        async with _ipc_get_lock():
+            _reader, writer = await _ipc_stream_open()
+            writer.write(_ipc_call_frame(phone))
+        return JSONResponse({"ok": True, "mode": "directive", "number": phone,
+                             "note": "директива MakeCall отправлена; если колонка не набрала — "
+                                     "переключись на режим «фразой»"})
+    answer = await _ipc_place_call(phone, timeout=listen)
+    return JSONResponse({"ok": True, "mode": "phrase", "number": phone,
+                         "phrase": f"позвони {phone}", **answer})
+
+
 @app.post("/api/alice/ask")
 async def api_alice_ask(request: Request) -> JSONResponse:
     """Спросить Алису прямо из панели.
@@ -4176,11 +4403,51 @@ async def api_alice_ask(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "mode": "ipc", "ipc": _ipc_status_text(), **answer})
 
 
+async def _ipc_probe_capability() -> dict:
+    """Проверка живости канала: посылаем кадр запроса состояния и ждём ответ.
+
+    maind отдаёт по ident своей сессии любое состояние — так видно, что
+    сокет не «немой» (после рестарта maind старые сокеты молчат)."""
+    async with _ipc_get_lock():
+        reader, writer = await _ipc_stream_open()
+        writer.write(_ipc_frame(20, _ipc_byte_field(1, b"AliceCapability")))
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while True:
+            left = deadline - asyncio.get_event_loop().time()
+            if left <= 0:
+                return {"alive": False}
+            try:
+                size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), left), "little")
+                if not 0 < size <= 512 * 1024:
+                    return {"alive": False, "reason": "битый кадр"}
+                await asyncio.wait_for(reader.readexactly(size), left)
+                return {"alive": True}
+            except asyncio.TimeoutError:
+                return {"alive": False}
+            except Exception:
+                return {"alive": False}
+
+
 @app.get("/api/alice/ask/ipc")
 async def api_alice_ask_ipc(request: Request) -> JSONResponse:
     """Состояние IPC-канала (подключён / нет) — для индикатора в «Терминале»."""
     require_auth(request)
     return JSONResponse({"ok": True, "status": _ipc_status_text()})
+
+
+@app.get("/api/alice/ask/ipc")
+async def api_alice_ask_ipc(request: Request) -> JSONResponse:
+    """Состояние IPC-канала (подключён / нет) — для индикатора в «Терминале»."""
+    require_auth(request)
+    return JSONResponse({"ok": True, "status": _ipc_status_text()})
+
+
+@app.post("/api/alice/ask/ipc/probe")
+async def api_alice_ask_ipc_probe(request: Request) -> JSONResponse:
+    """Жив ли канал колонки прямо сейчас (кнопка «Проверить канал»)."""
+    require_auth(request)
+    result = await _ipc_probe_capability()
+    return JSONResponse({"ok": True, **result, "status": _ipc_status_text()})
 
 
 @app.post("/api/alice/ask/ipc")
@@ -4192,8 +4459,26 @@ async def api_alice_ask_ipc_open(request: Request) -> JSONResponse:
         await _ipc_close()
         return JSONResponse({"ok": True, "status": _ipc_status_text()})
     async with _ipc_get_lock():
-        await _ipc_open()
+        await _ipc_stream_open()
     return JSONResponse({"ok": True, "status": _ipc_status_text()})
+
+
+@app.get("/api/calls/ipc-usage")
+async def api_calls_ipc_usage(request: Request) -> JSONResponse:
+    """Сколько TCP-соединений к IPC 9875 открыто на колонке.
+
+    Каждое такое соединение maind запоминает как «компонент» и не отпускает;
+    когда их больше ~6, новые директивы (вопросы, звонок) перестают доходить.
+    Лечение — перезапуск maind на колонке."""
+    require_auth(request)
+    code, out, _ = await ssh_run_bytes(
+        "awk -v h=':2693$' 'NR>1 && $2 ~ h && $4==\"01\"' "
+        "/proc/net/tcp /proc/net/tcp6 2>/dev/null | wc -l")
+    try:
+        count = int(out.decode(errors="replace").strip().split()[-1])
+    except (ValueError, IndexError):
+        count = 0
+    return JSONResponse({"ok": True, "connections": count, "busy": count >= 6})
 
 
 @app.post("/api/speaker/say")
