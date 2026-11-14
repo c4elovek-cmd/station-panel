@@ -250,9 +250,25 @@ async def _ipc_media_listener() -> None:
         bridge_base = str(cfg.get("voice_bridge_url") or "").split("/api/voice")[0].rstrip("/")
         token = str(cfg.get("voice_bridge_token") or "")
         try:
-            if conn is None or conn.is_closed():
+            if conn is None or conn.is_closed() or reader is None:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
                 conn = await ssh_connect()
-                reader, writer = await conn.open_connection("127.0.0.1", 9875)
+                try:
+                    reader, writer = await conn.open_connection("127.0.0.1", 9875)
+                except Exception:
+                    # канал мог не открыться (maind отверг соединение на прогреве):
+                    # закрываем SSH-сессию, иначе следующий круг решит, что
+                    # соединение живо, и упадёт на reader=None (AttributeError)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                    raise
                 failures = 0
                 # ВАЖНО: без кадра «подписка на AliceCapability» — maind считает
                 # подписчика компонентом речи и уводит активации «Алисы» ему
