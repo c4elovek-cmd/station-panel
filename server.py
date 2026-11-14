@@ -181,6 +181,25 @@ IPC_MEDIA_PHRASES = {
 }
 _media_listener_task: asyncio.Task | None = None
 
+# Диагностика слушателя (видна в GET /api/ipc_media_listen): жив ли канал,
+# что слышал последним, срабатывали ли лайк-фразы. Без неё «обе фразы играют
+# одно» не отладить — stdout панели на VPS наружу не торчит.
+_ipc_media_debug: dict = {
+    "connected": False,       # есть живое соединение к 9875
+    "connected_since": 0.0,   # когда подключились
+    "last_frame_ts": 0.0,     # когда пришёл последний кадр (любой)
+    "failures": 0,            # счётчик переподключений
+    "last_texts": [],         # последние распознанные тексты [{"ts","text"}]
+    "likes_triggers": [],     # срабатывания лайк-фраз [{"ts","text","user"}]
+}
+
+
+def _ipc_debug_note(bucket: str, entry: dict) -> None:
+    """Добавить запись в диагностику слушателя (последние 8)."""
+    lst: list = _ipc_media_debug.setdefault(bucket, [])
+    lst.append(entry)
+    del lst[:-8]
+
 
 # Фразы лайков: текст из IPC -> чей аккаунт играть. Слова нормализуются
 # («включи мои лайки», «мои лайки», «мой лайк» -> me; «любимые треки» -> other).
@@ -238,13 +257,18 @@ async def _ipc_media_listener() -> None:
                 # («не отвечает даже на слово алиса»). Текстовые события
                 # распознавания приходят широковещательно и без подписки.
                 print("[ipc-media] слушаю фразы без «Алисы»")
+                _ipc_media_debug["connected"] = True
+                _ipc_media_debug["connected_since"] = time.time()
+                _ipc_media_debug["failures"] = 0
             size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 30), "little")
             if not 0 < size <= 512 * 1024:
                 raise ValueError("кадр неверного размера")
             envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), 30))
+            _ipc_media_debug["last_frame_ts"] = time.time()
             if envelope.get(1) not in (1, 3) or not isinstance(envelope.get(2), bytes):
                 continue  # интересуют события распознавания с текстом
             text = envelope[2].decode("utf-8", "replace").strip().lower()
+            _ipc_debug_note("last_texts", {"ts": time.strftime("%H:%M:%S"), "text": text[:80]})
             # ответ Алисы на вопрос из панели — забирает тот, кто ждёт
             if text and _ask_pending is not None:
                 _ask_pending["phrases"].append(text)
@@ -263,6 +287,8 @@ async def _ipc_media_listener() -> None:
                 if now - last_sent.get("likes:" + user, 0) < float(cfg.get("ipc_media_dedupe_sec", 5)):
                     continue
                 last_sent["likes:" + user] = now
+                _ipc_debug_note("likes_triggers", {
+                    "ts": time.strftime("%H:%M:%S"), "text": text[:60], "user": user})
                 try:
                     code, out, err = await ssh_run_bytes(
                         f"/data/opt/soundya/likes_as.sh {user}", timeout=60)
@@ -285,6 +311,8 @@ async def _ipc_media_listener() -> None:
             print(f"[ipc-media] «{text}» -> {cmd}")
         except Exception:
             failures += 1
+            _ipc_media_debug["failures"] = failures
+            _ipc_media_debug["connected"] = False
             # растущая пауза: частые переподключения плодят «компоненты» в maind
             delay = min(5 * failures, 60)
             if failures <= 3 or failures % 10 == 0:
@@ -307,7 +335,18 @@ async def _ipc_media_listener() -> None:
 @app.get("/api/ipc_media_listen")
 async def api_ipc_media_listen_get(request: Request) -> JSONResponse:
     require_auth(request)
-    return JSONResponse({"enabled": bool(cfg.get("ipc_media_listen"))})
+    dbg = dict(_ipc_media_debug)
+    dbg["connected_since"] = time.strftime(
+        "%H:%M:%S", time.localtime(dbg["connected_since"])) if dbg["connected_since"] else ""
+    dbg["last_frame_ts"] = time.strftime(
+        "%H:%M:%S", time.localtime(dbg["last_frame_ts"])) if dbg["last_frame_ts"] else ""
+    return JSONResponse({
+        "enabled": bool(cfg.get("ipc_media_listen")),
+        "likes_phrases": bool(cfg.get("likes_phrases_enabled")),
+        "bridge_set": bool(str(cfg.get("voice_bridge_url") or "")
+                           and str(cfg.get("voice_bridge_token") or "")),
+        "listener": dbg,
+    })
 
 
 # --- синхронизация «Мне нравится» Яндекс Музыки -> лайки SoundCloud ---------- #
