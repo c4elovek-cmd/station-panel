@@ -189,6 +189,8 @@ _ipc_media_debug: dict = {
     "connected_since": 0.0,   # когда подключились
     "last_frame_ts": 0.0,     # когда пришёл последний кадр (любой)
     "failures": 0,            # счётчик переподключений
+    "last_error": "",         # текст последнего сбоя (ssh/кадр/EOF)
+    "last_error_ts": "",      # когда случился
     "last_texts": [],         # последние распознанные тексты [{"ts","text"}]
     "likes_triggers": [],     # срабатывания лайк-фраз [{"ts","text","user"}]
 }
@@ -314,10 +316,12 @@ async def _ipc_media_listener() -> None:
                                    json={"media": cmd},
                                    headers={"authorization": f"Bearer {token}"})
             print(f"[ipc-media] «{text}» -> {cmd}")
-        except Exception:
+        except Exception as exc:
             failures += 1
             _ipc_media_debug["failures"] = failures
             _ipc_media_debug["connected"] = False
+            _ipc_media_debug["last_error"] = f"{type(exc).__name__}: {str(exc)[:140]}"
+            _ipc_media_debug["last_error_ts"] = time.strftime("%H:%M:%S")
             # растущая пауза: частые переподключения плодят «компоненты» в maind
             delay = min(5 * failures, 60)
             if failures <= 3 or failures % 10 == 0:
@@ -345,6 +349,7 @@ async def api_ipc_media_listen_get(request: Request) -> JSONResponse:
         "%H:%M:%S", time.localtime(dbg["connected_since"])) if dbg["connected_since"] else ""
     dbg["last_frame_ts"] = time.strftime(
         "%H:%M:%S", time.localtime(dbg["last_frame_ts"])) if dbg["last_frame_ts"] else ""
+    dbg.pop("last_error_ts", None)
     return JSONResponse({
         "enabled": bool(cfg.get("ipc_media_listen")),
         "likes_phrases": bool(cfg.get("likes_phrases_enabled")),
