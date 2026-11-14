@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import html as html_mod
 import json
 import os
 import re
@@ -77,6 +78,15 @@ DEFAULTS: dict[str, Any] = {
     "bridge_enabled": False,
     "ipc_media_listen": False,  # ЭКСПЕРИМЕНТ: держать выключенным — см. todo (компоненты maind утекают)
     "ipc_media_dedupe_sec": 5,
+    "likes_phrases_enabled": True,  # «включи мои лайки»/«мои любимые треки» -> лайки по аккаунтам (soundya)
+    # --- синхронизация «Мне нравится» Яндекс Музыки -> лайки SoundCloud ---
+    "likes_sync_enabled": True,  # фоновая задача раз в час
+    "likes_sync_playlist": "https://music.yandex.ru/playlists/lk.4d22befb-86c1-4811-a99c-453af0b792eb",
+    "likes_sync_account": "other",  # чей аккаунт: me | other (висит на колонке)
+    "likes_sync_datadome": "",  # datadome-cookie из браузера ПК (страница панели -> «передать куку»)
+    "likes_sync_user_id": 1775876265,  # soundcloud user id аккаунта other
+    "likes_sync_last": "",  # время последнего цикла (для отображения)
+    "likes_sync_log": [],  # последние строки журнала
     "soundya_auto_firefox": True,  # автоматически брать токен SoundCloud из Firefox
     "bridge_path": "",  # путь к папке voice-bridge; пусто = ../voice-bridge рядом с панелью
     "llm_provider": "deepseek-web",  # deepseek-web | openrouter | none
@@ -165,6 +175,22 @@ IPC_MEDIA_PHRASES = {
     "играть": "play",
 }
 _media_listener_task: asyncio.Task | None = None
+
+
+# Фразы лайков: текст из IPC -> чей аккаунт играть. Слова нормализуются
+# («включи мои лайки», «мои лайки», «мой лайк» -> me; «любимые треки» -> other).
+_LIKES_ME = ("мои лайки", "мой лайк", "моих лайков", "мои лайки ")
+_LIKES_OTHER = ("мои любимые", "любимые треки", "любимые песни", "любимую музыку")
+
+
+def _likes_phrase_user(text: str) -> str | None:
+    """Определить по фразе, чьи лайки просили: 'me' / 'other' / None."""
+    t = " " + text.strip() + " "
+    if any(p in t for p in _LIKES_ME) and "включ" in text:
+        return "me"
+    if any(p in t for p in _LIKES_OTHER) and "включ" in text:
+        return "other"
+    return None
 # Вопрос из панели, ответ на который ждёт слушатель IPC: {"text": …, "phrases": […]}.
 # None — никто не ждёт; ответы Алисы в это время просто отбрасываются.
 _ask_pending: dict | None = None
@@ -223,6 +249,22 @@ async def _ipc_media_listener() -> None:
                 continue
             if not (cfg.get("ipc_media_listen") and bridge_base and token):
                 continue
+            # фразы «мои лайки» / «мои любимые треки»: играем лайки того,
+            # кто сказал — панель различает их по тексту (voiceprint в IPC
+            # не приходит, см. дамп 2026-11-14)
+            if _likes_phrase_user(text) and cfg.get("likes_phrases_enabled"):
+                user = _likes_phrase_user(text)
+                now = time.time()
+                if now - last_sent.get("likes:" + user, 0) < float(cfg.get("ipc_media_dedupe_sec", 5)):
+                    continue
+                last_sent["likes:" + user] = now
+                try:
+                    code, out, err = await ssh_run_bytes(
+                        f"/data/opt/soundya/likes_as.sh {user}", timeout=60)
+                    print(f"[ipc-media] «{text}» -> лайки ({user}): {out[:80]}")
+                except Exception as exc:
+                    print(f"[ipc-media] лайки ({user}) не удались: {exc}")
+                continue
             cmd = IPC_MEDIA_PHRASES.get(text)
             if not cmd:
                 continue
@@ -243,8 +285,9 @@ async def _ipc_media_listener() -> None:
             if failures <= 3 or failures % 10 == 0:
                 print(f"[ipc-media] переподключение через {delay}с (сбой #{failures})")
             await asyncio.sleep(delay)
-        finally:
-            # честно закрываем канал: полузакрытые сокеты = «утёкшие компоненты»
+            # закрываем только СЛОМАННОЕ соединение: ошибка чтения/парсинга кадра
+            # означает, что канал мёртв; чистый continue (нет совпадения фразы)
+            # сюда не попадает
             if writer is not None:
                 try:
                     writer.close()
@@ -260,6 +303,213 @@ async def _ipc_media_listener() -> None:
 async def api_ipc_media_listen_get(request: Request) -> JSONResponse:
     require_auth(request)
     return JSONResponse({"enabled": bool(cfg.get("ipc_media_listen"))})
+
+
+# --- синхронизация «Мне нравится» Яндекс Музыки -> лайки SoundCloud ---------- #
+# Каждые час: читаем плейлист ЯМ (публичная страница), ищем треки на
+# SoundCloud (GET), новые лайкаем PUT-ом через колонку (ssh_run + curl).
+# Запись (PUT) SoundCloud пропускает только с живой datadome-сессией,
+# поэтому в конфиге хранится datadome-cookie, снятая браузером на ПК
+# (тот же внешний IP, что у колонки). Страница панели «Лайки» умеет её
+# обновлять. Темп: не быстрее одного лайка в 15 с, иначе DataDome банит.
+
+_LIKES_SYNC_LOCK = asyncio.Lock()
+
+
+def _likes_log(msg: str) -> None:
+    """Строку в журнал синхронизации (последние 40, видно в панели)."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    log: list = cfg.setdefault("likes_sync_log", [])
+    log.append(f"{stamp} {msg}")
+    del log[:-40]
+    save_config(cfg)
+
+
+def _parse_ym_playlist(html: str) -> list[str]:
+    """«Артист - Название» из страницы плейлиста ЯМ (пары название/артист/время)."""
+    m = re.search(r"<main[^>]*>(.*?)</main>", html, re.S)
+    body = m.group(1) if m else html
+    text = re.sub(r"<[^>]+>", "\n", body)
+    text = html_mod.unescape(text)
+    lines = [s.strip() for s in text.split("\n") if s.strip()]
+    tracks: list[str] = []
+    i = 0
+    while i < len(lines) - 2:
+        t, a, d = lines[i], lines[i + 1], lines[i + 2]
+        if re.fullmatch(r"\d{1,2}:\d{2}", d) and not re.fullmatch(r"\d{1,2}:\d{2}", a) \
+                and not re.fullmatch(r"\d{1,2}:\d{2}", t) and t and a:
+            tracks.append(f"{a} - {t}")
+            i += 3
+        else:
+            i += 1
+    return tracks
+
+
+async def _sc_token_for(account: str) -> str:
+    """Access-токен нужного soundya-аккаунта (refresh на колонке)."""
+    rt_file = "/data/opt/soundya/refresh_token" if account == "me" else "/data/opt/soundya/refresh_token_other"
+    code, rt, _ = await ssh_run(f"cat {rt_file}")
+    if code != 0 or not rt.strip():
+        raise RuntimeError(f"нет refresh_token ({account})")
+    code, cid, _ = await ssh_run("cat /data/opt/soundya/client_id")
+    if code != 0 or not cid.strip():
+        raise RuntimeError("нет client_id")
+    body = (f"grant_type=refresh_token&client_id={cid.strip()}"
+            f"&refresh_token={rt.strip()}")
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://secure.soundcloud.com/oauth/token",
+                                data=body, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+            data = await resp.json(content_type=None)
+    if "access_token" not in data:
+        raise RuntimeError(f"refresh не удался: {str(data)[:120]}")
+    nrt = data.get("refresh_token")
+    if nrt:  # refresh одноразовый — сохраняем новый
+        await ssh_run(f"printf '%s' '{nrt}' > {rt_file}")
+    return data["access_token"]
+
+
+async def _sc_like_via_station(token: str, user_id: int, track_id: int) -> int:
+    """PUT-лайк с колонки: curl с dd-кукой и браузерными заголовками."""
+    dd = str(cfg.get("likes_sync_datadome") or "")
+    cid_q = "QhVEWrrJKvW4uSU5u5EoI0FTXYUGzy5k"
+    cookie = f"datadome={dd}" if dd else ""
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
+    headers = [
+        "-H", f"'Authorization: OAuth {token}'",
+        "-H", "'Origin: https://soundcloud.com'",
+        "-H", "'Referer: https://soundcloud.com/'",
+        "-H", f"'User-Agent: {ua}'",
+        "-H", "'sec-ch-ua: \"Not?A_Brand\";v=\"24\", \"Chromium\";v=\"152\"'",
+        "-H", "'sec-ch-ua-mobile: ?0'",
+        "-H", "'sec-ch-ua-platform: \"Windows\"'",
+        "-H", "'sec-fetch-dest: empty'", "-H", "'sec-fetch-mode: cors'",
+        "-H", "'sec-fetch-site: same-site'", "-H", "'accept: */*'",
+        "-H", "'accept-language: ru'",
+    ]
+    if dd:
+        headers += ["-H", f"'Cookie: {cookie}'", "-H", f"'x-datadome-clientid: {dd}'"]
+    cmd = (f"/opt/bin/curl -s -m 20 -X PUT "
+           f"'https://api-v2.soundcloud.com/users/{user_id}/track_likes/{track_id}"
+           f"?client_id={cid_q}' " + " ".join(headers))
+    code, out, _ = await ssh_run(cmd, timeout=30)
+    if code != 0:
+        return 0  # сеть/таймаут
+    m = re.search(r"^(\"OK\"|\{\})", out.strip())
+    return 200 if m else 403  # 403 = DataDome
+
+
+async def _likes_sync_run() -> str:
+    """Один цикл синхронизации. Возвращает человекочитаемый итог."""
+    async with _LIKES_SYNC_LOCK:
+        playlist = str(cfg.get("likes_sync_playlist") or "")
+        account = str(cfg.get("likes_sync_account") or "other")
+        user_id = int(cfg.get("likes_sync_user_id") or 0)
+        if not playlist or not user_id:
+            return "не настроен плейлист или user_id"
+        # 1) плейлист ЯМ
+        async with aiohttp.ClientSession() as session:
+            async with session.get(playlist, timeout=aiohttp.ClientTimeout(total=30),
+                                   headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}) as resp:
+                html = await resp.text()
+        tracks = _parse_ym_playlist(html)
+        if not tracks:
+            _likes_log("плейлист ЯМ пуст/не распознан")
+            return "плейлист ЯМ пуст"
+        # 2) токен и текущие лайки
+        token = await _sc_token_for(account)
+        cid_q = "QhVEWrrJKvW4uSU5u5EoI0FTXYUGzy5k"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                    "https://api-v2.soundcloud.com/me/track_likes/ids",
+                    params={"client_id": cid_q, "limit": 200},
+                    headers={"Authorization": f"OAuth {token}"},
+                    timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                liked = set((await resp.json(content_type=None)).get("collection", []))
+        # 3) поиск и лайки новых
+        added, failed, skipped = 0, 0, 0
+        async with aiohttp.ClientSession() as session:
+            for q in tracks:
+                async with session.get(
+                        "https://api-v2.soundcloud.com/search/tracks",
+                        params={"q": q, "client_id": cid_q, "limit": 1},
+                        timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                    data = await resp.json(content_type=None)
+                coll = data.get("collection") or []
+                if not coll:
+                    failed += 1
+                    _likes_log(f"не найден: {q}")
+                    continue
+                track = coll[0]
+                if track["id"] in liked:
+                    skipped += 1
+                    continue
+                status = await _sc_like_via_station(token, user_id, track["id"])
+                if status == 200:
+                    added += 1
+                    _likes_log(f"лайк: {q} -> {track['title'][:40]}")
+                    await asyncio.sleep(15)  # темп против DataDome
+                else:
+                    failed += 1
+                    _likes_log(f"ошибка {status}: {q}")
+                    if status == 403:
+                        _likes_log("DataDome: нужна свежая кука на странице панели")
+                        break
+        summary = f"итог: новых {added}, уже были {skipped}, проблем {failed}"
+        _likes_log(summary)
+        return summary
+
+
+async def _likes_sync_loop() -> None:
+    """Раз в час синхронизирует плейлист ЯМ с лайками SoundCloud."""
+    while True:
+        await asyncio.sleep(3600)
+        if not cfg.get("likes_sync_enabled"):
+            continue
+        try:
+            cfg["likes_sync_last"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            save_config(cfg)
+            result = await _likes_sync_run()
+            print(f"[likes-sync] {result}")
+        except Exception as exc:
+            _likes_log(f"сбой: {type(exc).__name__}: {str(exc)[:120]}")
+
+
+@app.get("/api/likes_sync")
+async def api_likes_sync_get(request: Request) -> JSONResponse:
+    require_auth(request)
+    return JSONResponse({
+        "enabled": bool(cfg.get("likes_sync_enabled")),
+        "playlist": cfg.get("likes_sync_playlist"),
+        "account": cfg.get("likes_sync_account"),
+        "user_id": cfg.get("likes_sync_user_id"),
+        "has_datadome": bool(cfg.get("likes_sync_datadome")),
+        "last": cfg.get("likes_sync_last"),
+        "log": cfg.get("likes_sync_log", []),
+    })
+
+
+@app.put("/api/likes_sync")
+async def api_likes_sync_put(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    for key in ("enabled", "playlist", "account", "user_id", "datadome"):
+        if key in data:
+            cfg["likes_sync_" + key] = data[key]
+    save_config(cfg)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/likes_sync/run")
+async def api_likes_sync_run(request: Request) -> JSONResponse:
+    """Запустить цикл вручную (кнопка в панели)."""
+    require_auth(request)
+    try:
+        result = await _likes_sync_run()
+        return JSONResponse({"ok": True, "result": result})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                            status_code=500)
 
 
 @app.put("/api/ipc_media_listen")
@@ -278,6 +528,7 @@ async def _start_background_loops() -> None:
     asyncio.create_task(_night_clock_loop())
     asyncio.create_task(_volume_sync_loop())
     _media_listener_task = asyncio.create_task(_ipc_media_listener())
+    asyncio.create_task(_likes_sync_loop())
 
 
 @app.on_event("shutdown")
