@@ -326,23 +326,30 @@ def _likes_log(msg: str) -> None:
 
 
 def _parse_ym_playlist(html: str) -> list[str]:
-    """«Артист - Название» из страницы плейлиста ЯМ (пары название/артист/время)."""
-    m = re.search(r"<main[^>]*>(.*?)</main>", html, re.S)
-    body = m.group(1) if m else html
-    text = re.sub(r"<[^>]+>", "\n", body)
-    text = html_mod.unescape(text)
-    lines = [s.strip() for s in text.split("\n") if s.strip()]
+    """«Артист - Название» из страницы плейлиста ЯМ.
+
+    Треки лежат в JSON-патчах __STATE_PATCHES__ (SSR-рендер ЯМ); собираем
+    все объекты с title + artists рекурсивным обходом."""
     tracks: list[str] = []
-    i = 0
-    while i < len(lines) - 2:
-        t, a, d = lines[i], lines[i + 1], lines[i + 2]
-        if re.fullmatch(r"\d{1,2}:\d{2}", d) and not re.fullmatch(r"\d{1,2}:\d{2}", a) \
-                and not re.fullmatch(r"\d{1,2}:\d{2}", t) and t and a:
-            tracks.append(f"{a} - {t}")
-            i += 3
-        else:
-            i += 1
-    return tracks
+    for m in re.finditer(
+            r"__STATE_PATCHES__\s*=\s*window\.__STATE_PATCHES__\s*\|\|\s*\[\]\)\.push\((\[.*?\])\);\s*window",
+            html, re.S):
+        try:
+            patches = json.loads(m.group(1))
+        except Exception:
+            continue
+        stack = [patches]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                title, artists = cur.get("title"), cur.get("artists")
+                if isinstance(title, str) and isinstance(artists, list) and artists \
+                        and isinstance(artists[0], dict) and artists[0].get("name"):
+                    tracks.append(f"{artists[0]['name']} - {title}")
+                stack.extend(cur.values())
+            elif isinstance(cur, list):
+                stack.extend(cur)
+    return list(dict.fromkeys(tracks))
 
 
 async def _sc_token_for(account: str) -> str:
