@@ -260,10 +260,15 @@ async def _ipc_media_listener() -> None:
                 _ipc_media_debug["connected"] = True
                 _ipc_media_debug["connected_since"] = time.time()
                 _ipc_media_debug["failures"] = 0
-            size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 30), "little")
+            # ВАЖНО: чтение БЕЗ таймаута. maind в тишине не шлёт ничего, а каждое
+            # переподключение оставляет в нём «мёртвый компонент»: 30-секундный
+            # таймаут превращал слушатель в машину утечки (реконнект каждые ~40 с,
+            # колонка постепенно глохла). Мёртвый сокет выявится по EOF — тогда
+            # цикл сам переподключится; зависший туннель держит TCP-keepalive SSH.
+            size = int.from_bytes(await reader.readexactly(4), "little")
             if not 0 < size <= 512 * 1024:
                 raise ValueError("кадр неверного размера")
-            envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), 30))
+            envelope = _ipc_parse(await reader.readexactly(size))
             _ipc_media_debug["last_frame_ts"] = time.time()
             if envelope.get(1) not in (1, 3) or not isinstance(envelope.get(2), bytes):
                 continue  # интересуют события распознавания с текстом
