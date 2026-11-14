@@ -87,6 +87,9 @@ DEFAULTS: dict[str, Any] = {
     "likes_sync_user_id": 1775876265,  # soundcloud user id аккаунта other
     "likes_sync_max_per_run": 20,  # лайков за прогон (DataDome банит за серии)
     "likes_sync_pause_sec": 20,  # пауза между лайками, с
+    "likes_sync_key": "",  # ключ для букмарклета (генерируется при первом обращении)
+    "likes_sync_done_ids": [],  # track_id, долайканные браузером (для журнала)
+    "likes_sync_playlist_cache": None,  # {"ts": ..., "tracks": [...]} — кеш очереди для букмарклета
     "likes_sync_last": "",  # время последнего цикла (для отображения)
     "likes_sync_log": [],  # последние строки журнала
     "soundya_auto_firefox": True,  # автоматически брать токен SoundCloud из Firefox
@@ -566,6 +569,172 @@ async def api_likes_sync_run(request: Request) -> JSONResponse:
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
                             status_code=500)
+
+
+# --- массовые лайки через браузер (букмарклет) -------------------------------- #
+# DataDome пропускает запись (PUT) только из настоящего браузера: curl с колонки
+# выдерживает 1-2 лайка, потом капча. Поэтому очередь треков отдаёт панель, а
+# ставит лайки браузер на странице soundcloud.com (букмарклет со страницы
+# /likes-runner). Панель принимает итоги (likes_done) и пишет их в журнал.
+
+def _likes_key() -> str:
+    """Ключ букмарклета (секрет: кто знает ключ, тот читает очередь)."""
+    if not cfg.get("likes_sync_key"):
+        cfg["likes_sync_key"] = secrets.token_urlsafe(16)
+        save_config(cfg)
+    return str(cfg["likes_sync_key"])
+
+
+async def _likes_playlist_cached(force: bool = False) -> list[str]:
+    """Список треков плейлиста с кешем на час (для букмарклета)."""
+    cache = cfg.get("likes_sync_playlist_cache") or {}
+    fresh = time.time() - float(cache.get("ts") or 0) < 3600
+    if not fresh or force:
+        tracks = await _ym_playlist_tracks(str(cfg.get("likes_sync_playlist") or ""))
+        cfg["likes_sync_playlist_cache"] = {"ts": time.time(), "tracks": tracks}
+        save_config(cfg)
+        return tracks
+    return list(cache.get("tracks") or [])
+
+
+@app.get("/api/likes_playlist")
+async def api_likes_playlist(request: Request, key: str = "", refresh: int = 0) -> JSONResponse:
+    """Очередь треков для букмарклета (CORS *: страница soundcloud.com её читает)."""
+    if not key or key != _likes_key():
+        raise HTTPException(status_code=403, detail="неверный ключ")
+    tracks = await _likes_playlist_cached(force=bool(refresh))
+    resp = JSONResponse({"tracks": tracks, "count": len(tracks)})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.post("/api/likes_done")
+async def api_likes_done(request: Request, key: str = "") -> JSONResponse:
+    """Букмарклет сообщает пачку долайканных track_id."""
+    if not key or key != _likes_key():
+        raise HTTPException(status_code=403, detail="неверный ключ")
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    ids = data.get("ids") or []
+    if ids:
+        done: list = cfg.setdefault("likes_sync_done_ids", [])
+        done.extend(int(i) for i in ids if str(i).isdigit())
+        del done[:-5000]
+        _likes_log(f"браузер: лайкнуто {len(ids)} (всего по журналу {len(done)})")
+    resp = JSONResponse({"ok": True, "liked": len(ids)})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+_LIKES_RUNNER_JS = """
+(async () => {
+  const PANEL = "__PANEL__", KEY = "__KEY__";
+  const CID = "QhVEWrrJKvW4uSU5u5EoI0FTXYUGzy5k", UID = 1775876265;
+  const bar = document.createElement("div");
+  bar.style.cssText = "position:fixed;top:10px;right:10px;z-index:2147483647;background:#101418;color:#7ee787;padding:12px 16px;border-radius:10px;font:13px/1.5 ui-monospace,Consolas,monospace;box-shadow:0 4px 16px rgba(0,0,0,.5);max-width:320px;white-space:pre-wrap";
+  document.body.appendChild(bar);
+  const say = (t) => { bar.textContent = t; };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    say("панель: беру очередь…");
+    const pr = await fetch(PANEL + "/api/likes_playlist?key=" + encodeURIComponent(KEY));
+    if (!pr.ok) throw new Error("панель ответила " + pr.status);
+    const tracks = (await pr.json()).tracks || [];
+    if (!tracks.length) throw new Error("очередь пуста");
+    const tok = decodeURIComponent((document.cookie.match(/oauth_token=([^;]+)/) || [])[1] || "");
+    if (!tok) throw new Error("нет oauth_token — войдите в SoundCloud (osmakeskue)");
+    say("свои лайки (пагинация)…");
+    const liked = {};
+    let path = "/me/track_likes/ids?client_id=" + CID + "&limit=200";
+    while (path) {
+      const g = await fetch("https://api-v2.soundcloud.com" + path, { credentials: "include" });
+      const j = await g.json();
+      (j.collection || []).forEach((id) => { liked[id] = 1; });
+      path = (typeof j.next === "string" && j.next) ? j.next : null;
+    }
+    say("плейлист: " + tracks.length + " | лайков уже: " + Object.keys(liked).length);
+    let batch = [], miss = 0, put = 0, banned = false;
+    for (const q of tracks) {
+      const s = await fetch("https://api-v2.soundcloud.com/search/tracks?q=" + encodeURIComponent(q) + "&client_id=" + CID + "&limit=1", { credentials: "include" });
+      const sc = (await s.json()).collection || [];
+      if (!sc.length) { miss++; continue; }
+      const id = sc[0].id;
+      if (liked[id]) continue;
+      const r = await fetch("https://api-v2.soundcloud.com/users/" + UID + "/track_likes/" + id + "?client_id=" + CID, { method: "PUT", credentials: "include", headers: { Authorization: "OAuth " + tok } });
+      if (r.ok) {
+        batch.push(id); put++;
+        say("лайкнуто: " + put + " | не найдено: " + miss + "\\n" + q);
+      } else if (r.status === 403) { banned = true; break; }
+      if (batch.length >= 20) {
+        fetch(PANEL + "/api/likes_done?key=" + encodeURIComponent(KEY), { method: "POST", body: JSON.stringify({ ids: batch }) });
+        batch = [];
+      }
+      if (put && put % 40 === 0) { say("пауза 45 с (DataDome)…"); await sleep(45000); }
+      await sleep(2500 + Math.random() * 1500);
+    }
+    if (batch.length) {
+      fetch(PANEL + "/api/likes_done?key=" + encodeURIComponent(KEY), { method: "POST", body: JSON.stringify({ ids: batch }) });
+    }
+    say(banned ? "DataDome остановил после " + put + " лайков.\\nПродолжить завтра/через закладку." :
+        ("Готово! Новых лайков: " + put + ", не найдено на SC: " + miss));
+  } catch (e) {
+    say("Ошибка: " + (e && e.message ? e.message : e));
+  }
+})();
+"""
+
+
+@app.get("/likes-runner")
+async def likes_runner_page(request: Request, refresh: int = 0) -> Response:
+    """Страница с букмарклетом: очередь лайков ставит браузер пользователя."""
+    require_auth(request)
+    key = _likes_key()
+    if refresh:
+        try:
+            await _likes_playlist_cached(force=True)
+        except Exception:
+            pass
+    panel = str(request.base_url).rstrip("/")
+    js = _LIKES_RUNNER_JS.replace("__PANEL__", panel).replace("__KEY__", key)
+    href = "javascript:" + js.replace('"', "&quot;").replace("\n", " ")
+    cache = cfg.get("likes_sync_playlist_cache") or {}
+    html = f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Лайки SoundCloud — запуск из браузера</title>
+<style>
+  body {{ font: 15px/1.6 system-ui, sans-serif; background: #101418; color: #d7dde3;
+         max-width: 720px; margin: 40px auto; padding: 0 20px; }}
+  a, button {{ color: #7ee787; }}
+  code {{ background: #1a2129; padding: 2px 6px; border-radius: 6px; }}
+  .card {{ background: #171e26; border-radius: 14px; padding: 20px 24px; margin: 16px 0; }}
+  ol {{ padding-left: 22px; }}
+  .big {{ font-size: 17px; }}
+</style></head><body>
+<h1>Лайки SoundCloud из плейлиста Я.Музыки</h1>
+<p class="big">В плейлисте кеш: <b>{len(cache.get('tracks') or [])}</b> треков
+(обновляется час; принудительно — ссылка <a href="/likes-runner?refresh=1">refresh</a>).</p>
+<div class="card">
+<ol>
+  <li>Открой <a href="https://soundcloud.com" target="_blank">soundcloud.com</a>
+      (нужен вход в аккаунт <b>osmakeskue@gmail.com</b>).</li>
+  <li>Перетащи эту кнопку в панель закладок браузера:
+      <br><a href="{href}" class="big" style="display:inline-block;background:#1a2129;
+      padding:10px 18px;border-radius:10px;text-decoration:none;border:1px solid #2a3540;margin-top:8px;">▶ Долайкать очередь</a></li>
+  <li>На странице soundcloud.com нажми закладку «Долайкать очередь».
+      Сверху справа появится табло прогресса. Не закрывай вкладку до конца.</li>
+</ol>
+</div>
+<p>Лайки ставятся с паузами 2,5–4 с и остановками каждые 40 штук — как настоящий
+пользователь, чтобы DataDome не включил капчу. ~500 треков ≈ 35–45 минут.
+Прогнал пачками по 20 — панель пишет это в журнал. Если DataDome всё же
+остановит — просто запусти закладку снова в другой день: уже поставленные
+пропустятся.</p>
+<p>Ключ очереди: <code>{key}</code></p>
+</body></html>"""
+    return Response(content=html, media_type="text/html")
 
 
 @app.put("/api/ipc_media_listen")
