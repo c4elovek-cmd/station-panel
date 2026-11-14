@@ -168,6 +168,9 @@ _media_listener_task: asyncio.Task | None = None
 # Вопрос из панели, ответ на который ждёт слушатель IPC: {"text": …, "phrases": […]}.
 # None — никто не ждёт; ответы Алисы в это время просто отбрасываются.
 _ask_pending: dict | None = None
+# Событие «слушатель поймал фразу от Алисы»: чтобы ожидающий ответ не ждал
+# конца таймаута, когда весь текст ответа пришёл через другой сокет.
+_ipc_wakeup: asyncio.Future | None = None
 
 
 def _ipc_alice_question() -> str | None:
@@ -180,53 +183,77 @@ async def _ipc_media_listener() -> None:
     """Долгоживущий слушатель IPC: переподключается, шлёт совпавшие фразы мосту
     и передаёт ответы Алисы (фокус — вопросы, заданные из панели).
 
-    Работает независимо от ipc_media_listen: ответы нужны «Спросить Алису»."""
+    Работает независимо от ipc_media_listen: ответы нужны «Спросить Алису».
+
+    ВАЖНО: каждое соединение к 9875 занимает в maind «компонент»; утёкшие
+    компоненты не освобождаются, и в итоге колонка перестаёт слышать «Алису»
+    (см. todo.md). Поэтому слушатель держит ОДНО долгоживущее SSH-соединение
+    и один канал, закрывает их при переподключении и не молотит ретраями."""
     last_sent: dict[str, float] = {}
+    conn = None
+    reader = None
+    writer = None
+    failures = 0
     while True:
         bridge_base = str(cfg.get("voice_bridge_url") or "").split("/api/voice")[0].rstrip("/")
         token = str(cfg.get("voice_bridge_token") or "")
-        conn = None
         try:
-            conn = await ssh_connect()
-            reader, writer = await conn.open_connection("127.0.0.1", 9875)
-            # ВАЖНО: без кадра «подписка на AliceCapability» — maind считает
-            # подписчика компонентом речи и уводит активации «Алисы» ему
-            # («не отвечает даже на слово алиса»). Текстовые события
-            # распознавания приходят широковещательно и без подписки.
-            print("[ipc-media] слушаю фразы без «Алисы»")
-            while True:
-                size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 30), "little")
-                if not 0 < size <= 512 * 1024:
-                    break
-                envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), 30))
-                if envelope.get(1) not in (1, 3) or not isinstance(envelope.get(2), bytes):
-                    continue  # интересуют события распознавания с текстом
-                text = envelope[2].decode("utf-8", "replace").strip().lower()
-                # ответ Алисы на вопрос из панели — забирает тот, кто ждёт
-                if text and _ask_pending is not None:
-                    _ask_pending["phrases"].append(text)
-                    continue
-                if not (cfg.get("ipc_media_listen") and bridge_base and token):
-                    continue
-                cmd = IPC_MEDIA_PHRASES.get(text)
-                if not cmd:
-                    continue
-                now = time.time()
-                if now - last_sent.get(cmd, 0) < float(cfg.get("ipc_media_dedupe_sec", 5)):
-                    continue  # тот же финал может прийти повторно
-                last_sent[cmd] = now
-                timeout = aiohttp.ClientTimeout(total=12)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    await session.post(bridge_base + "/api/media",
-                                       json={"media": cmd},
-                                       headers={"authorization": f"Bearer {token}"})
-                print(f"[ipc-media] «{text}» -> {cmd}")
+            if conn is None or conn.is_closed():
+                conn = await ssh_connect()
+                reader, writer = await conn.open_connection("127.0.0.1", 9875)
+                failures = 0
+                # ВАЖНО: без кадра «подписка на AliceCapability» — maind считает
+                # подписчика компонентом речи и уводит активации «Алисы» ему
+                # («не отвечает даже на слово алиса»). Текстовые события
+                # распознавания приходят широковещательно и без подписки.
+                print("[ipc-media] слушаю фразы без «Алисы»")
+            size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 30), "little")
+            if not 0 < size <= 512 * 1024:
+                raise ValueError("кадр неверного размера")
+            envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), 30))
+            if envelope.get(1) not in (1, 3) or not isinstance(envelope.get(2), bytes):
+                continue  # интересуют события распознавания с текстом
+            text = envelope[2].decode("utf-8", "replace").strip().lower()
+            # ответ Алисы на вопрос из панели — забирает тот, кто ждёт
+            if text and _ask_pending is not None:
+                _ask_pending["phrases"].append(text)
+                fut = _ipc_wakeup
+                if fut is not None and not fut.done():
+                    fut.set_result(True)
+                continue
+            if not (cfg.get("ipc_media_listen") and bridge_base and token):
+                continue
+            cmd = IPC_MEDIA_PHRASES.get(text)
+            if not cmd:
+                continue
+            now = time.time()
+            if now - last_sent.get(cmd, 0) < float(cfg.get("ipc_media_dedupe_sec", 5)):
+                continue  # тот же финал может прийти повторно
+            last_sent[cmd] = now
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                await session.post(bridge_base + "/api/media",
+                                   json={"media": cmd},
+                                   headers={"authorization": f"Bearer {token}"})
+            print(f"[ipc-media] «{text}» -> {cmd}")
         except Exception:
-            pass  # колонка офлайн/туннель рвался — переподключимся
+            failures += 1
+            # растущая пауза: частые переподключения плодят «компоненты» в maind
+            delay = min(5 * failures, 60)
+            if failures <= 3 or failures % 10 == 0:
+                print(f"[ipc-media] переподключение через {delay}с (сбой #{failures})")
+            await asyncio.sleep(delay)
         finally:
-            if conn:
-                conn.close()
-        await asyncio.sleep(5)
+            # честно закрываем канал: полузакрытые сокеты = «утёкшие компоненты»
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            writer = None
+            reader = None
+            if conn is not None and conn.is_closed():
+                conn = None
 
 
 @app.get("/api/ipc_media_listen")
@@ -3885,16 +3912,17 @@ async def _ipc_stream_open() -> tuple[Any, Any]:
         _ipc_stream_reset()
     conn = await _ipc_open()
     reader, writer = await conn.open_connection("127.0.0.1", 9875)
-    first = True
-    try:
-        while True:  # съесть приветственные кадры, чтобы не мешали ответу
-            size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 0.4 if first else 0.15), "little")
-            first = False
+    # шапка подключения: ровно 3 кадра (67, 92, 708 байт). Прочитать надо все,
+    # иначе «хвост» шапки позже выглядит как ответ колонки. Пауза между ними
+    # до 0.9 с, поэтому ждём по секунде на кадр.
+    for _ in range(3):
+        try:
+            size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 1.0), "little")
             if not 0 < size <= 512 * 1024:
                 break
-            await asyncio.wait_for(reader.readexactly(size), 0.15)
-    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
-        pass
+            await asyncio.wait_for(reader.readexactly(size), 1.0)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
+            break
     _ipc_reader, _ipc_stream = reader, writer
     _ipc_opened_at = time.time()
     return reader, writer
@@ -4150,9 +4178,9 @@ async def _ipc_ask(question: str, timeout: float = 25.0) -> dict:
     """Задать вопрос Алисе из панели и дождаться её ответа.
 
     Вопрос уходит директивой START_TEXT_INPUT: колонка сама делает запрос
-    в облако и проговаривает ответ голосом. Сам ответ забирает постоянный
-    слушатель IPC (`_ipc_media_listener`) — он видит событие распознавания
-    готовой фразы; здесь только ждём, пока он положит фразы в _ask_pending.
+    в облако и проговаривает ответ голосом. Текст ответа maind по IPC не
+    отдаёт (в кадре приходит только «начал отвечать»), поэтому список фраз
+    в ответе панели обычно пуст — важен сам факт ответа и звук на колонке.
 
     На Мини 2 maind доносит TextInput до облака спустя 10–15 с после отправки
     (проверено прямым подключением 11.11.2026), поэтому ждём не меньше 20 с."""
@@ -4203,10 +4231,18 @@ async def _ipc_say_frame(text: str) -> str:
 
 
 async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
-    """Ждём ответ Алисы: фразу из события распознавания или завершение TTS."""
+    """Ждём ответ Алисы: фразу из события распознавания или завершение TTS.
+
+    Панель писала в канал, а слушает его `_ipc_media_listener` (отдельный сокет):
+    maind отдаёт события телу, которое подписалось. Сокет панели остаётся
+    запасным источником — на случай, если слушатель не подключение."""
     deadline = asyncio.get_event_loop().time() + timeout
-    heard: list[str] = []
-    events: list[dict] = []
+    heard: list[str] = list((_ask_pending or {}).get("phrases") or [])
+    events: list[dict] = [{"event": 3, "text": line} for line in heard]
+    if heard:
+        return {"answered": heard, "events": events, "audio": True}
+    global _ipc_wakeup
+    _ipc_wakeup = asyncio.get_event_loop().create_future()
     started = False
     said = False  # колонка подтвердила, что начала говорить (TTS начался)
     eof = False   # maind закрыл наш сокет — следующий кадр придёт только по новому
@@ -4238,6 +4274,13 @@ async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
                 raise HTTPException(status_code=502, detail="IPC: битый размер кадра")
             envelope = _ipc_parse(await asyncio.wait_for(reader.readexactly(size), left))
         except asyncio.TimeoutError:
+            # пауза между кадрами: если слушатель поймал фразу, хватит и её
+            if _ask_pending is not None and _ask_pending.get("phrases"):
+                lines = [ln for ln in _ask_pending["phrases"] if ln not in heard]
+                if lines:
+                    return {"answered": heard + lines,
+                            "events": events + [{"event": 3, "text": ln} for ln in lines],
+                            "audio": True}
             continue
         except HTTPException:
             raise
@@ -4247,6 +4290,8 @@ async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
         except (asyncssh.Error, OSError, ValueError):
             eof = True
             continue
+        if envelope.get(1) not in (2,) and envelope.get(253) not in (3, 210):
+            continue  # служебные кадры «шапки» подключения — не ответ
         if isinstance(envelope.get(2), bytes) and envelope.get(1) in (1, 3, 5, 7, 9):
             line = envelope[2].decode("utf-8", "replace").strip()
             if line and line not in heard:
@@ -4262,6 +4307,16 @@ async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
             # состояние Алисы: 2 = думает, 3 = говорит — значит ответ есть
             if remote.get(1) >= 2:
                 said = True
+        if envelope.get(253) == 210:
+            # кадр колонки: поле 5 — способность, поле 6 — её состояние.
+            # Так подтверждается, что директива дошла до нужной подсистемы.
+            landmark = _ipc_parse(remote.get(5, b"") if isinstance(remote.get(5), bytes) else b"")
+            name = landmark.get(1).decode("utf-8", "replace") if isinstance(landmark.get(1), bytes) else ""
+            if name == "AliceCapability":
+                started = True
+                if isinstance(remote.get(6), bytes) and remote.get(6):
+                    said = True
+                continue
         if 18 not in remote:
             continue
         event = _ipc_parse(remote[18]).get(1)
@@ -4275,8 +4330,11 @@ async def _ipc_wait_answer(reader: Any, timeout: float) -> dict:
                     "note": "Алиса ответила голосом, но текст ответа в канале не пришёл"}
         elif event == 4:
             raise HTTPException(status_code=502, detail="колонка сообщила об ошибке ответа")
+    _ipc_wakeup = None
     return {"answered": heard, "events": events, "audio": bool(started or said) or bool(heard),
-            "note": "" if heard or started or said else "ответа не дождались: колонка не ответила или "
+            "note": "колонка приняла фразу и начала отвечать — ответ слышен на колонке"
+                    if (started or said) and not heard else
+                    "" if heard else "ответа не дождались: колонка не ответила или "
                     "нет связи с облаком Яндекса"}
 
 
@@ -4404,28 +4462,33 @@ async def api_alice_ask(request: Request) -> JSONResponse:
 
 
 async def _ipc_probe_capability() -> dict:
-    """Проверка живости канала: посылаем кадр запроса состояния и ждём ответ.
+    """Проверка канала: открыть свежий сокет, дождаться первого кадра и закрыть.
 
-    maind отдаёт по ident своей сессии любое состояние — так видно, что
-    сокет не «немой» (после рестарта maind старые сокеты молчат)."""
-    async with _ipc_get_lock():
-        reader, writer = await _ipc_stream_open()
-        writer.write(_ipc_frame(20, _ipc_byte_field(1, b"AliceCapability")))
-        deadline = asyncio.get_event_loop().time() + 3.0
-        while True:
-            left = deadline - asyncio.get_event_loop().time()
-            if left <= 0:
-                return {"alive": False}
-            try:
-                size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), left), "little")
+    maind на каждое подключение присылает «шапку» — если она пришла, канал
+    живой и директивы уйдут. Ничего в канал не пишем: пустая озвучка
+    заставила бы колонку говорить."""
+    try:
+        async with _ipc_get_lock():
+            conn = await _ipc_open()
+            reader, writer = await conn.open_connection("127.0.0.1", 9875)
+        try:
+            # любая «шапка» (обычно 3 кадра подряд, паузы до 0.9 с) значит,
+            # что maind принял соединение и обслуживает его
+            for _ in range(3):
+                size = int.from_bytes(await asyncio.wait_for(reader.readexactly(4), 1.0), "little")
                 if not 0 < size <= 512 * 1024:
-                    return {"alive": False, "reason": "битый кадр"}
-                await asyncio.wait_for(reader.readexactly(size), left)
-                return {"alive": True}
-            except asyncio.TimeoutError:
-                return {"alive": False}
+                    return {"alive": False, "reason": "битый размер кадра"}
+                await asyncio.wait_for(reader.readexactly(size), 1.0)
+            return {"alive": True}
+        finally:
+            try:
+                writer.close()
             except Exception:
-                return {"alive": False}
+                pass
+    except asyncio.TimeoutError:
+        return {"alive": False, "reason": "maind не ответил за 3 секунды"}
+    except Exception as exc:
+        return {"alive": False, "reason": f"{type(exc).__name__}: {str(exc)[:80]}"}
 
 
 @app.get("/api/alice/ask/ipc")
