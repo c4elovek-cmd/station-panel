@@ -85,6 +85,8 @@ DEFAULTS: dict[str, Any] = {
     "likes_sync_account": "other",  # чей аккаунт: me | other (висит на колонке)
     "likes_sync_datadome": "",  # datadome-cookie из браузера ПК (страница панели -> «передать куку»)
     "likes_sync_user_id": 1775876265,  # soundcloud user id аккаунта other
+    "likes_sync_max_per_run": 20,  # лайков за прогон (DataDome банит за серии)
+    "likes_sync_pause_sec": 20,  # пауза между лайками, с
     "likes_sync_last": "",  # время последнего цикла (для отображения)
     "likes_sync_log": [],  # последние строки журнала
     "soundya_auto_firefox": True,  # автоматически брать токен SoundCloud из Firefox
@@ -325,12 +327,11 @@ def _likes_log(msg: str) -> None:
     save_config(cfg)
 
 
-def _parse_ym_playlist(html: str) -> list[str]:
-    """«Артист - Название» из страницы плейлиста ЯМ.
+def _ym_playlist_meta(html: str) -> tuple[int, int]:
+    """(uid владельца, kind) плейлиста из SSR-страницы lk.*.
 
-    Треки лежат в JSON-патчах __STATE_PATCHES__ (SSR-рендер ЯМ); собираем
-    все объекты с title + artists рекурсивным обходом."""
-    tracks: list[str] = []
+    Плейлист «Мне нравится» и подобные лежат в JSON-патчах
+    __STATE_PATCHES__; ищем объект с owner.uid и kind."""
     for m in re.finditer(
             r"__STATE_PATCHES__\s*=\s*window\.__STATE_PATCHES__\s*\|\|\s*\[\]\)\.push\((\[.*?\])\);\s*window",
             html, re.S):
@@ -342,13 +343,38 @@ def _parse_ym_playlist(html: str) -> list[str]:
         while stack:
             cur = stack.pop()
             if isinstance(cur, dict):
-                title, artists = cur.get("title"), cur.get("artists")
-                if isinstance(title, str) and isinstance(artists, list) and artists \
-                        and isinstance(artists[0], dict) and artists[0].get("name"):
-                    tracks.append(f"{artists[0]['name']} - {title}")
+                owner = cur.get("owner")
+                if isinstance(owner, dict) and owner.get("uid") and cur.get("kind") is not None:
+                    return int(owner["uid"]), int(cur["kind"])
                 stack.extend(cur.values())
             elif isinstance(cur, list):
                 stack.extend(cur)
+    raise ValueError("не нашёл owner/kind в SSR-странице плейлиста")
+
+
+async def _ym_playlist_tracks(url: str) -> list[str]:
+    """Полный список «Артист - Название» плейлиста ЯМ.
+
+    SSR lk.*-страницы несёт только первый экран (~11 треков), поэтому
+    после чтения owner/kind забираем весь плейлист мобильным API
+    api.music.yandex.net/users/<uid>/playlists/<kind> — работает без
+    авторизации для публичных плейлистов."""
+    ua = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=ua, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            html = await resp.text()
+        uid, kind = _ym_playlist_meta(html)
+        async with session.get(
+                f"https://api.music.yandex.net/users/{uid}/playlists/{kind}",
+                headers=ua, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            data = await resp.json(content_type=None)
+    tracks: list[str] = []
+    for item in (data.get("result") or {}).get("tracks") or []:
+        tr = item.get("track") or {}
+        title, artists = tr.get("title"), tr.get("artists") or []
+        if isinstance(title, str) and artists and isinstance(artists[0], dict) \
+                and artists[0].get("name"):
+            tracks.append(f"{artists[0]['name']} - {title}")
     return list(dict.fromkeys(tracks))
 
 
@@ -422,28 +448,37 @@ async def _likes_sync_run() -> str:
         playlist = str(cfg.get("likes_sync_playlist") or "")
         account = str(cfg.get("likes_sync_account") or "other")
         user_id = int(cfg.get("likes_sync_user_id") or 0)
+        max_per_run = int(cfg.get("likes_sync_max_per_run") or 20)
+        pause_sec = int(cfg.get("likes_sync_pause_sec") or 20)
         if not playlist or not user_id:
             return "не настроен плейлист или user_id"
-        # 1) плейлист ЯМ
-        async with aiohttp.ClientSession() as session:
-            async with session.get(playlist, timeout=aiohttp.ClientTimeout(total=30),
-                                   headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}) as resp:
-                html = await resp.text()
-        tracks = _parse_ym_playlist(html)
+        # 1) полный плейлист ЯМ (SSR + мобильный API)
+        tracks = await _ym_playlist_tracks(playlist)
         if not tracks:
             _likes_log("плейлист ЯМ пуст/не распознан")
             return "плейлист ЯМ пуст"
-        # 2) токен и текущие лайки
+        # 2) токен и ВСЕ текущие лайки (пагинация по next)
         token = await _sc_token_for(account)
         cid_q = "QhVEWrrJKvW4uSU5u5EoI0FTXYUGzy5k"
+        liked: set[int] = set()
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                    "https://api-v2.soundcloud.com/me/track_likes/ids",
-                    params={"client_id": cid_q, "limit": 200},
-                    headers={"Authorization": f"OAuth {token}"},
-                    timeout=aiohttp.ClientTimeout(total=25)) as resp:
-                liked = set((await resp.json(content_type=None)).get("collection", []))
-        # 3) поиск и лайки новых
+            path: str | None = "/me/track_likes/ids"
+            params: dict | None = {"client_id": cid_q, "limit": 200}
+            while path:
+                async with session.get(
+                        "https://api-v2.soundcloud.com" + path,
+                        params=params,
+                        headers={"Authorization": f"OAuth {token}"},
+                        timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                    data = await resp.json(content_type=None)
+                liked.update(data.get("collection") or [])
+                nxt = data.get("next")
+                if isinstance(nxt, str) and nxt:
+                    path, params = nxt, None
+                else:
+                    path, params = None, None
+        _likes_log(f"плейлист {len(tracks)} треков, лайков в аккаунте {len(liked)}")
+        # 3) поиск и лайки новых (не больше max_per_run за прогон — DataDome)
         added, failed, skipped = 0, 0, 0
         async with aiohttp.ClientSession() as session:
             for q in tracks:
@@ -461,11 +496,14 @@ async def _likes_sync_run() -> str:
                 if track["id"] in liked:
                     skipped += 1
                     continue
+                if added >= max_per_run:
+                    _likes_log(f"лимит {max_per_run} лайков за прогон, остальные — в следующие часы")
+                    break
                 status = await _sc_like_via_station(token, user_id, track["id"])
                 if status == 200:
                     added += 1
                     _likes_log(f"лайк: {q} -> {track['title'][:40]}")
-                    await asyncio.sleep(15)  # темп против DataDome
+                    await asyncio.sleep(pause_sec)  # темп против DataDome
                 else:
                     failed += 1
                     _likes_log(f"ошибка {status}: {q}")
@@ -510,7 +548,8 @@ async def api_likes_sync_get(request: Request) -> JSONResponse:
 async def api_likes_sync_put(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
-    for key in ("enabled", "playlist", "account", "user_id", "datadome"):
+    for key in ("enabled", "playlist", "account", "user_id", "datadome",
+                "max_per_run", "pause_sec"):
         if key in data:
             cfg["likes_sync_" + key] = data[key]
     save_config(cfg)
