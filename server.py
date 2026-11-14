@@ -353,26 +353,36 @@ def _parse_ym_playlist(html: str) -> list[str]:
 
 
 async def _sc_token_for(account: str) -> str:
-    """Access-токен нужного soundya-аккаунта (refresh на колонке)."""
-    rt_file = "/data/opt/soundya/refresh_token" if account == "me" else "/data/opt/soundya/refresh_token_other"
-    code, rt, _ = await ssh_run(f"cat {rt_file}")
+    """Access-токен нужного soundya-аккаунта.
+
+    Refresh выполняется НА КОЛОНКЕ (secure.soundcloud.com отклоняет
+    refresh с датацентровых IP — invalid_request), панель только читает
+    готовый access-токен из config.json."""
+    cfg_file = "/data/opt/soundya/config.json"
+    if account != "other":
+        # для основного аккаунта токен уже в config.json soundya
+        code, out, _ = await ssh_run(f"sed -n 's/.*\"token\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\\1/p' {cfg_file}")
+        if code == 0 and out.strip():
+            return out.strip()
+    # второй аккаунт: обновляем его refresh_token скриптом на колонке
+    # (refresh.sh умеет только основной; для other — прямой curl там же)
+    code, rt, _ = await ssh_run("cat /data/opt/soundya/refresh_token_other")
     if code != 0 or not rt.strip():
-        raise RuntimeError(f"нет refresh_token ({account})")
+        raise RuntimeError("нет refresh_token_other")
     code, cid, _ = await ssh_run("cat /data/opt/soundya/client_id")
     if code != 0 or not cid.strip():
         raise RuntimeError("нет client_id")
-    body = (f"grant_type=refresh_token&client_id={cid.strip()}"
-            f"&refresh_token={rt.strip()}")
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://secure.soundcloud.com/oauth/token",
-                                data=body, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-            data = await resp.json(content_type=None)
-    if "access_token" not in data:
-        raise RuntimeError(f"refresh не удался: {str(data)[:120]}")
-    nrt = data.get("refresh_token")
-    if nrt:  # refresh одноразовый — сохраняем новый
-        await ssh_run(f"printf '%s' '{nrt}' > {rt_file}")
-    return data["access_token"]
+    quoted = shlex.quote(f"grant_type=refresh_token&client_id={cid.strip()}&refresh_token={rt.strip()}")
+    code, out, _ = await ssh_run(
+        f"/opt/bin/curl -s -m 25 -X POST https://secure.soundcloud.com/oauth/token "
+        f"-H 'Content-Type: application/x-www-form-urlencoded' --data {quoted}", timeout=40)
+    if code != 0 or "access_token" not in out:
+        raise RuntimeError(f"refresh (other) не удался: {out[:120]}")
+    m = re.search(r'"refresh_token":"([^"]+)"', out)
+    if m:  # refresh одноразовый — сохраняем новый на колонке
+        await ssh_run(f"printf '%s' {shlex.quote(m.group(1))} > /data/opt/soundya/refresh_token_other")
+    m = re.search(r'"access_token":"([^"]+)"', out)
+    return m.group(1)
 
 
 async def _sc_like_via_station(token: str, user_id: int, track_id: int) -> int:
