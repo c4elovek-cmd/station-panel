@@ -74,6 +74,14 @@ class SoundyaConfigTests(unittest.IsolatedAsyncioTestCase):
                     await self.put({"soundya_web_host": host})
         self.assertEqual(self.saved, [])
 
+    async def test_public_origin(self):
+        await self.put({"panel_public_origin": "https://panel.c4elovek.online/"})
+        self.assertEqual(self.handlers["cfg"]["panel_public_origin"], "https://panel.c4elovek.online")
+        for origin in ("https://user:password@localhost", "https://localhost/path", "javascript:alert(1)", ""):
+            with self.subTest(origin=origin):
+                with self.assertRaises(HTTPException):
+                    await self.put({"panel_public_origin": origin})
+
     async def test_normal_config_save_preserves_tunnel(self):
         await self.put({"soundya_web_host": "localhost", "soundya_web_port": 8766})
         await self.put({"station_ip": "192.168.0.172", "yam_port": 8099})

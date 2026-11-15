@@ -3386,6 +3386,7 @@ async def api_get_config(request: Request) -> JSONResponse:
             "yam_port": cfg["yam_port"],
             "soundya_web_host": cfg.get("soundya_web_host") or cfg["station_ip"],
             "soundya_web_port": cfg.get("soundya_web_port", 8765),
+            "panel_public_origin": cfg.get("panel_public_origin", ""),
         }
     )
 
@@ -3397,6 +3398,14 @@ async def api_put_config(request: Request) -> JSONResponse:
     # Проверяем новые параметры до изменения конфига. Адрес перечитывается
     # при каждом запросе, поэтому смена порта не требует рестарта контейнера.
     soundya_patch: dict[str, Any] = {}
+    if "panel_public_origin" in data:
+        from urllib.parse import urlsplit
+        public_origin = str(data["panel_public_origin"]).strip().rstrip("/")
+        parsed = urlsplit(public_origin)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment):
+            raise HTTPException(status_code=400, detail="некорректный публичный адрес панели")
+        soundya_patch["panel_public_origin"] = public_origin
     if "soundya_web_host" in data:
         host = str(data["soundya_web_host"]).strip()
         if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host):
@@ -6232,7 +6241,12 @@ async def api_soundya_proxy(path: str, request: Request) -> Response:
     origin = request.headers.get("origin")
     if origin:
         from urllib.parse import urlsplit
-        if urlsplit(origin).netloc.lower() != request.headers.get("host", "").lower():
+        source = urlsplit(origin)
+        same_host = source.netloc.lower() == request.headers.get("host", "").lower()
+        # За роутером контейнера Host внутренний. Разрешаем только явно
+        # настроенный публичный origin, а не произвольный X-Forwarded-Host.
+        public_origin = str(cfg.get("panel_public_origin") or "").rstrip("/")
+        if source.scheme not in ("http", "https") or not (same_host or origin.rstrip("/") == public_origin):
             raise HTTPException(status_code=403, detail="запрос со стороннего сайта отклонён")
         headers["origin"] = soundya_web_base()
     try:
