@@ -174,6 +174,8 @@ function showTab(name) {
   if (name === 'led') { ledAnimLoad(); loadNightClock(); }
   if (name === 'checklist') loadChecklist();
   if (name === 'plugins') loadCatalog();
+  if (name === 'music') scState();
+  if (name === 'soundyaweb') loadScWebTab();
   localStorage.setItem('sp_tab', name);
 }
 
@@ -2002,6 +2004,27 @@ $('askIpcDisconnect').onclick = async () => {
 };
 askIpcRefresh();
 
+/* Проверка канала: шлём в IPC кадр запроса состояния Алисы и ждём ответ.
+   «молчит» значит, что maind больше не обслуживает наш сокет (обычно после
+   рестарта maind или десятка подключений) — тогда нужен рестарт maind. */
+$('askIpcProbe').onclick = async () => {
+  $('askIpcProbe').disabled = true;
+  notify($('askStatus'), 'проверяю канал колонки…');
+  try {
+    const data = await api('/api/alice/ask/ipc/probe', { method: 'POST', body: JSON.stringify({}) });
+    $('askIpcStatus').textContent = data.status || '—';
+    if (data.alive) {
+      notify($('askStatus'), 'канал отвечает — можно спрашивать и звонить', 'ok');
+    } else {
+      notify($('askStatus'), 'канал молчит: колонка не примет фразу. Нужен перезапуск maind', 'error');
+    }
+  } catch (error) {
+    notify($('askStatus'), 'ошибка: ' + error.message, 'error');
+  } finally {
+    $('askIpcProbe').disabled = false;
+  }
+};
+
 /* ------------------------- позвонить на колонку -------------------------
    Звонок идёт телефонной учёткой колонки (ATS Яндекса). Директива MakeCall
    требует знания proto-схемы прошивки, поэтому основной режим — фраза
@@ -2281,6 +2304,11 @@ $('backupBtn').onclick = async () => {
 $('backupsRefresh').onclick = loadBackups;
 
 /* ------------------------- музыка: soundya + spotiya ------------------------- */
+function fmtMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
 let musicObserverBound = false;
 let spotiyaPaused = false;
 let spotiyaVolume = 60;
@@ -2290,8 +2318,23 @@ async function musicStatus() {
     const data = await api('/api/music/status');
     const s = data.soundya || {};
     $('soundyaPanel').style.display = s.installed === false ? 'none' : '';
-    $('soundyaChip').textContent = s.running ? 'работает' : (s.installed === false ? 'не установлен' : 'остановлен');
-    $('soundyaStatus').textContent = s.raw || '';
+    $('soundyaChip').textContent = s.running
+      ? (s.playing ? 'играет' : s.paused ? 'на паузе' : 'готов')
+      : (s.installed === false ? 'не установлен' : 'остановлен');
+    if (s.track) {
+      const dur = s.duration_ms ? ' · ' + fmtMs(s.duration_ms) : '';
+      const pos = typeof s.pos === 'number' && s.queue_len ? ` · трек ${s.pos + 1}/${s.queue_len}` : '';
+      const vol = typeof s.volume === 'number' ? ` · громкость ${s.volume}%` : '';
+      const login = s.login === 'refused' ? ' · ⚠ нужен логин' : s.login === 'checking' ? ' · проверяю вход' : '';
+      $('soundyaStatus').textContent = `${s.track}${dur}${pos}${vol}${login}`;
+    } else {
+      $('soundyaStatus').textContent = s.raw || 'ничего не играет';
+    }
+    // иконка play/pause по состоянию
+    const toggleBtn = document.querySelector('[data-soundya="toggle"]');
+    if (toggleBtn) toggleBtn.innerHTML = s.playing
+      ? '<svg class="ic"><use href="#i-pause"/></svg>'
+      : '<svg class="ic"><use href="#i-play"/></svg>';
     const p = data.spotiya || {};
     $('spotiyaPanel').style.display = p.installed === false ? 'none' : '';
     spotiyaPaused = !!p.paused;
@@ -2311,17 +2354,20 @@ async function musicStatus() {
 }
 
 async function musicCmd(kind, cmd, arg) {
+  let via = '';
   try {
     const result = await api('/api/music/' + kind, { method: 'POST', body: JSON.stringify({ cmd, arg }) });
+    via = result.via || '';
     if (!result.ok) notify($('soundyaStatus'), result.output || 'ошибка', 'error');
   } catch (error) {
     notify($('soundyaStatus'), 'ошибка: ' + error.message, 'error');
   }
-  setTimeout(musicStatus, 1500);
+  // прямой канал (web) к демону отвечает мгновенно — статус обновляем сразу
+  setTimeout(musicStatus, via === 'web' ? 200 : 1500);
 }
 
 document.querySelectorAll('[data-soundya]').forEach(button => {
-  button.onclick = () => musicCmd('soundya', button.dataset.soundya);
+  button.onclick = () => musicCmd('soundya', button.dataset.soundya, button.dataset.arg || '');
 });
 document.querySelectorAll('[data-spotiya]').forEach(button => {
   button.onclick = () => {
@@ -2391,13 +2437,178 @@ $('soundyaTokenSave').onclick = async () => {
   }
 };
 
+/* ------------------------- soundya: аккаунты, update, будильники, PIN, :8765 ------------------------- */
+let scTimerStarted = false;
+function scStateTimer() {
+  if (!scTimerStarted) { scTimerStarted = true; setInterval(scState, 30000); }
+}
+async function scState() {
+  try {
+    const data = await api('/api/soundya/state');
+    const s = data.state || {};
+    if (!s.web_up) {
+      $('scActiveAcc').textContent = '—';
+      $('scActiveExp').textContent = '';
+      notify($('soundyaStatus'), 'веб soundya не отвечает (порт 8765): ' + (s.web_error || '?'), 'error');
+      return;
+    }
+    const acc = s.active_account || 'me';
+    $('scActiveAcc').textContent = acc === 'other' ? 'аккаунт брата' : 'мой аккаунт';
+    if (typeof s.token_exp === 'number' && s.token_exp > 0) {
+      const left = s.token_exp - Math.floor(Date.now() / 1000);
+      $('scActiveExp').textContent = left > 0
+        ? `· токен жив ещё ${Math.floor(left / 3600)} ч ${Math.floor((left % 3600) / 60)} мин`
+        : '· токен истёк, ожидание продления';
+    }
+    if (s.sc_renew_error) notify($('scAccStatus'), 'продление: ' + s.sc_renew_error, 'error');
+    if (s.pin_on) $('scPinStatus').textContent = 'PIN включён (страницу :8765 защищён)';
+    else $('scPinStatus').textContent = 'PIN выключен';
+    const upd = s.update || {};
+    if (upd.version) $('scUpdStatus').textContent = `установлено: ${s.device?.version || '?'}${upd.latest ? ` · доступно ${upd.latest}` : ' · последняя версия'}`;
+    loadScAlarms();
+  } catch (error) {
+    $('scActiveAcc').textContent = 'ошибка';
+  }
+}
+
+async function loadScAlarms() {
+  const list = $('scAlarmList');
+  try {
+    const data = await api('/api/soundya/alarms');
+    const alarms = data.alarms || [];
+    if (!alarms.length) { list.textContent = 'будильников нет'; return; }
+    list.innerHTML = '';
+    for (const a of alarms) {
+      const row = document.createElement('div');
+      row.className = 'row wrap';
+      const label = document.createElement('span');
+      const src = a.source ? ' · ' + (a.source === 'recs' ? 'волна' : a.source === 'likes' ? 'лайки' : a.source) : '';
+      label.textContent = `⏰ ${String(a.hour).padStart(2, '0')}:${String(a.minute).padStart(2, '0')} · ${a.days === 'daily' ? 'ежедневно' : a.days === 'weekdays' ? 'будни' : a.days === 'weekend' ? 'выходные' : 'один раз'}${src}`;
+      const del = document.createElement('button');
+      del.className = 'btn sm';
+      del.textContent = 'убрать';
+      del.onclick = async () => {
+        try {
+          await api('/api/soundya/alarm/del', { method: 'POST', body: JSON.stringify({ id: a.id }) });
+          loadScAlarms();
+        } catch (e) { notify(list, 'не убрался: ' + e.message, 'error'); }
+      };
+      row.append(label, del);
+      list.append(row);
+    }
+  } catch (error) {
+    list.textContent = 'будильники: ' + error.message;
+  }
+}
+
+function scAccountSave(who) {
+  const token = (who === 'me' ? $('scAccMeToken') : $('scAccOtherToken')).value.trim();
+  const refresh = (who === 'me' ? $('scAccMeRT') : $('scAccOtherRT')).value.trim();
+  if (!token) { notify($('scAccStatus'), 'вставь oauth_token для ' + (who === 'me' ? 'своего' : 'брата'), 'error'); return; }
+  notify($('scAccStatus'), 'сохраняю…');
+  api('/api/soundya/account', { method: 'POST', body: JSON.stringify({ account: who, token, refresh }) })
+    .then(result => {
+      if (who === 'me') $('scAccMeToken').value = ''; else $('scAccOtherToken').value = '';
+      if (who === 'me') $('scAccMeRT').value = ''; else $('scAccOtherRT').value = '';
+      notify($('scAccStatus'), result.detail || 'сохранено', 'ok');
+      scState();
+    })
+    .catch(error => notify($('scAccStatus'), 'ошибка: ' + error.message, 'error'));
+}
+
+$('scAccSaveMe').onclick = () => scAccountSave('me');
+$('scAccSaveOther').onclick = () => scAccountSave('other');
+
+function scSwitch(account) {
+  const who = account === 'other' ? 'аккаунт брата' : 'свой аккаунт';
+  notify($('soundyaStatus'), 'переключаюсь на ' + who + ' (лайки)…');
+  api('/api/soundya/switch', { method: 'POST', body: JSON.stringify({ account, what: 'likes' }) })
+    .then(result => {
+      notify($('soundyaStatus'), result.output || (result.ok ? 'включил' : 'не вышло'), result.ok ? 'ok' : 'error');
+      setTimeout(musicStatus, 2000);
+      scState();
+    })
+    .catch(error => notify($('soundyaStatus'), 'ошибка: ' + error.message, 'error'));
+}
+$('scSwitchMe').onclick = () => scSwitch('me');
+$('scSwitchOther').onclick = () => scSwitch('other');
+
+$('scUpdCheck').onclick = async () => {
+  $('scUpdStatus').textContent = 'спрашиваю GitHub…';
+  try {
+    const r = await api('/api/soundya/update', { method: 'POST', body: JSON.stringify({ mode: 'check' }) });
+    $('scUpdStatus').textContent = r.output;
+  } catch (error) {
+    $('scUpdStatus').textContent = 'ошибка: ' + error.message;
+  }
+};
+$('scUpdInstall').onclick = async () => {
+  if (!confirm('Установить новую версию soundya? Бэкап и откат сделаются автоматически.')) return;
+  $('scUpdStatus').textContent = 'устанавливаю (это 1–3 минуты)…';
+  try {
+    const r = await api('/api/soundya/update', { method: 'POST', body: JSON.stringify({ mode: 'install' }) });
+    $('scUpdStatus').textContent = r.output;
+    scState();
+  } catch (error) {
+    $('scUpdStatus').textContent = 'ошибка: ' + error.message;
+  }
+};
+
+$('scAlarmAdd').onclick = async () => {
+  const parts = ($('scAlarmTime').value || '').split(':');
+  if (parts.length !== 2) { notify($('scAlarmList'), 'укажи время', 'error'); return; }
+  const body = {
+    hour: parseInt(parts[0], 10),
+    minute: parseInt(parts[1], 10),
+    days: $('scAlarmDays').value,
+    source: $('scAlarmSource').value,
+  };
+  try {
+    const r = await api('/api/soundya/alarms', { method: 'POST', body: JSON.stringify(body) });
+    notify($('scAlarmList'), r.output || 'добавлено', 'ok');
+    loadScAlarms();
+  } catch (error) {
+    notify($('scAlarmList'), 'ошибка: ' + error.message, 'error');
+  }
+};
+
+$('scPinSave').onclick = async () => {
+  const pin = $('scPinInput').value.trim();
+  try {
+    const r = await api('/api/soundya/pin', { method: 'POST', body: JSON.stringify({ pin }) });
+    $('scPinInput').value = '';
+    $('scPinStatus').textContent = r.output || (pin ? 'PIN установлен' : 'PIN выключен');
+  } catch (error) {
+    $('scPinStatus').textContent = 'ошибка: ' + error.message;
+  }
+};
+
+/* вкладка «Плеер SoundCloud»: страница колонки :8765 грузится лениво */
+let scWebLoaded = false;
+function loadScWebTab() {
+  const frame = $('soundyaWebFrame');
+  const note = $('soundyaWebNote');
+  if (!scWebLoaded && frame && state.status && state.status.station_ip) {
+    scWebLoaded = true;
+    const url = `http://${state.status.station_ip}:8765/`;
+    frame.src = url;
+    const urlEl = $('soundyaWebUrl');
+    if (urlEl) urlEl.textContent = url;
+  }
+  if (frame) frame.hidden = false;
+  if (note) note.hidden = false;
+  scState();
+}
+
 // статус музыки — при открытии вкладки и далее по таймеру
 const musicObserver = new MutationObserver(() => {
   if ($('tab-music').classList.contains('active') && !musicObserverBound) {
     musicObserverBound = true;
     musicStatus();
     localStatus();
-    setInterval(musicStatus, 10000);
+    scState();
+    scStateTimer();
+    setInterval(musicStatus, 3000);
     setInterval(localStatus, 5000);
   }
 });

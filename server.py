@@ -326,12 +326,18 @@ async def _ipc_media_listener() -> None:
             if now - last_sent.get(cmd, 0) < float(cfg.get("ipc_media_dedupe_sec", 5)):
                 continue  # тот же финал может прийти повторно
             last_sent[cmd] = now
+            # прямой канал в демон soundya (:8765) — мгновенно и без VPS;
+            # фолбэк — старая дорога через мост, если веб-порт не поднят
+            code, reply = await soundya_web("POST", "/api/cmd", body=cmd, timeout=15)
+            if code == 200 and not reply.lstrip().startswith("error"):
+                print(f"[ipc-media] «{text}» -> {cmd} (напрямую: {reply.strip()[:60]})")
+                continue
             timeout = aiohttp.ClientTimeout(total=12)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 await session.post(bridge_base + "/api/media",
                                    json={"media": cmd},
                                    headers={"authorization": f"Bearer {token}"})
-            print(f"[ipc-media] «{text}» -> {cmd}")
+            print(f"[ipc-media] «{text}» -> {cmd} (через мост: {reply.strip()[:60]})")
         except Exception as exc:
             failures += 1
             _ipc_media_debug["failures"] = failures
@@ -5624,19 +5630,48 @@ async def api_files_restore(request: Request) -> JSONResponse:
 
 # --------------------------------------------------------------------------- #
 # Музыка: управление soundya (SoundCloud) и spotiya (Spotify Connect)
+# soundya — напрямую в демон через веб-API :8765 (мгновенно, без SSH);
+# SSH — только fallback, если веб-порт не поднят.
 # --------------------------------------------------------------------------- #
 @app.get("/api/music/status")
 async def api_music_status(request: Request) -> JSONResponse:
     require_auth(request)
     result: dict[str, Any] = {}
-    code, out, _ = await ssh_run_bytes("soundya status 2>&1", timeout=20)
-    text = out.decode("utf-8", "replace").strip()
-    result["soundya"] = {
-        "installed": "running" in text or "stopped" in text,
-        "running": "running" in text,
-        "playing": text.lower().startswith("playing") or "playing" in text.lower().split(";")[0] if text else False,
-        "raw": text[:300],
-    }
+    # soundya: живой статус из демона (state/track/queue/login)
+    soundya: dict[str, Any] = {"installed": False, "running": False}
+    code, text = await soundya_web("GET", "/api/status", timeout=12)
+    if code == 200:
+        try:
+            s = json.loads(text)
+            st = str(s.get("state") or "")
+            soundya = {
+                "installed": True,
+                "running": True,
+                "playing": st == "playing",
+                "paused": st == "paused",
+                "track": s.get("track") or "",
+                "position_ms": s.get("position_ms") or 0,
+                "duration_ms": s.get("duration_ms") or 0,
+                "pos": s.get("pos") or 0,
+                "queue_len": len(s.get("queue") or []),
+                "login": s.get("login") or "",
+                "volume": s.get("volume"),
+                "raw": f"{st or 'остановлен'}: {s.get('track') or '—'}",
+            }
+        except json.JSONDecodeError:
+            pass
+    if not soundya.get("running"):
+        # fallback: CLI по SSH (веб-порт выключен или демон лежит)
+        code, out, _ = await ssh_run_bytes("soundya status 2>&1", timeout=20)
+        text = out.decode("utf-8", "replace").strip()
+        soundya = {
+            "installed": "running" in text or "stopped" in text or "paused" in text,
+            "running": "running" in text or "paused" in text,
+            "playing": "playing" in text.lower(),
+            "paused": text.lower().startswith("paused"),
+            "raw": text[:300],
+        }
+    result["soundya"] = soundya
     code, out, _ = await ssh_run_bytes("spotiya status 2>&1", timeout=20)
     try:
         spotiya = json.loads(out.decode("utf-8", "replace"))
@@ -5659,18 +5694,33 @@ async def api_music_status(request: Request) -> JSONResponse:
 
 @app.post("/api/music/soundya")
 async def api_music_soundya(request: Request) -> JSONResponse:
+    """Команды soundya: напрямую в демон (POST /api/cmd), SSH — fallback."""
     require_auth(request)
     data = await request.json()
     cmd = str(data.get("cmd", "")).strip()
     arg = str(data.get("arg", "")).strip()
-    allowed = {"play", "pause", "resume", "toggle", "next", "prev", "stop", "shuffle", "repeat", "similar", "likes", "recs", "playlist", "status"}
+    allowed = {"play", "pause", "resume", "toggle", "next", "prev", "stop",
+               "shuffle", "repeat", "similar", "likes", "recs", "playlist",
+               "status", "queue", "seek", "like", "unlike"}
     if cmd not in allowed:
         raise HTTPException(status_code=400, detail="неизвестная команда soundya")
-    if cmd in ("play", "playlist") and not arg:
+    if cmd in ("play", "playlist", "seek") and not arg:
         raise HTTPException(status_code=400, detail="нужен запрос")
+    command = cmd + (f" {arg}" if arg else "")
+    # 1) прямой канал: мгновенный ответ демона, без SSH-сессии
+    timeout = 90.0 if cmd in ("play", "playlist", "similar", "likes", "recs") else 30.0
+    code, text = await soundya_web("POST", "/api/cmd", body=command, timeout=timeout)
+    if code == 200:
+        ok = not text.lstrip().startswith("error")
+        return JSONResponse({"ok": ok, "output": text.strip()[:400], "via": "web"})
+    # 2) fallback: CLI по SSH (веб-порт не поднят)
     command = f"soundya {cmd}" + (f" {shlex.quote(arg)}" if arg else "")
     code, out, err = await ssh_run_bytes(command + " 2>&1", timeout=90)
-    return JSONResponse({"ok": code == 0, "output": out.decode("utf-8", "replace")[:400] + err.decode("utf-8", "replace")[:200]})
+    return JSONResponse({
+        "ok": code == 0,
+        "output": out.decode("utf-8", "replace")[:400] + err.decode("utf-8", "replace")[:200],
+        "via": "ssh",
+    })
 
 
 @app.post("/api/music/spotiya")
@@ -5817,13 +5867,23 @@ def _firefox_soundcloud_token() -> str | None:
 
 
 async def _soundya_apply_token(token: str) -> tuple[bool, str]:
-    """Записать токен в soundya и перезапустить плеер. (ok, подробность)."""
+    """Записать токен в soundya. (ok, подробность).
+
+    С 0.5.9 prefers горячую замену через веб-API :8765 (демон сам
+    перезалогинивается в фоне, без рестарта); если веб не отвечает —
+    старая дорога: запись config.json + рестарт.
+    """
     # формат куки oauth_token у SoundCloud: старый <версия>-<uid>-<время>-<секрет>
     # (например 2-332675-1600559952-phiBI8CyfxpF4) или новый JWT (eyJ…, сутки)
     if not (re.fullmatch(r"[0-9]{1,3}-[0-9]{2,15}-[0-9]{8,14}-[A-Za-z0-9_\-]{6,64}", token)
             or token.startswith("eyJ")
             or (20 <= len(token) <= 1600 and not re.search(r"\s", token))):
         return False, "не похоже на oauth_token: это значение куки oauth_token с soundcloud.com (eyJ… или 2-332675-…)"
+    # горячая замена на живом демоне — без рестарта
+    ok, detail = await _soundya_post_settings({"token": token})
+    if ok:
+        return True, detail or "принят (веб-API)"
+    # fallback: запись config.json + рестарт (веб недоступен / daemon лежит)
     code, current, _ = await ssh_run_bytes("cat /data/opt/soundya/config.json 2>/dev/null", timeout=15)
     try:
         config = json.loads(current.decode("utf-8", "replace") or "{}")
@@ -5844,23 +5904,285 @@ async def _soundya_apply_token(token: str) -> tuple[bool, str]:
     return True, out.decode("utf-8", "replace")[:300]
 
 
+# --------------------------------------------------------------------------- #
+# soundya 0.5.9: интеграция с веб-API демона (:8765) — настройки, токены
+# двух аккаунтов, обновление, будильник, ambilight, airplay, pin.
+# Панель ходит в http://<колонка>:8765 как не-браузер (без Origin): 
+# web.rs::allowed пропускает запросы без Origin с локального хоста.
+# --------------------------------------------------------------------------- #
+
+SOUNDYA_WEB_PORT = 8765
+SOUNDYA_STATE_DIR = "/data/opt/soundya"
+# хранится в config.json панели; RT каждого аккаунта живёт у soundya
+# (ротация), панель лишь переключает активный аккаунт и показывает статус
+SOUNDYA_ACCOUNTS = {"me": "мой аккаунт", "other": "аккаунт брата"}
+
+
+async def soundya_web(method: str, path: str, body: dict | str | None = None,
+                       timeout: float = 20.0) -> tuple[int, str]:
+    """Запрос к веб-API soundya на колонке. (код, текст ответа)."""
+    url = f"http://{cfg['station_ip']}:{SOUNDYA_WEB_PORT}{path}"
+    data = None
+    headers = {}
+    if body is not None:
+        data = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+        headers["Content-Type"] = "application/json"
+    try:
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.request(method, url, data=data, headers=headers) as resp:
+                text = await resp.text()
+                return resp.status, text
+    except asyncio.TimeoutError:
+        return 504, "таймаут обращения к soundya"
+    except Exception as exc:
+        return 502, f"{type(exc).__name__}: {str(exc)[:140]}"
+
+
+async def _soundya_post_settings(patch: dict) -> tuple[bool, str]:
+    """POST /api/settings — патч-мердж настроек на живом демоне (без рестарта)."""
+    code, text = await soundya_web("POST", "/api/settings", body=patch, timeout=25)
+    if code != 200:
+        return False, f"HTTP {code}: {text[:200]}"
+    if text.startswith("error"):
+        return False, text[:250]
+    return True, text.strip()
+
+
+async def _soundya_cmd(cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+    """POST /api/cmd — команда контролю демона (alarm, update, pin, led…)."""
+    code, text = await soundya_web("POST", "/api/cmd", body=cmd, timeout=timeout)
+    if code != 200:
+        return False, f"HTTP {code}: {text[:200]}"
+    return not text.startswith("error"), text.strip()[:400]
+
+
+async def _soundya_status_json() -> dict:
+    code, text = await soundya_web("GET", "/api/status", timeout=15)
+    if code != 200:
+        return {"web_up": False, "web_error": text[:180]}
+    try:
+        data = json.loads(text)
+        data["web_up"] = True
+        return data
+    except json.JSONDecodeError:
+        return {"web_up": False, "web_error": "статус soundya — не JSON"}
+
+
+@app.get("/api/soundya/state")
+async def api_soundya_state(request: Request) -> JSONResponse:
+    """Полный статус soundya: плеер, токены, обновление, airplay, ambilight."""
+    require_auth(request)
+    data = await _soundya_status_json()
+    # маскированные токены из статуса (…1234) — показываем как есть
+    data["accounts"] = {who: {"label": label} for who, label in SOUNDYA_ACCOUNTS.items()}
+    # активный аккаунт: файл на колонке
+    code, out, _ = await ssh_run(f"cat {SOUNDYA_STATE_DIR}/active_account 2>/dev/null", timeout=10)
+    data["active_account"] = out.strip() if code == 0 and out.strip() else "me"
+    return JSONResponse({"ok": True, "state": data})
+
+
+@app.post("/api/soundya/account")
+async def api_soundya_account(request: Request) -> JSONResponse:
+    """Сохранить oauth_token + oauth_refresh_token аккаунта (me|other).
+
+    RT панель НЕ использует для продления сама: с 0.5.9 soundya сам продлевает
+    и ротирует RT из config.json. Панель лишь записывает пару в конфиг текущего
+    активного аккаунта (перезапись токена с проверкой логина) и сохраняет RT
+    в файл на колонке — likes_as.sh возьмёт при переключении.
+    """
+    require_auth(request)
+    data = await request.json()
+    who = str(data.get("account", "")).strip()
+    if who not in SOUNDYA_ACCOUNTS:
+        raise HTTPException(status_code=400, detail="account: me или other")
+    token = str(data.get("token", "")).strip()
+    refresh = str(data.get("refresh", "")).strip()
+    if not (token.startswith("eyJ") or re.fullmatch(r"[0-9]{1,3}-[0-9]{2,15}-[0-9]{8,14}-[A-Za-z0-9_\-]{6,64}", token)
+            or (20 <= len(token) <= 1600 and not re.search(r"\s", token))):
+        raise HTTPException(status_code=400, detail="не похоже на oauth_token (eyJ… или 2-…-…-…)")
+    if refresh and not (20 <= len(refresh) <= 400 and not re.search(r"\s", refresh)):
+        raise HTTPException(status_code=400, detail="oauth_refresh_token не похож на правду (длинная строка без пробелов)")
+    # 1) пара пишется в config.json активного аккаунта — но только если это
+    #    и есть активный аккаунт, иначе конфиг перезапишется чужим токеном.
+    active = ""
+    code, out, _ = await ssh_run(f"cat {SOUNDYA_STATE_DIR}/active_account 2>/dev/null", timeout=10)
+    if code == 0:
+        active = out.strip()
+    if who == (active or "me"):
+        patch: dict = {"token": token}
+        if refresh:
+            patch["sc_refresh"] = refresh
+        ok, detail = await _soundya_post_settings(patch)
+        if not ok:
+            raise HTTPException(status_code=502, detail="soundya не принял токен: " + detail[:200])
+    else:
+        detail = "сохранён для переключения (активен другой аккаунт)"
+    # 2) RT — в файл на колонке, его берёт likes_as.sh при переключении на этого
+    #    аккаунта; сам RT живёт своей ротацией уже только у soundya
+    if refresh:
+        rt_file = f"{SOUNDYA_STATE_DIR}/refresh_token{'_other' if who == 'other' else ''}"
+        code, _, err = await ssh_run_bytes(
+            f"printf '%s' {shlex.quote(refresh)} > {rt_file}", timeout=10)
+        if code != 0:
+            raise HTTPException(status_code=502, detail="не записался refresh-токен: " + err.decode("utf-8", "replace")[:120])
+    return JSONResponse({"ok": True, "account": who, "detail": detail})
+
+
+@app.post("/api/soundya/switch")
+async def api_soundya_switch(request: Request) -> JSONResponse:
+    """Переключить активный аккаунт (me|other) и заиграть лайки/рекомендации."""
+    require_auth(request)
+    data = await request.json()
+    who = str(data.get("account", "")).strip()
+    if who not in SOUNDYA_ACCOUNTS:
+        raise HTTPException(status_code=400, detail="account: me или other")
+    what = str(data.get("what", "likes")).strip().lower()
+    if what not in ("likes", "recs"):
+        raise HTTPException(status_code=400, detail="what: likes или recs")
+    code, out, err = await ssh_run_bytes(
+        f"/data/opt/soundya/likes_as.sh {who} {what}", timeout=90)
+    text = out.decode("utf-8", "replace")
+    if code != 0:
+        return JSONResponse({"ok": False, "output": (text + err.decode("utf-8", "replace"))[:400]})
+    return JSONResponse({"ok": True, "output": text[:400]})
+
+
+@app.get("/api/soundya/alarms")
+async def api_soundya_alarms(request: Request) -> JSONResponse:
+    require_auth(request)
+    ok, text = await _soundya_cmd("alarm json")
+    if not ok or not text.startswith("{"):
+        return JSONResponse({"ok": False, "error": text[:200], "alarms": []})
+    try:
+        return JSONResponse({"ok": True, **json.loads(text)})
+    except json.JSONDecodeError:
+        return JSONResponse({"ok": False, "error": "alarm json — не JSON", "alarms": []})
+
+
+@app.post("/api/soundya/alarms")
+async def api_soundya_alarms_post(request: Request) -> JSONResponse:
+    """Будильник «под что»: soundya alarm add {json}."""
+    require_auth(request)
+    data = await request.json()
+    hour = data.get("hour")
+    minute = data.get("minute")
+    days = data.get("days", "once")
+    source = data.get("source", "")
+    try:
+        hour = int(hour); minute = int(minute)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="hour/minute — числа")
+    if not (0 <= hour <= 23 and 0 <= minute <= 57):
+        raise HTTPException(status_code=400, detail="время — 00:00–23:59")
+    if days not in ("once", "daily", "weekdays", "weekend"):
+        days = "once"
+    payload = json.dumps({"hour": hour, "minute": minute, "days": days, "source": str(source)}, ensure_ascii=False)
+    ok, text = await _soundya_cmd(f"alarm add {payload}")
+    if not ok:
+        raise HTTPException(status_code=502, detail=text[:250])
+    return JSONResponse({"ok": True, "output": text})
+
+
+@app.post("/api/soundya/alarm/del")
+async def api_soundya_alarm_del(request: Request) -> JSONResponse:
+    require_auth(request)
+    data = await request.json()
+    alarm_id = data.get("id")
+    if not isinstance(alarm_id, (int, str)) or str(alarm_id).strip().isdigit() is False:
+        raise HTTPException(status_code=400, detail="id будильника — число")
+    ok, text = await _soundya_cmd(f"alarm del {int(alarm_id)}")
+    if not ok:
+        raise HTTPException(status_code=502, detail=text[:250])
+    return JSONResponse({"ok": True, "output": text})
+
+
+@app.post("/api/soundya/pin")
+async def api_soundya_pin(request: Request) -> JSONResponse:
+    """PIN-код страницы soundya: set 4–12 цифр / off."""
+    require_auth(request)
+    data = await request.json()
+    pin = str(data.get("pin", "")).strip()
+    if pin and not re.fullmatch(r"[0-9]{4,12}", pin):
+        raise HTTPException(status_code=400, detail="PIN — 4–12 цифр или пусто (выключить)")
+    cmd = f"pin set {pin}" if pin else "pin off"
+    ok, text = await _soundya_cmd(cmd)
+    if not ok or text.startswith("error"):
+        raise HTTPException(status_code=502, detail=text[:250])
+    return JSONResponse({"ok": True, "output": text})
+
+
+@app.post("/api/soundya/update")
+async def api_soundya_update(request: Request) -> JSONResponse:
+    """Обновить soundya: check (поиск новой версии) или install (установить).
+
+    Сам апдейтёр живёт в soundya (update.rs) и качает через прокси из GitHub,
+    сверяет sha256, делает бэкап и откат — панель лишь вызывает его.
+    """
+    require_auth(request)
+    data = await request.json()
+    mode = str(data.get("mode", "check")).strip().lower()
+    if mode not in ("check", "install"):
+        raise HTTPException(status_code=400, detail="mode: check или install")
+    ok, text = await _soundya_cmd(f"update {mode}", timeout=600 if mode == "install" else 60)
+    if not ok:
+        raise HTTPException(status_code=502, detail=text[:250])
+    return JSONResponse({"ok": True, "output": text})
+
+
+@app.get("/api/soundya/web")
+async def api_soundya_web(request: Request) -> Response:
+    """Проксирует страницу soundya :8765 в панель (вкладка-плеер).
+
+    Браузер грузит страницу с панели (origin панели), а сам документ и все
+    его запросы идут с origin колонки — проверки allowed() проходят.
+    """
+    require_auth(request)
+    sub = request.query_params.get("path", "")
+    if sub and not re.fullmatch(r"[A-Za-z0-9_./-]{1,80}", sub):
+        return JSONResponse({"ok": False, "error": "путь запрещён"}, status_code=400)
+    code, ctype, body = await _soundya_web_fetch("/" + sub.lstrip("/"))
+    if code != 200:
+        return JSONResponse({"ok": False, "error": ctype[:200]}, status_code=502)
+    return Response(body, media_type=ctype, headers={"Cache-Control": "no-store"})
+
+
+async def _soundya_web_fetch(path: str) -> tuple[int, str, bytes]:
+    url = f"http://{cfg['station_ip']}:{SOUNDYA_WEB_PORT}{path}"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.get(url) as resp:
+                return resp.status, resp.content_type or "text/html", await resp.read()
+    except Exception as exc:
+        return 502, f"{type(exc).__name__}: {str(exc)[:120]}", b""
+
+
 async def _soundya_token_loop() -> None:
-    """Каждые 30 минут: свежий oauth_token из Firefox -> soundya (если изменился)."""
+    """Каждые 30 минут: свежий oauth_token из Firefox -> soundya (если изменился).
+
+    Тронем только когда активен «me»: иначе переищем активного аккаунта
+    брата своим токеном.
+    """
     while True:
         try:
             if cfg.get("soundya_auto_firefox"):
-                token = await asyncio.to_thread(_firefox_soundcloud_token)
-                if token:
-                    code, cur, _ = await ssh_run_bytes(
-                        "cat /data/opt/soundya/config.json 2>/dev/null", timeout=15)
-                    try:
-                        current = json.loads(cur.decode("utf-8", "replace") or "{}").get("token", "")
-                    except Exception:
-                        current = ""
-                    if token != current:
-                        ok, detail = await _soundya_apply_token(token)
-                        print(f"[soundya] токен обновлён из Firefox: {detail[:120]!r}" if ok
-                              else f"[soundya] не применился: {detail[:120]!r}")
+                code, active, _ = await ssh_run_bytes(
+                    "cat /data/opt/soundya/active_account 2>/dev/null", timeout=10)
+                if code == 0 and active.strip() not in ("", "me"):
+                    pass  # активен другой аккаунт — не трогаем его токен
+                else:
+                    token = await asyncio.to_thread(_firefox_soundcloud_token)
+                    if token:
+                        code, cur, _ = await ssh_run_bytes(
+                            "cat /data/opt/soundya/config.json 2>/dev/null", timeout=15)
+                        try:
+                            current = json.loads(cur.decode("utf-8", "replace") or "{}").get("token", "")
+                        except Exception:
+                            current = ""
+                        if token != current:
+                            ok, detail = await _soundya_apply_token(token)
+                            print(f"[soundya] токен обновлён из Firefox: {detail[:120]!r}" if ok
+                                  else f"[soundya] не применился: {detail[:120]!r}")
         except Exception as exc:
             print(f"[soundya] цикл Firefox: {type(exc).__name__}: {str(exc)[:120]}")
         await asyncio.sleep(1800)
