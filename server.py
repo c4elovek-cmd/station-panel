@@ -5907,11 +5907,14 @@ async def _soundya_apply_token(token: str) -> tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 # soundya 0.5.9: интеграция с веб-API демона (:8765) — настройки, токены
 # двух аккаунтов, обновление, будильник, ambilight, airplay, pin.
-# Панель ходит в http://<колонка>:8765 как не-браузер (без Origin): 
-# web.rs::allowed пропускает запросы без Origin с локального хоста.
+# Панель ходит в http://<soundya_web_host>:<soundya_web_port>/ как не-браузер
+# (без Origin): web.rs::allowed пропускает запросы без Origin с локального хоста.
+# На VPS (panel.c4elovek.online) веб soundya проброшен chisel-туннелем как
+# 127.0.0.1:8766 (8765 там занят voice-bridge); локально — 192.168.0.172:8765.
 # --------------------------------------------------------------------------- #
 
-SOUNDYA_WEB_PORT = 8765
+SOUNDYA_WEB_PORT = int(cfg.get("soundya_web_port", 8765))
+SOUNDYA_WEB_HOST = str(cfg.get("soundya_web_host") or cfg["station_ip"])
 SOUNDYA_STATE_DIR = "/data/opt/soundya"
 # хранится в config.json панели; RT каждого аккаунта живёт у soundya
 # (ротация), панель лишь переключает активный аккаунт и показывает статус
@@ -5920,8 +5923,8 @@ SOUNDYA_ACCOUNTS = {"me": "мой аккаунт", "other": "аккаунт бр
 
 async def soundya_web(method: str, path: str, body: dict | str | None = None,
                        timeout: float = 20.0) -> tuple[int, str]:
-    """Запрос к веб-API soundya на колонке. (код, текст ответа)."""
-    url = f"http://{cfg['station_ip']}:{SOUNDYA_WEB_PORT}{path}"
+    """Запрос к веб-API soundya. (код, текст ответа)."""
+    url = f"http://{SOUNDYA_WEB_HOST}:{SOUNDYA_WEB_PORT}{path}"
     data = None
     headers = {}
     if body is not None:
@@ -6130,25 +6133,107 @@ async def api_soundya_update(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "output": text})
 
 
+SOUNDYA_PROXY_SHIM = """
+<script>
+(function() {
+  // живёт в iframe панели на panel.c4elovek.online: переносим все запросы
+  // страницы soundya под префикс /soundya/, иначе они уйдут в API самой панели
+  var P = '/soundya/';
+  var rew = function(u) {
+    try {
+      var s = (u === null || u === undefined) ? '' : String(u);
+      if (s.indexOf('/') === 0) return P + s.slice(1);
+      if (s.indexOf(location.origin + '/') === 0) return P + s.slice(location.origin.length + 1);
+    } catch (e) {}
+    return u;
+  };
+  var of = window.fetch;
+  window.fetch = function(input, init) {
+    try {
+      if (typeof input === 'string') input = rew(input);
+      else if (input && input.url) input = new Request(rew(input.url), input);
+    } catch (e) {}
+    return of.call(window, input, init);
+  };
+  var oo = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(m, u) {
+    arguments[1] = rew(u);
+    return oo.apply(this, arguments);
+  };
+})();
+</script>
+"""
+
+
 @app.get("/api/soundya/web")
 async def api_soundya_web(request: Request) -> Response:
-    """Проксирует страницу soundya :8765 в панель (вкладка-плеер).
+    """Страница soundya :8765, проксированная панелью (вкладка-плеер).
 
-    Браузер грузит страницу с панели (origin панели), а сам документ и все
-    его запросы идут с origin колонки — проверки allowed() проходят.
+    Проксируется под префиксом /soundya/, а в HTML внедряется шим, который
+    переводит fetch/XHR страницы в этот префикс. Работает и локально,
+    и с panel.c4elovek.online (там веб soundya приходит туннелем как
+    127.0.0.1:8766).
     """
     require_auth(request)
-    sub = request.query_params.get("path", "")
-    if sub and not re.fullmatch(r"[A-Za-z0-9_./-]{1,80}", sub):
-        return JSONResponse({"ok": False, "error": "путь запрещён"}, status_code=400)
-    code, ctype, body = await _soundya_web_fetch("/" + sub.lstrip("/"))
+    code, ctype, body = await _soundya_web_fetch("/")
     if code != 200:
         return JSONResponse({"ok": False, "error": ctype[:200]}, status_code=502)
-    return Response(body, media_type=ctype, headers={"Cache-Control": "no-store"})
+    html = body.decode("utf-8", "replace")
+    # шим — как можно раньше, до скриптов страницы
+    marker = "<head>"
+    if marker in html:
+        html = html.replace(marker, "<head>" + SOUNDYA_PROXY_SHIM, 1)
+    else:
+        html = SOUNDYA_PROXY_SHIM + html
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.api_route("/soundya/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"])
+async def api_soundya_proxy(path: str, request: Request) -> Response:
+    """Реверс-прокси к веб-странице и API soundya (:8765) — для iframe."""
+    require_auth(request)
+    if not re.fullmatch(r"[A-Za-z0-9_./?&=%-]{0,300}", path):
+        return JSONResponse({"ok": False, "error": "путь запрещён"}, status_code=400)
+    url = f"http://{SOUNDYA_WEB_HOST}:{SOUNDYA_WEB_PORT}/{path}"
+    if request.url.query:
+        url += "?" + request.url.query
+    body = await request.body()
+    headers = {}
+    for name in ("content-type", "origin", "cookie"):
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+    try:
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(request.method, url, data=body or None, headers=headers) as resp:
+                payload = await resp.read()
+                # страница: снова внедряем шим (iframe мог уйти с /soundya/)
+                ctype = resp.headers.get("content-type", "")
+                if "text/html" in ctype:
+                    html = payload.decode("utf-8", "replace")
+                    if SOUNDYA_PROXY_SHIM not in html:
+                        marker = "<head>"
+                        if marker in html:
+                            html = html.replace(marker, "<head>" + SOUNDYA_PROXY_SHIM, 1)
+                        else:
+                            html = SOUNDYA_PROXY_SHIM + html
+                    payload = html.encode("utf-8")
+                out_headers = {"Cache-Control": "no-store"}
+                if resp.headers.get("set-cookie"):
+                    out_headers["set-cookie"] = resp.headers["set-cookie"]
+                return Response(
+                    content=payload,
+                    status_code=resp.status,
+                    media_type=ctype or "text/plain",
+                    headers=out_headers,
+                )
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"soundya недоступен: {type(exc).__name__}: {exc}"[:200]}, status_code=502)
 
 
 async def _soundya_web_fetch(path: str) -> tuple[int, str, bytes]:
-    url = f"http://{cfg['station_ip']}:{SOUNDYA_WEB_PORT}{path}"
+    url = f"http://{SOUNDYA_WEB_HOST}:{SOUNDYA_WEB_PORT}{path}"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.get(url) as resp:

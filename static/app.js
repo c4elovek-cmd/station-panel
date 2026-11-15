@@ -2588,12 +2588,13 @@ let scWebLoaded = false;
 function loadScWebTab() {
   const frame = $('soundyaWebFrame');
   const note = $('soundyaWebNote');
-  if (!scWebLoaded && frame && state.status && state.status.station_ip) {
+  if (!scWebLoaded && frame) {
     scWebLoaded = true;
-    const url = `http://${state.status.station_ip}:8765/`;
-    frame.src = url;
+    // страница soundya через прокси панели: работает и с ПК в локалке,
+    // и с panel.c4elovek.online (на VPS веб soundya проброшен туннелем)
+    frame.src = '/api/soundya/web';
     const urlEl = $('soundyaWebUrl');
-    if (urlEl) urlEl.textContent = url;
+    if (urlEl) urlEl.textContent = 'через панель → soundya на колонке';
   }
   if (frame) frame.hidden = false;
   if (note) note.hidden = false;
