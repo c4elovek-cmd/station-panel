@@ -3384,6 +3384,8 @@ async def api_get_config(request: Request) -> JSONResponse:
             "ssh_port": cfg["ssh_port"],
             "ssh_user": cfg["ssh_user"],
             "yam_port": cfg["yam_port"],
+            "soundya_web_host": cfg.get("soundya_web_host") or cfg["station_ip"],
+            "soundya_web_port": cfg.get("soundya_web_port", 8765),
         }
     )
 
@@ -3392,6 +3394,22 @@ async def api_get_config(request: Request) -> JSONResponse:
 async def api_put_config(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
+    # Проверяем новые параметры до изменения конфига. Адрес перечитывается
+    # при каждом запросе, поэтому смена порта не требует рестарта контейнера.
+    soundya_patch: dict[str, Any] = {}
+    if "soundya_web_host" in data:
+        host = str(data["soundya_web_host"]).strip()
+        if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host):
+            raise HTTPException(status_code=400, detail="некорректный адрес веб-API soundya")
+        soundya_patch["soundya_web_host"] = host
+    if "soundya_web_port" in data:
+        try:
+            port = int(str(data["soundya_web_port"]))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="порт soundya — целое число")
+        if not 1 <= port <= 65535:
+            raise HTTPException(status_code=400, detail="порт soundya — от 1 до 65535")
+        soundya_patch["soundya_web_port"] = port
     if data.get("station_ip"):
         ip = str(data["station_ip"]).strip()
         parts = ip.split(".")
@@ -3403,6 +3421,7 @@ async def api_put_config(request: Request) -> JSONResponse:
             cfg[key] = int(data[key])
     if data.get("ssh_user"):
         cfg["ssh_user"] = str(data["ssh_user"]).strip()
+    cfg.update(soundya_patch)
     save_config(cfg)
     _status_cache["ts"] = 0.0
     return JSONResponse({"ok": True})
@@ -5913,8 +5932,13 @@ async def _soundya_apply_token(token: str) -> tuple[bool, str]:
 # 127.0.0.1:8766 (8765 там занят voice-bridge); локально — 192.168.0.172:8765.
 # --------------------------------------------------------------------------- #
 
-SOUNDYA_WEB_PORT = int(cfg.get("soundya_web_port", 8765))
-SOUNDYA_WEB_HOST = str(cfg.get("soundya_web_host") or cfg["station_ip"])
+def soundya_web_base() -> str:
+    """Живой адрес демона: настройки применяются без перезапуска панели."""
+    host = str(cfg.get("soundya_web_host") or cfg["station_ip"])
+    port = int(cfg.get("soundya_web_port", 8765))
+    return f"http://{host}:{port}"
+
+
 SOUNDYA_STATE_DIR = "/data/opt/soundya"
 # хранится в config.json панели; RT каждого аккаунта живёт у soundya
 # (ротация), панель лишь переключает активный аккаунт и показывает статус
@@ -5924,7 +5948,7 @@ SOUNDYA_ACCOUNTS = {"me": "мой аккаунт", "other": "аккаунт бр
 async def soundya_web(method: str, path: str, body: dict | str | None = None,
                        timeout: float = 20.0) -> tuple[int, str]:
     """Запрос к веб-API soundya. (код, текст ответа)."""
-    url = f"http://{SOUNDYA_WEB_HOST}:{SOUNDYA_WEB_PORT}{path}"
+    url = soundya_web_base() + path
     data = None
     headers = {}
     if body is not None:
@@ -6194,15 +6218,23 @@ async def api_soundya_proxy(path: str, request: Request) -> Response:
     require_auth(request)
     if not re.fullmatch(r"[A-Za-z0-9_./?&=%-]{0,300}", path):
         return JSONResponse({"ok": False, "error": "путь запрещён"}, status_code=400)
-    url = f"http://{SOUNDYA_WEB_HOST}:{SOUNDYA_WEB_PORT}/{path}"
+    url = soundya_web_base() + "/" + path
     if request.url.query:
         url += "?" + request.url.query
     body = await request.body()
     headers = {}
-    for name in ("content-type", "origin", "cookie"):
+    for name in ("content-type", "cookie"):
         value = request.headers.get(name)
         if value:
             headers[name] = value
+    # Проверяем Origin браузера на стороне панели, затем переводим его
+    # в адрес демона: публичный домен не совпадает с 127.0.0.1:8766.
+    origin = request.headers.get("origin")
+    if origin:
+        from urllib.parse import urlsplit
+        if urlsplit(origin).netloc.lower() != request.headers.get("host", "").lower():
+            raise HTTPException(status_code=403, detail="запрос со стороннего сайта отклонён")
+        headers["origin"] = soundya_web_base()
     try:
         timeout = aiohttp.ClientTimeout(total=60)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -6233,7 +6265,7 @@ async def api_soundya_proxy(path: str, request: Request) -> Response:
 
 
 async def _soundya_web_fetch(path: str) -> tuple[int, str, bytes]:
-    url = f"http://{SOUNDYA_WEB_HOST}:{SOUNDYA_WEB_PORT}{path}"
+    url = soundya_web_base() + path
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.get(url) as resp:
