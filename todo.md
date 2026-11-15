@@ -75,6 +75,16 @@
 - **PIN страницы :8765**: `pin set/off` из панели.
 - Тест прямого канала (pause→resume→next→seek): все OK мгновенно; `state` синхронный. Коммит `ece81cd`.
 
+## 2026-11-15 (вечер) — деплой на panel.c4elovek.online
+
+- **Всё перенесено на прод-домен**. Путь обновления: `PUT /api/config` умеет `soundya_web_host/port` + `panel_public_origin` (живые, без рестарта: `soundya_web_base()` читает cfg на каждом запросе). Деплой: git push → `POST /api/panel/update` (tarball с GitHub, супервизор перезапускает панель сам).
+- **VPS-контейнер был offline/stuck**: поднят через Pterodactyl `power start` (204). Доступ к панели Lymu: `/api/client` + BPC-челлендж; запись через `/files/write` блокирует ddos-guard (403) — деплой только через самообновление панели.
+- **Пароль панели на VPS — `0000`** (сверка salt+sha256; Gorka_2014 — от SC-аккаунта, не панели). Логин из скриптов требует браузерного UA, иначе Cloudflare 1010.
+- **chisel**: колонка пробрасывает `R:127.0.0.1:8766 → column:8765` (soundya web); VPS-конфиг: `soundya_web_host=127.0.0.1, soundya_web_port=8766`. Голосовой «стоп/пауза» из IPC-листенера тоже идёт напрямую.
+- **Прокси плеера**: `/soundya/{path}` + шим fetch/XHR; Origin браузера панель переписывает в адрес демона (`panel_public_origin` — единственный разрешённый посторонний origin).
+- **Живой прогон всех кнопок на проде**: pause 0.26 с, resume 0.22 с, next 0.35 с (трек сменился), prev, seek ±15, stop, команда из iframe — все `via: web`, `login: ok`. Коммиты `0b908d2`, `6379b0c`.
+- Осталось: RT обоих SC-аккаунтов мертвы (`invalid_grant` в likes_sync) — нужен ручной логин на soundcloud.com и вставка пары токенов в «Два аккаунта».
+
 ## 2026-11-11
 
 - **Звонок на колонку**: телефонная учётка Яндекса уже привязана (`2338370722`, `alice-ats.yandex.net`). Флаги в `user_config.dat`: `system_config.phone_calls.enabled` (было true), `account_config.enabledCommandSpotters.call.answer` (было false → включили), `device_config.dndMode.features.allowIncomingCalls` (было false → включили). Колонка подхватывает их после `kill maind --platformd`.
