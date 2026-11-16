@@ -246,7 +246,14 @@ static int serve(void){
             if(c->output&&(fds[i+1].revents&POLLOUT)){ssize_t n=write(c->fd,c->output+c->sent,c->length-c->sent);if(n>0)c->sent+=(size_t)n;else if(errno!=EAGAIN){close_client(c);continue;}if(c->sent==c->length)close_client(c);}
         }
         collect_job();int done=audio_poll(&player.audio);
-        if(done<0){copy(player.error,sizeof(player.error),player.audio.shared->error);copy(player.state,sizeof(player.state),"error");}
+        if(done<0){
+            copy(player.error,sizeof(player.error),player.audio.shared->error);
+            /* Мёртвый источник — не стоп для очереди: переходим к следующему
+             * треку, пока очередь не кончится. Ошибка остаётся в статусе. */
+            if(player.index+1<player.queue.count){
+                player.index=(player.index+1)%player.queue.count;play_index();
+            }else copy(player.state,sizeof(player.state),"error");
+        }
         else if(done>0){if(player.repeat)play_index();else if(player.index+1<player.queue.count){player.index=player.shuffle?(size_t)rand()%player.queue.count:player.index+1;play_index();}else copy(player.state,sizeof(player.state),"stopped");}
         if(!player.job&&monotime()>=player.next_login){
             Account *a=&player.accounts[check_account];if(a->token[0]||a->refresh[0])start_job(2,"","",check_account);

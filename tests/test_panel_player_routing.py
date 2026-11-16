@@ -243,6 +243,53 @@ class PlayerRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"<head><script>shim</script>", response.body)
         self.h["_soundya_web_fetch"].assert_awaited_once_with("/")
 
+    async def test_index_forwards_zero_based_queue_number_via_web(self):
+        for backend in ("panel-player", "soundya"):
+            self.status = {"backend": backend}
+            for number in ("0", "12"):
+                with self.subTest(backend=backend, number=number):
+                    result = decoded(await self.call("api_music_soundya", {"cmd": "index", "arg": number}))
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(result["via"], "web")
+                    self.h["soundya_web"].assert_any_await("POST", "/api/cmd", body=f"index {number}", timeout=30.0)
+        self.assert_no_ssh()
+
+    async def test_index_rejects_missing_or_invalid_number_before_routing(self):
+        payloads = [{"cmd": "index"}] + [
+            {"cmd": "index", "arg": value}
+            for value in ("", " ", "-1", "1.5", "next", "1 2", "1\nstop", "0; stop", "１２", None, True, [], {})
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload), self.assertRaises(HTTPException) as caught:
+                await self.call("api_music_soundya", payload)
+            self.assertEqual(caught.exception.status_code, 400)
+        self.h["soundya_web"].assert_not_awaited()
+        self.assert_no_ssh()
+
+    async def test_index_daemon_error_stays_on_web(self):
+        self.cmd_response = (200, "error: index — номер трека очереди")
+        result = decoded(await self.call("api_music_soundya", {"cmd": "index", "arg": "12"}))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["via"], "web")
+        self.assertIn("номер трека очереди", result["output"])
+        self.assert_no_ssh()
+
+    async def test_index_failure_has_no_panel_player_ssh_fallback(self):
+        self.cmd_response = (503, "busy")
+        response = await self.call("api_music_soundya", {"cmd": "index", "arg": "0"})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(decoded(response)["via"], "web")
+        self.assertFalse(decoded(response)["ok"])
+        self.assert_no_ssh()
+
+    async def test_legacy_index_fallback_keeps_queue_number(self):
+        self.status = {"backend": "soundya"}
+        self.cmd_response = (503, "busy")
+        result = decoded(await self.call("api_music_soundya", {"cmd": "index", "arg": "12"}))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["via"], "ssh")
+        self.h["ssh_run_bytes"].assert_awaited_once_with("soundya index 12 2>&1", timeout=90)
+
     async def test_music_command_error_has_no_new_backend_ssh_fallback(self):
         self.cmd_response = (503, "busy")
         result = await self.call("api_music_soundya", {"cmd": "pause"})

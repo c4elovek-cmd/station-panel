@@ -5744,11 +5744,13 @@ async def api_music_soundya(request: Request) -> JSONResponse:
     arg = str(data.get("arg", "")).strip()
     allowed = {"play", "pause", "resume", "toggle", "next", "prev", "stop",
                "shuffle", "repeat", "similar", "likes", "recs", "playlist",
-               "status", "queue", "seek", "like", "unlike"}
+               "status", "queue", "seek", "like", "unlike", "index"}
     if cmd not in allowed:
         raise HTTPException(status_code=400, detail="неизвестная команда soundya")
-    if cmd in ("play", "playlist", "seek") and not arg:
+    if cmd in ("play", "playlist", "seek", "index") and not arg:
         raise HTTPException(status_code=400, detail="нужен запрос")
+    if cmd == "index" and not re.fullmatch(r"[0-9]+", arg):
+        raise HTTPException(status_code=400, detail="index — неотрицательный целый номер трека очереди")
     command = cmd + (f" {arg}" if arg else "")
     # 1) прямой канал: мгновенный ответ демона, без SSH-сессии
     timeout = 90.0 if cmd in ("play", "playlist", "similar", "likes", "recs") else 30.0

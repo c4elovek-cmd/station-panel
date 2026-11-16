@@ -25,7 +25,7 @@ STYLE_CSS = ROOT / "static" / "style.css"
 # команды, разрешённые сервером (server.py, только чтение)
 ALLOWED_CMD = {"play", "pause", "resume", "toggle", "next", "prev", "stop",
                "shuffle", "repeat", "similar", "likes", "recs", "playlist",
-               "status", "queue", "seek", "like", "unlike"}
+               "status", "queue", "seek", "like", "unlike", "index"}
 
 
 def run_node_file(path: Path) -> str:
@@ -107,8 +107,6 @@ class PlayerJsContract(unittest.TestCase):
 
     def test_index_command_sent_as_cmd_index(self):
         self.assertIn("sendCmd('index'", self.js)
-        # 'index' НЕ входит в разрешённый сервером список — контракт для демона
-        self.assertNotIn("'index', undefined", self.js)
 
     def test_switch_contract_account_what(self):
         # сервер ждёт {account, what}, не {who, mode}
@@ -118,10 +116,10 @@ class PlayerJsContract(unittest.TestCase):
     def test_commands_within_server_allowlist(self):
         import re
         sent = set(re.findall(r"sendCmd\('([a-z]+)'", self.js))
-        # 'index' требует расширения allowlist сервера (отдельный агент)
+        # сервер уже принимает index (см. server.py allowlist /api/soundya/cmd)
         pending = sent - ALLOWED_CMD
-        self.assertEqual(pending, {"index"},
-                         "неожиданные команды: %s" % (pending - {"index"},))
+        self.assertEqual(pending, set(),
+                         "неожиданные команды: %s" % (pending,))
 
     def test_volume_settings_contract(self):
         self.assertIn("/api/soundya/settings", self.js)

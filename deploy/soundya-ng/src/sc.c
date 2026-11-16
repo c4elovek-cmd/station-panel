@@ -239,6 +239,53 @@ static int me(const ScConfig *c,char *id,size_t idcap,char *e,size_t cap){
 }
 int sc_check_login(const ScConfig *c,char *e,size_t cap){char id[64];clear(e,cap);if(config(c,e,cap))return -1;return me(c,id,sizeof(id),e,cap)?-1:0;}
 
+static int have(const char ids[][64],int count,const char *id){
+    for(int i=0;i<count;i++)if(!strcmp(ids[i],id))return 1;return 0;
+}
+/* Волна: /me/track_recommendations для аккаунтов пары отвечает 404, поэтому
+ * рекомендации берутся из /tracks/{id}/related — того же источника, из которого
+ * SoundCloud строит похожие треки. Источники волны: текущий трек и последние
+ * лайки аккаунта; сами лайки и текущий трек в очередь не попадают. */
+static int recs(const ScConfig *c,const ScTrack *current,ScQueue *q,char *e,size_t cap){
+    char user[64],seeds[4][64],liked[200][64],url[URL_MAX];int seedn=0,likedn=0;
+    if(login_required(c,e,cap))return -1;
+    if(me(c,user,sizeof(user),e,cap))return -1;
+    if(current&&!id_norm(current->id,"tracks",seeds[seedn],sizeof(seeds[0])))seedn++;
+    {   /* Лайки дают и исходные точки волны, и список исключений. Страницы по 24:
+         * большой ответ превышает лимит токенов JSON-парсера. */
+        char *body;JDoc *d;int list,n;
+        snprintf(url,sizeof(url),API "/users/%s/likes?linked_partitioning=true&limit=24",user);
+        if(get(c,url,&body,e,cap))return -1;
+        d=doc_parse(body,e,cap);if(!d){free(body);return -1;}
+        list=list_root(d);n=list>=0?j_count(d,list):0;
+        for(int i=0;i<n;i++){
+            char id[64];int obj=track_obj(d,j_at(d,list,i));
+            if(id_obj(d,obj,"tracks",id,sizeof(id)))continue;
+            if(seedn<4&&!have((const char (*)[64])seeds,seedn,id))strcpy(seeds[seedn++],id);
+            if(likedn<200&&!have((const char (*)[64])liked,likedn,id))strcpy(liked[likedn++],id);
+        }
+        free(d);free(body);
+    }
+    if(!seedn)return err(e,cap,"Нет исходных треков для волны.");
+    for(int s=0;s<seedn&&q->count<200;s++){
+        char *body;JDoc *d;int list,n,rc;
+        snprintf(url,sizeof(url),API "/tracks/%s/related?limit=24&linked_partitioning=true",seeds[s]);
+        rc=get(c,url,&body,e,cap);
+        if(rc){if(s)break;q->count=0;return -1;}
+        d=doc_parse(body,e,cap);if(!d){free(body);if(s)break;q->count=0;return -1;}
+        list=list_root(d);n=list>=0?j_count(d,list):0;
+        for(int i=0;i<n&&q->count<200;i++){
+            ScTrack t;char id[64];int obj=track_obj(d,j_at(d,list,i));
+            /* Заглушки без потоков пропускаем: волна не делает по запросу на трек. */
+            if(id_obj(d,obj,"tracks",id,sizeof(id))||have((const char (*)[64])liked,likedn,id)||
+               have((const char (*)[64])seeds,seedn,id)||contains(q,id))continue;
+            if(decode(d,obj,&t)==1)q->tracks[q->count++]=t;
+        }
+        free(d);free(body);
+    }
+    return q->count?0:err(e,cap,"Похожие треки не найдены.");
+}
+
 int sc_queue(const ScConfig *c,const char *kind,const char *query,const ScTrack *current,
              ScQueue *q,char *e,size_t cap){
     char url[URL_MAX],previous[URL_MAX]={0},value[6147],id[64]={0};int playlist=0;
@@ -255,19 +302,19 @@ int sc_queue(const ScConfig *c,const char *kind,const char *query,const ScTrack 
         else if(playlist)return err(e,cap,"Нужна ссылка или ID плейлиста SoundCloud.");
         else if(!strncmp(query,"http:",5)||!strncmp(query,"https:",6))return err(e,cap,"Поддерживаются только ссылки SoundCloud.");
         else{if(enc(query,value,sizeof(value)))return err(e,cap,"Поисковый запрос слишком длинный.");
-            snprintf(url,sizeof(url),API "/search/tracks?q=%s&limit=100&linked_partitioning=true",value);}
+        snprintf(url,sizeof(url),API "/search/tracks?q=%s&limit=24&linked_partitioning=true",value);}
     }else if(!strcmp(kind,"likes")){
         if(me(c,id,sizeof(id),e,cap))return -1;
-        snprintf(url,sizeof(url),API "/users/%s/likes?linked_partitioning=true&limit=100",id);
+        /* Страницы по 24 лайка: полный ответ при limit=100 превышает лимит
+         * токенов JSON-парсера (366 КБ при сотне элементов). */
+        snprintf(url,sizeof(url),API "/users/%s/likes?linked_partitioning=true&limit=24",id);
     }else if(!strcmp(kind,"recs")){
-        if(login_required(c,e,cap))return -1;
-        /* Web API v2: настоящие персональные рекомендации, не shuffle лайков.
-         * Публичная спецификация OAuth API v1 этот endpoint не описывает. */
-        snprintf(url,sizeof(url),API "/me/track_recommendations?limit=100&linked_partitioning=true");
+        /* Отдельная процедура: нужны несколько источников и список исключений. */
+        return recs(c,current,q,e,cap);
     }else if(!strcmp(kind,"similar")){
         if(!current||!terminated(current->id,sizeof(current->id))||id_norm(current->id,"tracks",id,sizeof(id)))
             return err(e,cap,"Сначала выберите трек для похожих рекомендаций.");
-        snprintf(url,sizeof(url),API "/tracks/%s/related?limit=100&linked_partitioning=true",id);
+        snprintf(url,sizeof(url),API "/tracks/%s/related?limit=24&linked_partitioning=true",id);
     }else return err(e,cap,"Неизвестный режим очереди SoundCloud.");
     for(unsigned page=0;page<16&&q->count<256;page++){
         char *body,next[URL_MAX]={0};JDoc *d;int list,n,nt;
