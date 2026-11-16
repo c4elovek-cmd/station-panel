@@ -1,0 +1,101 @@
+<!doctype html>
+<!-- Встроенный плеер SoundCloud (panel-player): отдаётся маршрутом
+     /api/soundya/web, живёт в iframe основной панели и работает
+     в одиночном окне. Все запросы — по абсолютным путям родителя
+     (/api/soundya/*), поэтому и iframe, и прямой таб работают
+     одинаково. Без внешних библиотек, шрифтов и CDN. -->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Плеер SoundCloud — Панель Станции</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg">
+</head>
+<body class="pl-body">
+<header class="pl-top">
+  <span class="pl-logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h4l3-9 4 18 3-9h6"/></svg></span>
+  <b class="pl-title">Плеер SoundCloud</b>
+  <span class="pl-sub" id="plConn">связываюсь с колонкой…</span>
+  <span class="pl-acc" id="plAcc" hidden></span>
+</header>
+
+<main class="pl-main">
+
+  <!-- ————— состояние/ошибка сети: не значит «не играет» ————— -->
+  <p class="pl-error" id="plError" role="alert" hidden></p>
+  <p class="pl-msg" id="plMsg" aria-live="polite"></p>
+
+  <!-- ————— метаданные и ход трека ————— -->
+  <section class="pl-meta" aria-label="Что играет">
+    <span class="pl-art" aria-hidden="true">
+      <svg viewBox="0 0 48 48"><circle cx="24" cy="24" r="22" fill="none" stroke="rgba(255,206,214,.24)" stroke-width="1.4"/><path d="M19.5 30.5v-13l13 6.5z" fill="rgba(255,206,214,.34)"/></svg>
+    </span>
+    <div class="pl-track">
+      <h1 class="pl-track-title" id="plTitle">—</h1>
+      <p class="pl-track-artist" id="plArtist"></p>
+    </div>
+    <div class="pl-progress">
+      <div class="pl-progress-bar" aria-hidden="true"><i id="plBarFill"></i></div>
+      <div class="pl-progress-nums">
+        <span id="plPos">0:00</span>
+        <span id="plDur">–:––</span>
+      </div>
+    </div>
+    <input type="range" class="pl-seek" id="plSeek"
+           min="0" max="1000" step="10" value="0"
+           aria-label="Позиция в треке">
+    <span class="pl-statechip" id="plStateChip">неизвестно</span>
+    <span class="pl-index" id="plIndex" hidden></span>
+  </section>
+
+  <!-- ————— транспорт ————— -->
+  <section class="pl-controls" aria-label="Управление воспроизведением">
+    <div class="pl-tbuttons">
+      <button type="button" class="pl-btn" id="btnPrev" aria-label="Предыдущий трек"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 5.3v13.4c0 .8-.9 1.3-1.6.9l-9.6-6.7c-.6-.4-.6-1.4 0-1.8l9.6-6.7c.7-.4 1.6.1 1.6.9z" fill="currentColor"/><rect x="3.8" y="4.5" width="2.6" height="15" rx="1.3" fill="currentColor"/></svg></button>
+      <button type="button" class="pl-btn" id="btnPlay" aria-label="Играть"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.3v13.4c0 .8.9 1.3 1.6.9l10.2-6.7c.6-.4.6-1.4 0-1.8L9.6 4.4C8.9 4 8 4.5 8 5.3z" fill="currentColor"/></svg></button>
+      <button type="button" class="pl-btn" id="btnPause" aria-label="Пауза"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="4.5" width="4" height="15" rx="1.3" fill="currentColor"/><rect x="14" y="4.5" width="4" height="15" rx="1.3" fill="currentColor"/></svg></button>
+      <button type="button" class="pl-btn" id="btnStop" aria-label="Остановить и очистить очередь"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5.5" y="5.5" width="13" height="13" rx="2.6" fill="currentColor"/></svg></button>
+      <button type="button" class="pl-btn" id="btnNext" aria-label="Следующий трек"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.3v13.4c0 .8.9 1.3 1.6.9l9.6-6.7c.6-.4.6-1.4 0-1.8L6.6 4.4C5.9 4 5 4.5 5 5.3z" fill="currentColor"/><rect x="17.6" y="4.5" width="2.6" height="15" rx="1.3" fill="currentColor"/></svg></button>
+    </div>
+    <div class="pl-vol">
+      <label for="plVolume">Громкость</label>
+      <input type="range" class="pl-vrange" id="plVolume" min="0" max="100" step="1" value="70">
+      <output for="plVolume" id="plVolumeVal">70%</output>
+    </div>
+  </section>
+
+  <!-- ————— источники и поиск ————— -->
+  <section class="pl-sources" aria-label="Источники и поиск">
+    <label class="visually-hidden" for="plQuery">Что искать в SoundCloud</label>
+    <div class="pl-searchrow">
+      <input type="search" id="plQuery" autocomplete="off" spellcheck="false"
+             placeholder="артист, трек или ссылка SoundCloud">
+      <button type="button" class="btn" id="btnSearchPlay">Найти и играть</button>
+    </div>
+    <div class="pl-sbtns">
+      <button type="button" class="btn" id="btnLikesMe">Мои лайки</button>
+      <button type="button" class="btn" id="btnLikesOther">Лайки брата</button>
+      <button type="button" class="btn" id="btnRecs">Волна</button>
+    </div>
+    <p class="pl-hint">Поиск, лайки и волна отправляются на колонку как команда «играть», поэтому очередь заменяется.</p>
+  </section>
+
+  <!-- ————— очередь ————— -->
+  <section class="pl-queue" aria-label="Очередь треков">
+    <h2 class="pl-queue-h">Очередь</h2>
+    <ol class="pl-qlist" id="plQueue"></ol>
+    <p class="pl-qempty" id="plQueueEmpty" hidden>Очередь пуста. Запусти «Мои лайки», «Волна» или найди трек — очередь наполнится.</p>
+  </section>
+
+</main>
+
+<footer class="pl-foot">
+  <p>Токены и учётные записи настраиваются в основной панели: <a href="/" target="_top" rel="noopener">Музыка → Плеер SoundCloud</a> — вкладка «Музыка», блок аккаунтов.</p>
+</footer>
+
+<p class="pl-announce visually-hidden" id="plAnnounce" aria-live="polite"></p>
+<script src="/static/player.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+# Результаты локальной сборки и конфигурация с токенами.
+build/
+.zig-cache/
+hello_a64*
+panel-player.json
+player.lock
