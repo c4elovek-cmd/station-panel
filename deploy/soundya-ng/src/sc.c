@@ -77,17 +77,21 @@ static int status_error(int code,char *e,size_t cap){
 /* Секреты только через stdin curl: ни shell, ни секретов в argv/логах.
  * socketpair+MSG_NOSIGNAL исключает SIGPIPE. stdout ограничен; stderr подавлен.
  */
-static int request(const ScConfig *c,const char *method,const char *url,const char *form,
-                   int auth,char **body,char *e,size_t cap){
+static int request_once(const ScConfig *c,const char *method,const char *url,const char *form,
+                        int auth,char **body,char *e,size_t cap,int *retry){
     char opts[32768]={0},header[2100];char *buf=NULL;
     int in[2]={-1,-1},out[2]={-1,-1},nullfd=-1,status=0,dead=0,eof=0,bad=0;
     size_t sent=0,used=0,total;pid_t pid;long long start;
     const char *exe=c->curl[0]?c->curl:getenv("SOUNDYA_CURL");
-    *body=NULL;if(!exe||!*exe)exe="/data/opt/entware/bin/curl";
+    *body=NULL;*retry=0;if(!exe||!*exe)exe="/data/opt/entware/bin/curl";
     if(exe[0]!='/'||!text(exe))return err(e,cap,"Путь curl должен быть абсолютным.");
-    if(option(opts,sizeof(opts),"url",url)||option(opts,sizeof(opts),"proxy",c->proxy)||
-       option(opts,sizeof(opts),"noproxy","")||option(opts,sizeof(opts),"header","Accept: application/json"))
-        return err(e,cap,"Запрос SoundCloud слишком длинный.");
+    /* Метаданные api-v2 доступны напрямую и отвечают стабильно, а прокси
+     * периодически не принимает CONNECT; медиа (sndcdn) — наоборот, только
+     * через прокси. Токены SoundCloud тоже идут через прокси. */
+    {const char *px=strstr(url,"//api-v2.soundcloud.com/")?"":c->proxy;
+    if(option(opts,sizeof(opts),"url",url)||option(opts,sizeof(opts),"proxy",px)||
+       option(opts,sizeof(opts),"noproxy",px[0]?"":"*")||option(opts,sizeof(opts),"header","Accept: application/json"))
+        return err(e,cap,"Запрос SoundCloud слишком длинный.");}
     if(auth&&c->token[0]){
         snprintf(header,sizeof(header),"Authorization: OAuth %s",c->token);
         if(option(opts,sizeof(opts),"header",header))return err(e,cap,"Запрос SoundCloud слишком длинный.");
@@ -135,10 +139,10 @@ static int request(const ScConfig *c,const char *method,const char *url,const ch
     if(!dead){kill(pid,SIGKILL);reap(pid,&status);}
     if(bad||!WIFEXITED(status)||WEXITSTATUS(status)){
         int x=WIFEXITED(status)?WEXITSTATUS(status):-1;free(buf);
-        if(bad==2||x==28)return err(e,cap,"Таймаут запроса SoundCloud.");
+        if(bad==2||x==28){*retry=1;return err(e,cap,"Таймаут запроса SoundCloud.");}
         if(bad==3||x==63)return err(e,cap,"Ответ SoundCloud слишком большой.");
         if(x==127)return err(e,cap,"curl не найден или не запускается.");
-        return err(e,cap,"Ошибка сети при обращении к SoundCloud.");
+        *retry=1;return err(e,cap,"Ошибка сети при обращении к SoundCloud.");
     }
     if(used<4||buf[used-4]!='\n'||!isdigit((unsigned char)buf[used-3])||
        !isdigit((unsigned char)buf[used-2])||!isdigit((unsigned char)buf[used-1])||memchr(buf,0,used)){
@@ -146,6 +150,20 @@ static int request(const ScConfig *c,const char *method,const char *url,const ch
     {int code=(buf[used-3]-'0')*100+(buf[used-2]-'0')*10+buf[used-1]-'0';
      if(code<200||code>=300){free(buf);return status_error(code,e,cap);}}
     buf[used-4]=0;*body=buf;return 0;
+}
+/* Прокси периодически не принимает CONNECT с первой попытки: обрыв на
+ * соединении лечится повтором. HTTP-ошибки и разбор ответа не повторяем. */
+#define REQUEST_TRIES 3
+static int request(const ScConfig *c,const char *method,const char *url,const char *form,
+                   int auth,char **body,char *e,size_t cap){
+    int rc=-1;
+    for(int i=0;i<REQUEST_TRIES;i++){
+        int retry=0;
+        rc=request_once(c,method,url,form,auth,body,e,cap,&retry);
+        if(!retry||i+1>=REQUEST_TRIES)break;
+        {struct timespec pause={0,800000000L};nanosleep(&pause,NULL);}
+    }
+    return rc;
 }
 static int get(const ScConfig *c,const char *u,char **body,char *e,size_t cap){
     char url[URL_MAX],v[384];if(!host(u,"api-v2.soundcloud.com",0))return err(e,cap,"Недопустимый адрес API SoundCloud.");

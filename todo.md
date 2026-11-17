@@ -13,7 +13,10 @@
 - ☑ **Сверка деплоя**: MD5 на колонке = локальным для panel-player, run.sh, service.sh, voice_watch.sh, fast_pause_watch.sh.
 - ☐ **Токен `me` мёртв** (exp 1794769200): `/api/status` и панель показывают `login: "unavailable"` для обоих аккаунтов. «Мои лайки» команду принимают, но воспроизведение не начнётся до ручного перелогина me в браузере.
 - ⚠ **`/data/opt/etc/dropbear/dropbear.log` — 61 МБ, растёт ~5 КБ/40 с**; раздел /bkupgrade заполнен на 96 % (свободно ~3,2 МБ). Это первое, что стоит усечь/ротировать при нехватке места (без разрешения не трогали).
-- ☐ **Не закоммичено**: `deploy/soundya-ng/src/sc.c`, `tests/test_sc_transcoding.c`, `deploy/soundya-ng/{run.sh,service.sh,voice_watch.sh}`, `tests/test_voice_watch.py`, `tests/voice_mock_curl.sh`, `deploy/soundya/fast_pause_watch.sh`, `server.py`.
+- ☑ **metadata SoundCloud — напрямую, медиа — через прокси.** Прокси отдаёт 20–40 % CONNECT с таймаутом (8/10 в тесте), резервный `gate172.psnode.me:3130` с колонки не отвечает вовсе (0/5). Прямой `api-v2` стабилен (0,3 с, 76–90 КБ), поэтому в `sc.c` запросы к `//api-v2.soundcloud.com/` идут без прокси, а сегменты `playback.media-streaming.soundcloud.cloud` — по-прежнему через прокси (там он нужен: канал режет ответы CloudFront). Добавлены 3 попытки на таймаут/обрыв CONNECT (пауза 0,8 с), HTTP-ошибки и ошибки разбора не повторяются. После деплоя очередь грузится за ~4 с, позиция растёт, pause/resume/next/stop — OK.
+- ☑ **Закоммичено и запушено**: `02fb06d` (голос, автозапуск, MIME-фикс), `8b4c745` (`.gitattributes`: `*.sh text eol=lf`), затем правки `sc.c` с прямым `api-v2` и повторами.
+- ☑ **VPS-панель обновлена** через `POST /api/panel/update`, после рестарта `backend=panel-player`.
+- ☑ **Бинарник panel-player пересобран и задеплоен** (md5 `ef5604cefd1e4c112bac57ab4415c28d`); после заливки через base64 нужен `chmod 750`, иначе `run.sh: Permission denied` и плеер не поднимается.
 
 ## 2026-11-16 (вечер) — panel-player готов, переключение НЕ начато
 
