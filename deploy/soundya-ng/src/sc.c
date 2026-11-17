@@ -208,8 +208,9 @@ static int decode(const JDoc *d,int obj,ScTrack *out){
         if(field(d,t,"url",url,sizeof(url))||!host(url,"api-v2.soundcloud.com",0)||has_ci(url,"preview")||
            field(d,fmt,"protocol",proto,sizeof(proto))||field(d,fmt,"mime_type",mime,sizeof(mime)))continue;
         if(!strcmp(proto,"progressive"))rank=300;
-        else if(!strcmp(proto,"hls")&&has_ci(mime,"audio/mpeg"))rank=200;
-        else if(!strcmp(proto,"hls"))rank=100;else continue;
+        else if(!strcmp(proto,"hls")&&!strcmp(mime,"audio/mpeg"))rank=200;
+        /* audio/mpegurl — это m3u8-манифест, а не аудиопоток; пропускаем. */
+        else if(!strcmp(proto,"hls")&&strcmp(mime,"audio/mpegurl"))rank=100;else continue;
         if(!strncmp(mime,"audio/",6))rank+=5;
         if(rank>best){best=rank;strcpy(out->transcoding,url);strcpy(out->protocol,proto);strcpy(out->mime,mime);}
     }return best?1:0;

@@ -1,5 +1,20 @@
 # Панель Станции — задачи
 
+## 2026-11-17 — колонка переведена на panel-player, голос работает
+
+- ☑ **Колонка переключена на собственный плеер.** `/etc/init.d/S99soundya` стал форвардом `exec /data/opt/panel-player/service.sh "$@"`; оригинал лежит в `/data/opt/panel-player/legacy-S99soundya` (вне init.d, чтобы не запускался сам). Старый soundya остановлен, файлы целы. Бэкап перед переключением: `backups/soundya-before-panel-player-20261117-164429/` (soundya.tar 15 759 360 Б, SHA-256 сверен, + S99soundya, panel-player-before.tar, manifest.json).
+- ☑ **Живой звук на новом плеере**: `account other likes` → 46 треков, играет «Планка»; `account other recs` → 47 треков. pause/next/resume/stop работают. `/health` → `{"ok":true,"backend":"panel-player","version":"0.1.0"}`, active_account=other.
+- ☑ **`run/verify_after_switch.py` — все пункты ✔**: локальный backend, карточка `/api/music/status` backend=panel-player, `/api/soundya/state`, команда `status` через VPS, страница плеера, переключение аккаунта, стоп после проверок.
+- ☑ **Голос подтверждён вживую** (`/tmp/panel-player-voice.log`): «включи любимое» → `other-likes: OK` (16:50:01), «мои лайки» → `me-likes: OK` (16:50:19), «стоп» → `stop: OK` (16:50:43); в maind.log те же `onAliceStateChanged: BUSY, recognizedPhrase='…'`. Адаптер `voice_watch.sh` (PID 4471) слушает `maind.log`; `fast_pause_watch.sh` (4470) — голая «пауза». Тесты voice_watch: 22/22 OK (~32 с), `run/test_column_adapters.py` на колонке — OK.
+- ☑ **sc.c: MIME-фикс плеера** — `audio/mpegurl` (m3u8-манифест) больше не считается аудиопотоком; `audio/mpeg` — только точное совпадение. `deploy/soundya-ng/tests/test_sc_transcoding.c` 33/33, контрольная старая логика падает (3 ошибки).
+- ☑ **server.py: IPC-фиксы** — слушатель не подключается при `ipc_media_listen=False`, `_media_listener_task` отменяется при shutdown, при выключении флага чистится `voice_bridge_url`. Тесты маршрутизации 35 OK, конфига 6 OK.
+- ☑ **Инцидент и восстановление**: `kill -TERM -- -1` на BusyBox убил все процессы колонки, SSH/ARP/TCP зависли, помогла только физическая перезагрузка. Отрицательные PID на BusyBox не использовать (service.sh переделан на проверку `/proc/PID/cmdline`, TERM → ожидание 30 с → KILL).
+- ☑ **Инвентаризация ФС колонки** (только чтение, по просьбе пользователя): 2 862 объекта — 2 058 файлов, 304 каталога, 490 симлинков. Снимок `run/column-inventory/snapshot-20261117-200112/`, база знаний — `run/column-inventory/COLUMN_KNOWLEDGE.md` (разметка mtd, boot/init, quasar, YAM, аудио-цепочка громкости, entware, наш блок, инциденты).
+- ☑ **Сверка деплоя**: MD5 на колонке = локальным для panel-player, run.sh, service.sh, voice_watch.sh, fast_pause_watch.sh.
+- ☐ **Токен `me` мёртв** (exp 1794769200): `/api/status` и панель показывают `login: "unavailable"` для обоих аккаунтов. «Мои лайки» команду принимают, но воспроизведение не начнётся до ручного перелогина me в браузере.
+- ⚠ **`/data/opt/etc/dropbear/dropbear.log` — 61 МБ, растёт ~5 КБ/40 с**; раздел /bkupgrade заполнен на 96 % (свободно ~3,2 МБ). Это первое, что стоит усечь/ротировать при нехватке места (без разрешения не трогали).
+- ☐ **Не закоммичено**: `deploy/soundya-ng/src/sc.c`, `tests/test_sc_transcoding.c`, `deploy/soundya-ng/{run.sh,service.sh,voice_watch.sh}`, `tests/test_voice_watch.py`, `tests/voice_mock_curl.sh`, `deploy/soundya/fast_pause_watch.sh`, `server.py`.
+
 ## 2026-11-16 (вечер) — panel-player готов, переключение НЕ начато
 
 - ☑ **Живой звук panel-player пошёл**. Причина обрыва сегментов на ~15,8 КБ — НЕ PMTU: канал режет длинные ответы CloudFront при любом протоколе (HTTP/1.1, HTTP/2, TLS1.2, с MSS-клампом и без). Через штатный прокси из config.json звук. (`socks5://…45.94.39.219:9717`) сегмент 202 КБ — 0,74 с. Живой тест аудиоконвейера (track 293 flickermood, HLS fMP4 AAC): первый PCM за 2,8 с, позиция растёт, пауза замораживает, стоп терминирует группу, 0 зомби. faad 2.11.2 на колонке есть. Прокси в demоn передаётся через PANEL_TEST_PROXY / cfg.proxy.

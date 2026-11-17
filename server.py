@@ -247,7 +247,9 @@ async def _ipc_media_listener() -> None:
     """Долгоживущий слушатель IPC: переподключается, шлёт совпавшие фразы мосту
     и передаёт ответы Алисы (фокус — вопросы, заданные из панели).
 
-    Работает независимо от ipc_media_listen: ответы нужны «Спросить Алису».
+    При ipc_media_listen=False новые IPC-соединения не открываются.
+    Уже открытый канал сохраняем до остановки панели: закрытие/повторное
+    открытие не освобождает компонент maind и может повредить активации.
 
     ВАЖНО: каждое соединение к 9875 занимает в maind «компонент»; утёкшие
     компоненты не освобождаются, и в итоге колонка перестаёт слышать «Алису»
@@ -263,6 +265,11 @@ async def _ipc_media_listener() -> None:
         token = str(cfg.get("voice_bridge_token") or "")
         try:
             if conn is None or conn.is_closed() or reader is None:
+                # Выключенная опция должна запрещать подключение, а не только
+                # обработку фраз. Голос panel-player идёт через maind.log.
+                if not cfg.get("ipc_media_listen"):
+                    await asyncio.sleep(2)
+                    continue
                 if conn is not None:
                     try:
                         conn.close()
@@ -822,6 +829,10 @@ async def api_ipc_media_listen_put(request: Request) -> JSONResponse:
     require_auth(request)
     data = await request.json()
     cfg["ipc_media_listen"] = bool(data.get("enabled"))
+    # Голос с колонки работает через maind.log: выключенный слушатель не
+    # должен сам себя реактивировать пустым мостом при следующем старте.
+    if not cfg["ipc_media_listen"]:
+        cfg["voice_bridge_url"] = ""
     save_config(cfg)
     return JSONResponse({"ok": True, "enabled": bool(cfg["ipc_media_listen"])})
 
@@ -829,6 +840,7 @@ async def api_ipc_media_listen_put(request: Request) -> JSONResponse:
 @app.on_event("startup")
 async def _start_background_loops() -> None:
     """Фоновые задачи: закрепление времени, ночной профиль, синхронизация громкости."""
+    global _media_listener_task
     asyncio.create_task(_clock_pin_loop())
     asyncio.create_task(_night_clock_loop())
     asyncio.create_task(_volume_sync_loop())
@@ -838,7 +850,15 @@ async def _start_background_loops() -> None:
 
 @app.on_event("shutdown")
 async def _stop_background_loops() -> None:
-    """Закрыть постоянное IPC-соединение с колонкой, чтобы maind видел отключение."""
+    """Остановить слушатель и закрыть каналы панели без новых подключений."""
+    global _media_listener_task
+    if _media_listener_task is not None:
+        _media_listener_task.cancel()
+        try:
+            await _media_listener_task
+        except asyncio.CancelledError:
+            pass
+        _media_listener_task = None
     await _ipc_close()
 
 

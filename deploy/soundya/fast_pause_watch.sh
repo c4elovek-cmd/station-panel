@@ -60,10 +60,12 @@ if [ "${1:-}" = --handle-line ]; then
 fi
 
 [ -x "$CURL" ] || { note 'curl не найден'; exit 1; }
+umask 077
 if ! mkdir "$LOCK" 2>/dev/null; then
+    [ ! -L "$LOCK" ] || { note 'лок-ссылка: требуется ручная проверка'; exit 1; }
     OWNER=$(cat "$LOCK/pid" 2>/dev/null)
     case "$OWNER" in
-        ''|*[!0-9]*) note 'лок без корректного PID: требуется ручная проверка'; exit 1 ;;
+        ''|0|*[!0-9]*) note 'лок без корректного PID: требуется ручная проверка'; exit 1 ;;
     esac
     kill -0 "$OWNER" 2>/dev/null && exit 0
     # Убираем только свои известные файлы; чужие данные не удаляем рекурсивно.
@@ -77,6 +79,8 @@ cleanup() {
     trap - EXIT HUP INT TERM
     [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null
     [ -n "$TAIL_PID" ] && wait "$TAIL_PID" 2>/dev/null
+    # Не удаляем лок, если его уже заменил другой владелец.
+    [ ! -L "$LOCK" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
     rm -f "$LOCK/events" "$LOCK/pid"
     rmdir "$LOCK" 2>/dev/null
 }
