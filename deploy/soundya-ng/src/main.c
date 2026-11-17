@@ -104,11 +104,17 @@ static int start_job(int kind,const char *what,const char *query,int account){
         JobResult *r=calloc(1,sizeof(*r));if(!r)_exit(1);r->kind=kind;r->account=account;
         if(kind==1)r->ok=sc_queue(&cfg,what,query,player.queue.count?&player.queue.tracks[player.index]:NULL,&r->queue,r->error,sizeof(r->error))==0;
         else {
-            r->ok=cfg.token[0]&&sc_check_login(&cfg,r->error,sizeof(r->error))==0;
-            if(r->ok&&player.accounts[account].expires>0&&player.accounts[account].expires>(long long)time(NULL)+300){/* токен жив — ротация не нужна */}
-            else if(player.accounts[account].refresh[0]){
-                r->ok=sc_refresh(&cfg,player.accounts[account].refresh,r->at,sizeof(r->at),r->rt,sizeof(r->rt),&r->expires,r->error,sizeof(r->error))==0;
+            int ok=r->ok=cfg.token[0]&&sc_check_login(&cfg,r->error,sizeof(r->error))==0;
+            /* Ротация нужна только при неподтверждённом входе или скором истечении
+             * токена: иначе неудачный refresh перетирал бы успешную проверку. */
+            int expiring=player.accounts[account].expires>0&&player.accounts[account].expires<(long long)time(NULL)+300;
+            if((!ok||expiring)&&player.accounts[account].refresh[0]){
+                char login_err[256],refresh_err[256];copy(login_err,sizeof(login_err),r->error);refresh_err[0]=0;
+                r->ok=sc_refresh(&cfg,player.accounts[account].refresh,r->at,sizeof(r->at),r->rt,sizeof(r->rt),&r->expires,refresh_err,sizeof(refresh_err))==0;
                 if(r->ok){copy(cfg.token,sizeof(cfg.token),r->at);r->ok=sc_check_login(&cfg,r->error,sizeof(r->error))==0;}
+                else if(ok){/* токен ещё жив: ротацию отложили, вход подтверждён */
+                    r->ok=1;note("refresh SoundCloud не удался, токен пока рабочий");
+                }else copy(r->error,sizeof(r->error),login_err);
             }
         }
         int rc=writeall(fds[1],r,sizeof(*r));close(fds[1]);free(r);_exit(rc?1:0);
@@ -129,6 +135,7 @@ static void collect_job(void){
             if(r->ok)copy(a->login,sizeof(a->login),"ok");
             else if(r->error[0]&&(strstr(r->error,"401")||strstr(r->error,"403")||strstr(r->error,"invalid_grant")))copy(a->login,sizeof(a->login),"refused");
             else copy(a->login,sizeof(a->login),"unavailable");
+            if(!r->ok){char msg[320];snprintf(msg,sizeof(msg),"проверка входа %s: %s",r->account?"other":"me",r->error[0]?r->error:"без описания");note(msg);}
             if(r->ok&&r->at[0]&&strcmp(a->token,r->at)){copy(a->token,sizeof(a->token),r->at);if(r->rt[0])copy(a->refresh,sizeof(a->refresh),r->rt);a->expires=(long long)time(NULL)+(r->expires>0?r->expires:3600);if(save())note("Не удалось сохранить ротированную пару токенов");}
             sync_config();
         }

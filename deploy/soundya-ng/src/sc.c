@@ -66,8 +66,8 @@ static int nb(int fd){int f=fcntl(fd,F_GETFL,0);return f<0?-1:fcntl(fd,F_SETFL,f
 static void reap(pid_t p,int *status){while(waitpid(p,status,0)<0&&errno==EINTR){}}
 static int status_error(int code,char *e,size_t cap){
     switch(code){
-    case 401:err(e,cap,"Вход SoundCloud истёк или токен недействителен.");break;
-    case 403:err(e,cap,"SoundCloud запретил доступ к ресурсу.");break;
+    case 401:err(e,cap,"Вход SoundCloud истёк или токен недействителен (HTTP 401).");break;
+    case 403:err(e,cap,"SoundCloud запретил доступ к ресурсу (HTTP 403).");break;
     case 404:err(e,cap,"Ресурс SoundCloud не найден.");break;
     case 429:err(e,cap,"Лимит SoundCloud: повторите запрос позже.");break;
     default:if(e&&cap)snprintf(e,cap,"Ошибка SoundCloud: HTTP %d.",code);break;

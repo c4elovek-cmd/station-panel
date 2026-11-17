@@ -79,21 +79,27 @@ static int child_result(pid_t pid) {
 }
 
 /* Сеть получает только публичный media URL: OAuth и client_id не добавляются.
- * В памяти хранятся ограниченные манифесты/сегменты; весь трек — только в pipe. */
-static int fetch(const ScConfig *cfg, const char *url, FILE *output,
-                 unsigned char **memory, size_t *length, size_t limit,
-                 char *err, size_t cap) {
+ * Ответы CloudFront на этом канале обрываются примерно после 16 КБ (сегмент
+ * висит до таймаута), поэтому медиа качается короткими Range-запросами
+ * напрямую: прямой канал отдаёт 15 КБ за ~0,2 с, а прокси отвечает через раз. */
+#define MEDIA_CHUNK 15000u
+#define MEDIA_TRIES 3
+
+static int fetch_raw(const ScConfig *cfg, const char *url, const char *range,
+                     unsigned char **body, size_t *length, size_t limit,
+                     int *code, char *err, size_t cap) {
+    *body = NULL; *length = 0; *code = 0;
     if (strncmp(url, "https://", 8)) {
         message(err, cap, "Медиа: разрешён только HTTPS");
         return -1;
     }
     int fds[2];
     if (pipe(fds)) { message(err, cap, "Медиа: не удалось создать pipe"); return -1; }
-    char *args[] = {(char *)cfg->curl, "--silent", "--fail", "--location",
+    char *args[] = {(char *)cfg->curl, "--silent", "--location", "--http1.1",
         "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "5",
-        "--max-time", limit ? "45" : "7200", "--speed-limit", "1", "--speed-time", "30",
-        "--proxy", (char *)cfg->proxy, "--noproxy", cfg->proxy[0] ? "" : "*",
-        "--", (char *)url, NULL};
+        "--max-time", "25", "--speed-limit", "1", "--speed-time", "20",
+        "--proxy", "", "--noproxy", "*",
+        "-H", (char *)range, "--write-out", "\n%{http_code}", "--", (char *)url, NULL};
     pid_t child = spawn(args, -1, fds[1]);
     close(fds[1]);
     unsigned char buffer[16384], *data = NULL;
@@ -107,34 +113,93 @@ static int fetch(const ScConfig *cfg, const char *url, FILE *output,
         if (limit && (used > limit || count > limit - used)) {
             message(err, cap, "Медиа: превышен лимит размера"); failed = 1; break;
         }
-        if (memory) {
-            if (used + count + 1 > allocated) {
-                size_t next = allocated ? allocated * 2 : sizeof(buffer) + 1;
-                if (next < used + count + 1) next = used + count + 1;
-                if (next > limit + 1) next = limit + 1;
-                unsigned char *grown = realloc(data, next);
-                if (!grown) { message(err, cap, "Медиа: недостаточно памяти"); failed = 1; break; }
-                data = grown; allocated = next;
-            }
-            memcpy(data + used, buffer, count);
-        } else if (fwrite(buffer, 1, count, output) != count) {
-            message(err, cap, "Медиа: декодер закрыл вход"); failed = 1; break;
+        if (used + count + 1 > allocated) {
+            size_t next = allocated ? allocated * 2 : sizeof(buffer) + 1;
+            if (next < used + count + 1) next = used + count + 1;
+            unsigned char *grown = realloc(data, next);
+            if (!grown) { message(err, cap, "Медиа: недостаточно памяти"); failed = 1; break; }
+            data = grown; allocated = next;
         }
+        memcpy(data + used, buffer, count);
         used += count;
     }
     close(fds[0]);
     if (child > 0) {
         if (failed) kill(child, SIGTERM);
-        if (child_result(child)) {
-            if (!failed) message(err, cap, "Медиа: загрузка завершилась с ошибкой");
-            failed = 1;
+        if (child_result(child)) failed = 1;
+    }
+    if (failed) { free(data); message(err, cap, "Медиа: загрузка завершилась с ошибкой"); return -1; }
+    /* curl печатает код ответа после тела: "\n%{http_code}". */
+    if (used < 4 || data[used - 4] != '\n' || data[used - 3] < '0' || data[used - 3] > '9' ||
+        data[used - 2] < '0' || data[used - 2] > '9' || data[used - 1] < '0' || data[used - 1] > '9') {
+        free(data); message(err, cap, "Медиа: некорректный ответ curl"); return -1;
+    }
+    int status = (data[used - 3] - '0') * 100 + (data[used - 2] - '0') * 10 + (data[used - 1] - '0');
+    used -= 4;
+    *code = status;
+    if (status != 200 && status != 206) {
+        char text[64];
+        free(data);
+        if (status == 416) { message(err, cap, "Медиа: конец файла"); return -1; }
+        snprintf(text, sizeof(text), "Медиа: HTTP %d", status);
+        message(err, cap, text);
+        return -1;
+    }
+    data[used] = 0; *body = data; *length = used;
+    return 0;
+}
+
+/* Загрузка файла целиком кусками MEDIA_CHUNK. Каждый кусок независим, поэтому
+ * повтор запроса безопасен: в декодер уходит только целиком полученный кусок. */
+static int fetch(const ScConfig *cfg, const char *url, FILE *output,
+                 unsigned char **memory, size_t *length, size_t limit,
+                 char *err, size_t cap) {
+    size_t offset = 0, total = 0, allocated = 0;
+    unsigned char *data = NULL;
+    for (;;) {
+        char range[64];
+        snprintf(range, sizeof(range), "Range: bytes=%zu-%zu", offset, offset + MEDIA_CHUNK - 1);
+        unsigned char *part = NULL;
+        size_t part_len = 0;
+        int code = 0, rc = -1;
+        for (int attempt = 0; attempt < MEDIA_TRIES; ++attempt) {
+            part = NULL; part_len = 0; code = 0;
+            /* +16: к телу ответа curl дописывает "\nNNN" с кодом. */
+            rc = fetch_raw(cfg, url, range, &part, &part_len, (limit ? limit : MEDIA_CHUNK) + 16, &code, err, cap);
+            if (rc == 0 || code == 416) break;
+            struct timespec pause = {0, 600000000L};
+            nanosleep(&pause, NULL);
+        }
+        if (rc != 0 && code != 416) { free(part); free(data); return -1; }
+        /* Плейлисты CloudFront отдаёт без Range (200) целиком — это тоже конец. */
+        int last = code == 416 || code == 200 || part_len < MEDIA_CHUNK;
+        if (part_len) {
+            if (limit && total + part_len > limit) {
+                free(part); free(data); message(err, cap, "Медиа: превышен лимит размера"); return -1;
+            }
+            if (memory) {
+                if (total + part_len + 1 > allocated) {
+                    size_t next = allocated ? allocated * 2 : 2 * MEDIA_CHUNK;
+                    if (next < total + part_len + 1) next = total + part_len + 1;
+                    unsigned char *grown = realloc(data, next);
+                    if (!grown) { free(part); free(data); message(err, cap, "Медиа: недостаточно памяти"); return -1; }
+                    data = grown; allocated = next;
+                }
+                memcpy(data + total, part, part_len);
+            } else if (fwrite(part, 1, part_len, output) != part_len) {
+                free(part); free(data); message(err, cap, "Медиа: декодер закрыл вход"); return -1;
+            }
+            total += part_len;
+            offset += part_len;
+        }
+        free(part);
+        if (last) break;
+        if (limit && total >= limit) {
+            free(data); message(err, cap, "Медиа: превышен лимит размера"); return -1;
         }
     }
-    if (failed || (memory && !used)) {
-        if (!failed) message(err, cap, "Медиа: пустой ответ");
-        free(data); return -1;
-    }
-    if (memory) { data[used] = 0; *memory = data; *length = used; }
+    if (!total) { free(data); message(err, cap, "Медиа: пустой ответ"); return -1; }
+    if (memory) { data[total] = 0; *memory = data; *length = total; }
     return 0;
 }
 
