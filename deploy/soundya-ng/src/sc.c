@@ -29,9 +29,11 @@ static int text(const char *s){if(!s)return 0;for(;*s;s++)if((unsigned char)*s<3
 #ifndef SC_FIXTURE_ONLY
 static int terminated(const char *s,size_t cap){return s&&memchr(s,0,cap)!=NULL;}
 static int config(const ScConfig *c,char *e,size_t n){
+    /* Пустой proxy — законный режим «напрямую»: он нужен как запасной путь,
+     * когда прокси не поднимает CONNECT. */
     if(!c||!terminated(c->curl,sizeof(c->curl))||!terminated(c->proxy,sizeof(c->proxy))||
        !terminated(c->client_id,sizeof(c->client_id))||!terminated(c->token,sizeof(c->token))||
-       !text(c->curl)||!text(c->proxy)||!text(c->client_id)||!text(c->token))
+       !text(c->curl)||!text(c->client_id)||!text(c->token))
         return err(e,n,"Некорректная конфигурация SoundCloud.");
     return 0;
 }
@@ -148,7 +150,11 @@ static int request_once(const ScConfig *c,const char *method,const char *url,con
        !isdigit((unsigned char)buf[used-2])||!isdigit((unsigned char)buf[used-1])||memchr(buf,0,used)){
         free(buf);return err(e,cap,"Некорректный ответ curl.");}
     {int code=(buf[used-3]-'0')*100+(buf[used-2]-'0')*10+buf[used-1]-'0';
-     if(code<200||code>=300){free(buf);return status_error(code,e,cap);}}
+     if(code<200||code>=300){
+         int revoked;buf[used-4]=0;revoked=(code==400||code==401)&&strstr(buf,"invalid_grant");free(buf);
+         /* Отозванный refresh-токен обновить нельзя: нужен новый вход, повторять
+          * запрос бессмысленно. Отдельный текст, чтобы это было видно в статусе. */
+         return revoked?err(e,cap,"Вход SoundCloud отозван, нужен новый вход (invalid_grant)."):status_error(code,e,cap);}}
     buf[used-4]=0;*body=buf;return 0;
 }
 /* Прокси периодически не принимает CONNECT с первой попытки: обрыв на

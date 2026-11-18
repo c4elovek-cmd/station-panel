@@ -32,11 +32,11 @@ static void copy(char *dst,size_t cap,const char *src){snprintf(dst,cap,"%s",src
 static void note(const char *text){fprintf(stderr,"panel-player: %s\n",text);}
 static int writeall(int fd,const void *data,size_t size){const char *p=data;while(size){ssize_t n=write(fd,p,size);if(n<0&&errno==EINTR)continue;if(n<=0)return -1;p+=n;size-=(size_t)n;}return 0;}
 
-typedef struct { char token[2048],refresh[1024];long long expires;char login[32]; } Account;
+typedef struct { char token[2048],refresh[1024];long long expires,retry_after;char login[32]; } Account;
 typedef struct {
     ScConfig sc;Account accounts[2];int active;char dir[512],device[128];
     ScQueue queue;size_t index;Audio audio;char state[32],error[256];int repeat,shuffle,paused;
-    pid_t job;int jobfd;size_t jobread;long long jobstart,next_login;int jobaccount,jobkind;unsigned revisions[2],jobrevision;
+    pid_t job;int jobfd;size_t jobread;long long jobstart,next_login[2];int jobaccount,jobkind;unsigned revisions[2],jobrevision;
 } Player;
 typedef struct { int kind,account,ok;ScQueue queue;char at[2048],rt[1024],error[256];long expires; } JobResult;
 static Player player;static JobResult jobresult;
@@ -105,15 +105,29 @@ static int start_job(int kind,const char *what,const char *query,int account){
         if(kind==1)r->ok=sc_queue(&cfg,what,query,player.queue.count?&player.queue.tracks[player.index]:NULL,&r->queue,r->error,sizeof(r->error))==0;
         else {
             int ok=r->ok=cfg.token[0]&&sc_check_login(&cfg,r->error,sizeof(r->error))==0;
-            /* Ротация нужна только при неподтверждённом входе или скором истечении
-             * токена: иначе неудачный refresh перетирал бы успешную проверку. */
-            int expiring=player.accounts[account].expires>0&&player.accounts[account].expires<(long long)time(NULL)+300;
-            if((!ok||expiring)&&player.accounts[account].refresh[0]){
-                char login_err[256],refresh_err[256];copy(login_err,sizeof(login_err),r->error);refresh_err[0]=0;
-                r->ok=sc_refresh(&cfg,player.accounts[account].refresh,r->at,sizeof(r->at),r->rt,sizeof(r->rt),&r->expires,refresh_err,sizeof(refresh_err))==0;
-                if(r->ok){copy(cfg.token,sizeof(cfg.token),r->at);r->ok=sc_check_login(&cfg,r->error,sizeof(r->error))==0;}
+            /* Ротация нужна при неподтверждённом входе, неизвестном сроке или за
+             * 15 минут до истечения: иначе неудачный refresh перетирал бы
+             * успешную проверку. Отозванный refresh не трогаем час. */
+            long long exp=player.accounts[account].expires;
+            int expiring=exp<=0||exp<((long long)time(NULL)+900);
+            if((!ok||expiring)&&player.accounts[account].refresh[0]&&monotime()>=player.accounts[account].retry_after){
+                char login_err[256];copy(login_err,sizeof(login_err),r->error);
+                int rotated=0;
+                /* Прокси периодически отваливается целиком: если пару токенов
+                 * получить не удалось, второй раз идём напрямую, мимо прокси. */
+                for(int attempt=0;attempt<2&&!rotated;attempt++){
+                    ScConfig net=cfg;if(attempt)net.proxy[0]=0;
+                    rotated=sc_refresh(&net,player.accounts[account].refresh,r->at,sizeof(r->at),r->rt,sizeof(r->rt),&r->expires,r->error,sizeof(r->error))==0;
+                    if(rotated)break;
+                    /* Отозванный токен и отказ SoundCloud повтором не лечатся. */
+                    if(strstr(r->error,"invalid_grant")||strstr(r->error,"HTTP 401")||strstr(r->error,"HTTP 403"))break;
+                }
+                if(rotated){copy(cfg.token,sizeof(cfg.token),r->at);r->ok=sc_check_login(&cfg,r->error,sizeof(r->error))==0;}
                 else if(ok){/* токен ещё жив: ротацию отложили, вход подтверждён */
-                    r->ok=1;note("refresh SoundCloud не удался, токен пока рабочий");
+                    r->ok=1;char msg[360];
+                    if(strstr(r->error,"invalid_grant"))snprintf(msg,sizeof(msg),"SoundCloud: refresh-токен %s отозван, нужен новый вход; текущий вход пока рабочий",account?"other":"me");
+                    else snprintf(msg,sizeof(msg),"refresh SoundCloud не удался, токен пока рабочий: %s",r->error[0]?r->error:"без описания");
+                    note(msg);
                 }else copy(r->error,sizeof(r->error),login_err);
             }
         }
@@ -136,8 +150,20 @@ static void collect_job(void){
             else if(r->error[0]&&(strstr(r->error,"401")||strstr(r->error,"403")||strstr(r->error,"invalid_grant")))copy(a->login,sizeof(a->login),"refused");
             else copy(a->login,sizeof(a->login),"unavailable");
             if(!r->ok){char msg[320];snprintf(msg,sizeof(msg),"проверка входа %s: %s",r->account?"other":"me",r->error[0]?r->error:"без описания");note(msg);}
-            if(r->ok&&r->at[0]&&strcmp(a->token,r->at)){copy(a->token,sizeof(a->token),r->at);if(r->rt[0])copy(a->refresh,sizeof(a->refresh),r->rt);a->expires=(long long)time(NULL)+(r->expires>0?r->expires:3600);if(save())note("Не удалось сохранить ротированную пару токенов");}
+            /* Отозванный refresh-токен не повторяем час: это не лечится запросами. */
+            if(strstr(r->error,"invalid_grant"))a->retry_after=monotime()+3600000;
+            /* Ротированную пару сохраняем даже при неудачной повторной проверке:
+             * refresh-токен на стороне SoundCloud уже заменён, старый не вернуть. */
+            if(r->at[0]&&strcmp(a->token,r->at)){
+                copy(a->token,sizeof(a->token),r->at);if(r->rt[0])copy(a->refresh,sizeof(a->refresh),r->rt);a->expires=(long long)time(NULL)+(r->expires>0?r->expires:3600);a->retry_after=0;
+                if(save())note("Не удалось сохранить ротированную пару токенов");
+                else{char msg[160];snprintf(msg,sizeof(msg),"SoundCloud: токены %s обновлены, действуют %ld мин",r->account?"other":"me",(long)(r->expires/60));note(msg);}
+            }
             sync_config();
+            /* Подтверждённый вход проверяем раз в 10 минут, проблемный — каждую
+             * минуту: лишние запросы SoundCloud считает подозрительной
+             * активностью и может отозвать сессию. */
+            player.next_login[r->account]=monotime()+(r->ok?600000:60000);
         }
     }else if(n==0||monotime()-player.jobstart>120000){cancel_job();copy(player.error,sizeof(player.error),"Сетевая задача завершилась без результата");}
 }
@@ -155,7 +181,7 @@ static int patch(const char *raw,char *err,size_t cap){
     if(bad||save()){memcpy(player.accounts,old,sizeof(old));player.sc=oldcfg;player.active=oldactive;atomic_store(&player.audio.shared->volume,volume);copy(err,cap,bad?"Некорректное значение настройки":"Не удалось сохранить настройки");return -1;}
     player.revisions[account]++;player.jobrevision=0;
     if(player.job&&player.jobkind==2&&player.jobaccount==account)cancel_job();
-    copy(player.accounts[account].login,sizeof(player.accounts[account].login),player.accounts[account].token[0]?"unchecked":"missing");sync_config();player.next_login=0;return 0;
+    copy(player.accounts[account].login,sizeof(player.accounts[account].login),player.accounts[account].token[0]?"unchecked":"missing");sync_config();player.next_login[account]=monotime();return 0;
 }
 static void command(const char *body,Buffer *b){
     char input[8192];if(strlen(body)>=sizeof(input)){add(b,"error: слишком длинная команда");return;}copy(input,sizeof(input),body);
@@ -241,7 +267,7 @@ static int serve(void){
     char *end;long port=strtol(env("PANEL_PLAYER_PORT","8765"),&end,10);if(*end||port<1||port>65535)return 1;addr.sin_port=htons((uint16_t)port);
     if(inet_pton(AF_INET,env("PANEL_PLAYER_HOST","127.0.0.1"),&addr.sin_addr)!=1||bind(s,(struct sockaddr*)&addr,sizeof(addr))||listen(s,16)){note("Не удалось открыть HTTP-порт");close(s);return 1;}
     Client clients[CLIENTS];memset(clients,0,sizeof(clients));for(int i=0;i<CLIENTS;i++)clients[i].fd=-1;
-    note("Собственный плеер запущен; IPC-соединения к Алисе не создаются");player.next_login=monotime()+2000;int check_account=0;
+    note("Собственный плеер запущен; IPC-соединения к Алисе не создаются");player.next_login[0]=player.next_login[1]=monotime()+2000;
     while(!shutdown_requested){
         struct pollfd fds[CLIENTS+1];fds[0]=(struct pollfd){s,POLLIN,0};for(int i=0;i<CLIENTS;i++)fds[i+1]=(struct pollfd){clients[i].fd,clients[i].output?POLLOUT:POLLIN,0};
         if(poll(fds,CLIENTS+1,50)<0&&errno!=EINTR)break;
@@ -262,9 +288,14 @@ static int serve(void){
             }else copy(player.state,sizeof(player.state),"error");
         }
         else if(done>0){if(player.repeat)play_index();else if(player.index+1<player.queue.count){player.index=player.shuffle?(size_t)rand()%player.queue.count:player.index+1;play_index();}else copy(player.state,sizeof(player.state),"stopped");}
-        if(!player.job&&monotime()>=player.next_login){
-            Account *a=&player.accounts[check_account];if(a->token[0]||a->refresh[0])start_job(2,"","",check_account);
-            check_account=1-check_account;player.next_login=monotime()+60000;
+        if(!player.job){
+            /* У каждого аккаунта свой срок следующей проверки: иначе успешный
+             * вход одного откладывает проверку второго на все 10 минут. */
+            for(int i=0;i<2;i++){
+                Account *a=&player.accounts[i];
+                if(monotime()<player.next_login[i]||(!a->token[0]&&!a->refresh[0]))continue;
+                start_job(2,"","",i);if(player.job)break;
+            }
         }
     }
     for(int i=0;i<CLIENTS;i++)close_client(&clients[i]);close(s);cancel_job();audio_close(&player.audio);close(lockfd);return 0;
