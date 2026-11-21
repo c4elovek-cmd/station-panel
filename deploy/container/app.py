@@ -255,6 +255,13 @@ async def on_startup(app: web.Application) -> None:
     spawn_all()
     app["health_watch"] = asyncio.create_task(healthz_watch())
     app["watchdog"] = asyncio.create_task(watchdog())
+        # socks_autostart: 3proxy (SOCKS5 для колонки) переживает рестарт контейнера
+    import subprocess as _sp
+    try:
+        _sp.Popen(['/home/container/socks/3proxy.bin', '/home/container/socks/3proxy.cfg'],
+                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True)
+    except Exception as _e:
+        print('[socks_autostart] сбой:', _e, flush=True)
     app["stdin_loop"] = asyncio.create_task(_stdin_command_loop())
 
 
